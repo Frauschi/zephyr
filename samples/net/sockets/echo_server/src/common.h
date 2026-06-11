@@ -8,7 +8,10 @@
 #include "net_sample_common.h"
 
 #define MY_PORT 4242
-#if defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS) || defined(CONFIG_NET_TCP) || \
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+/* The wolfSSL handshake runs on the stack of the accepting thread */
+#define STACK_SIZE 8192
+#elif defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS) || defined(CONFIG_NET_TCP) || \
 	defined(CONFIG_COVERAGE_GCOV)
 #define STACK_SIZE 4096
 #else
