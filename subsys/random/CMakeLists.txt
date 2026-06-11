@@ -2,7 +2,8 @@
 
 if(CONFIG_ENTROPY_DEVICE_RANDOM_GENERATOR OR
     CONFIG_TIMER_RANDOM_GENERATOR OR
-    CONFIG_XOSHIRO_RANDOM_GENERATOR)
+    CONFIG_XOSHIRO_RANDOM_GENERATOR OR
+    CONFIG_WOLFSSL_CSPRNG_GENERATOR)
 zephyr_syscall_header(${ZEPHYR_BASE}/include/zephyr/random/random.h)
 zephyr_library()
 zephyr_library_sources_ifdef(CONFIG_USERSPACE           random_handlers.c)
@@ -26,4 +27,9 @@ endif()
 if(CONFIG_CTR_DRBG_CSPRNG_GENERATOR OR CONFIG_PSA_CSPRNG_GENERATOR)
 zephyr_library_sources(random_psa.c)
 zephyr_library_link_libraries_ifdef(CONFIG_MBEDTLS mbedTLS)
+endif()
+
+if(CONFIG_WOLFSSL_CSPRNG_GENERATOR)
+zephyr_library_sources(random_wolfssl.c)
+zephyr_library_link_libraries(wolfSSL)
 endif()

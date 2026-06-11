@@ -24,6 +24,16 @@ tests:
     min_ram: 16
     integration_platforms:
       - native_sim
+  crypto.rng.random_wolfssl:
+    extra_args: CONF_FILE=prj_wolfssl.conf
+    filter: CONFIG_ENTROPY_HAS_DRIVER
+    min_ram: 16
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
   drivers.rng.random_psa_crypto:
     filter: CONFIG_BUILD_WITH_TFM
     arch_exclude: posix
