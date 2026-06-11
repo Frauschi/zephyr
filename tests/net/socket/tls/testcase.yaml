@@ -21,3 +21,12 @@ tests:
   net.socket.tls.sendmsg_no_buf:
     extra_configs:
       - CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE=0
+  net.socket.tls.wolfssl:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: net socket tls wolfssl
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl.conf
