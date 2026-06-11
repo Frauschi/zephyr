@@ -12,3 +12,13 @@ common:
 
 tests:
   net.coap.server.secure: {}
+  net.coap.server.secure.wolfssl:
+    tags:
+      - wolfssl
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim/native/64
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl.conf

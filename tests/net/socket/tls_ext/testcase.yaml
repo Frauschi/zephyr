@@ -8,3 +8,19 @@ tests:
     platform_allow: qemu_x86
     integration_platforms:
       - qemu_x86
+
+  net.socket.tls.ext.wolfssl:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl.conf
+
+  net.socket.tls.ext.wolfssl.verify_cb:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl-verify-cb.conf
