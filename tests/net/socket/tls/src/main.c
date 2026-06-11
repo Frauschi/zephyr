@@ -3481,6 +3481,30 @@ ZTEST(net_socket_tls, test_v6_dtls_server_cid_matching_on_addr_change)
 	test_dtls_server_cid_matching_on_addr_change(NET_AF_INET6);
 }
 
+/* Poll a non-blocking recv until the DTLS peer's close-notify has been
+ * processed and the socket reports ENOTCONN, or a short bound elapses. On
+ * native_sim loopback delivery is synchronous and the first recv already sees
+ * the alert; on targets with asynchronous delivery (e.g. real hardware) this
+ * waits for the in-flight alert instead of racing a fixed guess delay. A
+ * genuinely missing close-notify is NOT masked: errno stays EAGAIN, the bound
+ * expires, and the caller's ENOTCONN assertion fails.
+ */
+static int recv_await_peer_closed(int sock)
+{
+	uint8_t rx_buf;
+	int ret = -1;
+
+	for (int i = 0; i < 20; i++) {
+		ret = zsock_recv(sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		if (ret == -1 && errno == ENOTCONN) {
+			break;
+		}
+		k_msleep(5);
+	}
+
+	return ret;
+}
+
 static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 {
 	struct net_sockaddr c_saddr_1;
@@ -3503,11 +3527,11 @@ static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify client socket reports error (server closed the session). The
+	 * close-notify may still be in flight on targets with asynchronous
+	 * loopback delivery, so poll for it instead of racing a fixed delay.
+	 */
+	ret = recv_await_peer_closed(c_sock);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 
@@ -3525,11 +3549,8 @@ static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify second client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify second client socket reports error (server closed the session). */
+	ret = recv_await_peer_closed(c_sock_2);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 }
@@ -3573,11 +3594,11 @@ static void test_dtls_server_session_timeout_recvfrom(net_sa_family_t family)
 	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify client socket reports error (server closed the session). The
+	 * close-notify may still be in flight on targets with asynchronous
+	 * loopback delivery, so poll for it instead of racing a fixed delay.
+	 */
+	ret = recv_await_peer_closed(c_sock);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 
@@ -3593,8 +3614,8 @@ static void test_dtls_server_session_timeout_recvfrom(net_sa_family_t family)
 	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Verify second client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify second client socket reports error (server closed the session). */
+	ret = recv_await_peer_closed(c_sock_2);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 }
