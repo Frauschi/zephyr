@@ -22,3 +22,21 @@ tests:
       - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
       - CONFIG_NET_SOCKETS_DTLS_TIMEOUT=30000
       - CONFIG_MAIN_STACK_SIZE=2048
+  net.socket.register.tls.wolfssl:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: net socket socket.register wolfssl
+    extra_configs:
+      - CONFIG_MBEDTLS=n
+      - CONFIG_POSIX_API=y
+      - CONFIG_POSIX_TIMERS=y
+      - CONFIG_POSIX_THREADS=y
+      - CONFIG_WOLFSSL=y
+      - CONFIG_WOLFSSL_DTLS=y
+      - CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE=65536
+      - CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
+      - CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=6
+      - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
+      - CONFIG_NET_SOCKETS_DTLS_TIMEOUT=30000
+      - CONFIG_MAIN_STACK_SIZE=2048

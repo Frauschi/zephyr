@@ -160,7 +160,12 @@ static void test_tls(void)
 		const sec_tag_t *sec_tag_list;
 		size_t sec_tag_list_size;
 
-		sec_tag_list_size = sizeof(sec_tag_list);
+		/* sizeof(sec_tag_list_verify_none), not sizeof(sec_tag_list)
+		 * — the latter is sizeof(pointer), which on 64-bit hosts
+		 * (e.g. native_sim/native/64) feeds an extra garbage sec_tag
+		 * into setsockopt and breaks credential lookup.
+		 */
+		sec_tag_list_size = sizeof(sec_tag_list_verify_none);
 		sec_tag_list = sec_tag_list_verify_none;
 
 		ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST,

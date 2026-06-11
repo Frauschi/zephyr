@@ -17,3 +17,17 @@ tests:
     extra_configs:
       - CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
       - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
+  net.coap.server.secure.wolfssl:
+    tags:
+      - tls
+      - wolfssl
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim/native/64
+    extra_configs:
+      - CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
+      - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl.conf
