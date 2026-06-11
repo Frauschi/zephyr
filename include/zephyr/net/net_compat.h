@@ -172,6 +172,7 @@ extern "C" {
 #define TLS_DTLS_HANDSHAKE_ON_CONNECT     ZSOCK_TLS_DTLS_HANDSHAKE_ON_CONNECT
 #define TLS_CERT_VERIFY_RESULT            ZSOCK_TLS_CERT_VERIFY_RESULT
 #define TLS_CERT_VERIFY_CALLBACK          ZSOCK_TLS_CERT_VERIFY_CALLBACK
+#define TLS_CERT_VERIFY_CALLBACK_WOLFSSL  ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL
 #define TLS_PEER_VERIFY_NONE              ZSOCK_TLS_PEER_VERIFY_NONE
 #define TLS_PEER_VERIFY_OPTIONAL          ZSOCK_TLS_PEER_VERIFY_OPTIONAL
 #define TLS_PEER_VERIFY_REQUIRED          ZSOCK_TLS_PEER_VERIFY_REQUIRED
@@ -190,6 +191,8 @@ extern "C" {
 #define TLS_DTLS_CID_STATUS_BIDIRECTIONAL ZSOCK_TLS_DTLS_CID_STATUS_BIDIRECTIONAL
 
 #define tls_cert_verify_cb zsock_tls_cert_verify_cb
+#define tls_cert_verify_cb_wolfssl zsock_tls_cert_verify_cb_wolfssl
+#define tls_wolfssl_verify_cb_t zsock_tls_wolfssl_verify_cb_t
 
 #define AI_PASSIVE      ZSOCK_AI_PASSIVE
 #define AI_CANONNAME    ZSOCK_AI_CANONNAME
