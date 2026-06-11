@@ -11,3 +11,10 @@ tests:
   net.socket.register.tls:
     extra_args:
       - EXTRA_CONF_FILE=overlay-tls.conf
+  net.socket.register.tls.wolfssl:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf

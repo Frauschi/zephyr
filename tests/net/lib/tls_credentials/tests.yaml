@@ -33,3 +33,22 @@ tests:
     platform_exclude: *secure_storage_platform_exclude
     tags:
       - secure_storage.psa
+  net.tls_credentials.wolfssl:
+    # Catches symbol clashes between a WOLFSSL=y build and the credentials API
+    tags:
+      - net
+      - tls
+      - wolfssl
+    depends_on: netif
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim/native/64
+    extra_configs:
+      - CONFIG_MBEDTLS=n
+      - CONFIG_POSIX_API=y
+      - CONFIG_POSIX_TIMERS=y
+      - CONFIG_POSIX_THREADS=y
+      - CONFIG_WOLFSSL=y
+      - CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE=65536
