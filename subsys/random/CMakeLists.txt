@@ -26,4 +26,5 @@ endif()
 
 if(CONFIG_CTR_DRBG_CSPRNG_GENERATOR)
 zephyr_library_link_libraries_ifdef(CONFIG_MBEDTLS mbedTLS)
+zephyr_library_link_libraries_ifdef(CONFIG_WOLFSSL wolfSSL)
 endif()

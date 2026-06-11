@@ -173,7 +173,9 @@ extern "C" {
 
 /** Socket option for preventing certificates from being copied to the mbedTLS
  *  heap if possible. The option is only effective for DER certificates and is
- *  ignored for PEM certificates.
+ *  ignored for PEM certificates. This option has no effect when using wolfSSL
+ *  as the underlying TLS implementation, the cert data is always copied to the
+ *  heap in that case.
  */
 #define TLS_CERT_NOCOPY	       10
 /** TLS socket option to use with offloading. The option instructs the network
@@ -258,9 +260,20 @@ extern "C" {
  *  certificates and decide whether to proceed or abort the handshake.
  *
  *  The option is only available if CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
- *  Kconfig option is enabled.
+ *  Kconfig option is enabled AND the mbedTLS backend is in use. Under
+ *  CONFIG_WOLFSSL, setsockopt(TLS_CERT_VERIFY_CALLBACK) returns -ENOTSUP;
+ *  use TLS_CERT_VERIFY_CALLBACK_WOLFSSL instead.
  */
 #define TLS_CERT_VERIFY_CALLBACK 20
+/** Write-only socket option to register a wolfSSL-style cert-verify callback.
+ *  The option accepts a pointer to a @ref tls_cert_verify_cb_wolfssl structure.
+ *
+ *  Only honored when CONFIG_WOLFSSL_VERIFY_CALLBACK is enabled and CONFIG_WOLFSSL
+ *  is the active TLS backend; under the mbedTLS backend setsockopt returns
+ *  -ENOPROTOOPT. The numeric value (21) is reserved unconditionally so the
+ *  socket option-number space stays stable across backends.
+ */
+#define TLS_CERT_VERIFY_CALLBACK_WOLFSSL 21
 
 /* Valid values for @ref TLS_PEER_VERIFY option */
 #define TLS_PEER_VERIFY_NONE 0     /**< Peer verification disabled. */
@@ -302,6 +315,35 @@ struct tls_cert_verify_cb {
 	/** A pointer to an opaque context passed to the callback. */
 	void *ctx;
 };
+
+#if defined(CONFIG_WOLFSSL)
+/** Callback type for @ref TLS_CERT_VERIFY_CALLBACK_WOLFSSL.
+ *
+ *  The second parameter is the underlying WOLFSSL_X509_STORE_CTX, typed as
+ *  void* so the public header does not pull in <wolfssl/ssl.h>. Cast to
+ *  WOLFSSL_X509_STORE_CTX* inside the callback.
+ *
+ *  Shape matches the wolfSSL VerifyCallback signature
+ *  int (*)(int preverify_ok, WOLFSSL_X509_STORE_CTX *ctx).
+ */
+typedef int (*tls_wolfssl_verify_cb_t)(int preverify_ok, void *store_ctx);
+
+/** Data structure for @ref TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.
+ *  Only available with CONFIG_WOLFSSL.
+ */
+struct tls_cert_verify_cb_wolfssl {
+	/** Callback with wolfSSL VerifyCallback signature; see
+	 *  @ref tls_wolfssl_verify_cb_t.
+	 */
+	tls_wolfssl_verify_cb_t cb;
+
+	/** Application context pointer. Passed to the callback via
+	 *  WOLFSSL_X509_STORE_CTX->userCtx. If NULL, wolfSSL default
+	 *  behavior applies.
+	 */
+	void *ctx;
+};
+#endif /* CONFIG_WOLFSSL */
 /** @} */ /* for @name */
 /** @} */ /* for @defgroup */
 
