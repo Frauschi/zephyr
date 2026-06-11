@@ -14,6 +14,9 @@
 #include <zephyr/net/tls_credentials.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/ztest.h>
+#if defined(CONFIG_WOLFSSL)
+#include <time.h>
+#endif
 
 LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 
@@ -263,4 +266,37 @@ static void *setup(void)
 	return NULL;
 }
 
-ZTEST_SUITE(framework_tests_tls, NULL, setup, NULL, NULL, NULL);
+#if defined(CONFIG_WOLFSSL)
+/* Realtime clock (seconds since the Unix epoch) used to satisfy wolfSSL's
+ * X.509 date validation. It MUST lie within every test certificate's validity
+ * window: the http_server certs used here are valid Nov-2024..2124, so this is
+ * 2025-06-01T00:00:00Z. Update it if the test certificates are regenerated
+ * with a later notBefore.
+ */
+#define WOLFSSL_CERT_VALID_TIME 1748736000
+
+static void set_cert_validity_clock(void *fixture)
+{
+	const struct timespec ts = {
+		.tv_sec = WOLFSSL_CERT_VALID_TIME,
+		.tv_nsec = 0,
+	};
+	int ret;
+
+	ARG_UNUSED(fixture);
+
+	/* wolfSSL validates X.509 certificate dates. On native_sim z_time()
+	 * reads the host clock, but on real targets it reads the Zephyr realtime
+	 * clock, whose offset ztest's clock_offset_reset_rule resets to epoch 0
+	 * (1970) after every test -- so this must run before each test, not once
+	 * in suite setup, or the CA certificate is rejected as "not yet valid".
+	 */
+	ret = clock_settime(CLOCK_REALTIME, &ts);
+	zassert_ok(ret, "failed to set CLOCK_REALTIME (%d)", ret);
+}
+#define HTTP_TLS_BEFORE set_cert_validity_clock
+#else
+#define HTTP_TLS_BEFORE NULL
+#endif /* CONFIG_WOLFSSL */
+
+ZTEST_SUITE(framework_tests_tls, NULL, setup, HTTP_TLS_BEFORE, NULL, NULL);
