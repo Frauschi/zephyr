@@ -11,23 +11,80 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr/net/loopback.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/tls_credentials.h>
+/* IANA TLS ciphersuite IDs used by this file's set_ciphersuites tests.
+ * Names match RFC 5487. Don't introduce a public Zephyr-wide header just
+ * for these two — both backends accept IANA IDs verbatim via the byte-
+ * list cipher API. (The RFC 4279 SHA-1 CBC suites used previously are no
+ * longer selectable in the Zephyr 4.4 mbedTLS ciphersuite Kconfig.)
+ */
+#define TEST_TLS_PSK_WITH_AES_128_GCM_SHA256  0x00A8
+#define TEST_TLS_PSK_WITH_AES_256_CBC_SHA384  0x00AF
+
+#if defined(CONFIG_WOLFSSL)
+#ifndef WOLFSSL_USER_SETTINGS
+#include <user_settings.h>
+#endif
+#include <wolfssl/ssl.h>
+WOLFSSL *ztls_get_wolfssl_context(int fd);
+/* Fatal-alert injection for the pollerr tests; implemented in
+ * wolfssl_alert.c, which confines <wolfssl/internal.h> (and its huge
+ * unprefixed identifier surface) to a single translation unit.
+ */
+void test_wolfssl_send_fatal_alert(WOLFSSL *ssl);
+#endif
+
+#if defined(CONFIG_MBEDTLS)
 #include <mbedtls/ssl.h>
+mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
+#endif
 
 #include "../../socket_helpers.h"
 
-struct mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
 uint32_t ztls_get_session_count(void);
+
+/* Server-side allow-list. Only TLS_PSK_WITH_AES_256_CBC_SHA384 is enabled
+ * in prj.conf for the mbedTLS scenarios — the GCM suite entry is never
+ * negotiated, it only exercises list handling and the mismatch case. Keep
+ * it that way: enabling extra suites globally in prj.conf would change the
+ * default cipher negotiated by the other tests in this file, which size
+ * SO_RCVBUF based on the default suite's record overhead.
+ */
+static const int cipher_list_psk[] = {
+	TEST_TLS_PSK_WITH_AES_256_CBC_SHA384,
+	TEST_TLS_PSK_WITH_AES_128_GCM_SHA256
+};
+
+/* Test test_set_ciphersuites() assumes [0] of this list is the
+ * cipher that will be negotiated */
+static const int cipher_list_psk2[] = {
+	TEST_TLS_PSK_WITH_AES_256_CBC_SHA384,
+};
+
+static const int cipher_list_psk3[] = {
+	TEST_TLS_PSK_WITH_AES_128_GCM_SHA256,
+};
 
 #define TEST_STR_SMALL "test"
 
 #define MY_IPV4_ADDR "127.0.0.1"
 #define MY_IPV6_ADDR "::1"
 
+#ifndef MY_DEFLT_HOSTNAME
+#define MY_DEFLT_HOSTNAME "localhost"
+#endif
+
 #define ANY_PORT 0
 #define SERVER_PORT 4242
 #define CLIENT_1_PORT 4243
 #define CLIENT_2_PORT 4244
 #define CLIENT_3_PORT 4245
+/* Dedicated port for test_session_cache_client_resume: the client-side
+ * session cache is keyed by peer address, so the test needs a fixed
+ * port — but it must not collide with SERVER_PORT used by the DTLS
+ * multi-client tests, to stay independent of suite ordering and
+ * TIME_WAIT teardown.
+ */
+#define RESUME_SERVER_PORT 4246
 
 #define PSK_TAG 1
 
@@ -121,6 +178,20 @@ static void test_connect(int sock, struct net_sockaddr *addr, net_socklen_t addr
 	}
 }
 
+static void test_connect_err(int sock, struct net_sockaddr *addr, net_socklen_t addrlen)
+{
+	k_yield();
+
+	zassert_equal(zsock_connect(sock, addr, addrlen),
+		      -1,
+		      "connect expected to fail but succeeded");
+
+	if (IS_ENABLED(CONFIG_NET_TC_THREAD_PREEMPTIVE)) {
+		/* Let the connection proceed */
+		k_yield();
+	}
+}
+
 static void test_send(int sock, const void *buf, size_t len, int flags)
 {
 	zassert_equal(zsock_send(sock, buf, len, flags),
@@ -156,6 +227,15 @@ static void test_accept(int sock, int *new_sock, struct net_sockaddr *addr,
 
 	*new_sock = zsock_accept(sock, addr, addrlen);
 	zassert_true(*new_sock >= 0, "zsock_accept() failed");
+}
+
+static void test_accept_err(int sock, int *new_sock, struct net_sockaddr *addr,
+			    net_socklen_t *addrlen)
+{
+	zassert_not_null(new_sock, "null newsock");
+
+	*new_sock = zsock_accept(sock, addr, addrlen);
+	zassert_true(*new_sock < 0, "accept expected to fail but succeeded");
 }
 
 static void test_shutdown(int sock, int how)
@@ -302,6 +382,16 @@ static void client_connect_work_handler(struct k_work *work)
 		     sizeof(struct net_sockaddr_in) : sizeof(struct net_sockaddr_in6));
 }
 
+static void client_connect_work_handler_err(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct connect_data *data =
+		CONTAINER_OF(dwork, struct connect_data, work);
+
+	test_connect_err(data->sock, data->addr, data->addr->sa_family == NET_AF_INET ?
+			 sizeof(struct net_sockaddr_in) : sizeof(struct net_sockaddr_in6));
+}
+
 static void dtls_client_connect_send_work_handler(struct k_work *work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
@@ -416,6 +506,71 @@ static void test_prepare_dtls_connection(net_sa_family_t family)
 	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
 	zassert_equal(ret, sizeof(rx_buf), "zsock_recv() failed");
 
+	test_work_wait(&test_data.work);
+}
+
+/* Function pointer type for function to be called after socket creation but
+ * before any bind/listen/connect operations */
+typedef void (*tls_pre_cb)(void);
+/* Function pointer type for function to be used to perform client work
+ * instead of client_connect_work_handler() */
+typedef void (*client_work_func)(struct k_work *work);
+
+static void test_prepare_tls_connection_ex(net_sa_family_t family, bool accept_err,
+					   tls_pre_cb cb, client_work_func cw)
+{
+	struct net_sockaddr c_saddr;
+	struct net_sockaddr s_saddr;
+	net_socklen_t exp_addrlen = family == NET_AF_INET6 ?
+				sizeof(struct net_sockaddr_in6) :
+				sizeof(struct net_sockaddr_in);
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+
+	if (family == NET_AF_INET6) {
+		prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &c_sock,
+				    (struct net_sockaddr_in6 *)&c_saddr,
+				    NET_IPPROTO_TLS_1_2);
+		prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &s_sock,
+				    (struct net_sockaddr_in6 *)&s_saddr,
+				    NET_IPPROTO_TLS_1_2);
+	} else {
+		prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock,
+				    (struct net_sockaddr_in *)&c_saddr,
+				    NET_IPPROTO_TLS_1_2);
+		prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &s_sock,
+				    (struct net_sockaddr_in *)&s_saddr,
+				    NET_IPPROTO_TLS_1_2);
+	}
+
+	if (NULL != cb) {
+		cb();
+	}
+
+	test_config_psk(s_sock, c_sock);
+
+	test_bind(s_sock, &s_saddr, exp_addrlen);
+	test_listen(s_sock);
+
+	/* Helper work for the connect operation - need to handle client/server
+	 * in parallel due to handshake.
+	 */
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	if (cw != NULL) {
+		k_work_init_delayable(&test_data.work, cw);
+	} else {
+		k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	}
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	if (accept_err == true) {
+		test_accept_err(s_sock, &new_sock, &addr, &addrlen);
+	} else {
+		test_accept(s_sock, &new_sock, &addr, &addrlen);
+		zassert_equal(addrlen, exp_addrlen, "Wrong addrlen");
+	}
 	test_work_wait(&test_data.work);
 }
 
@@ -549,6 +704,7 @@ static void send_work_handler(struct k_work *work)
 
 void test_msg_trunc(net_sa_family_t family)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	int rv;
 	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
 	struct send_data test_data = {
@@ -583,6 +739,9 @@ void test_msg_trunc(net_sa_family_t family)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(net_socket_tls, test_v4_msg_trunc)
@@ -677,18 +836,26 @@ static void test_dtls_sendmsg_no_buf(net_sa_family_t family)
 
 ZTEST(net_socket_tls, test_v4_dtls_sendmsg_no_buf)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE > 0) {
 		ztest_test_skip();
 	}
+#else
+	ztest_test_skip();
+#endif
 
 	test_dtls_sendmsg_no_buf(NET_AF_INET);
 }
 
 ZTEST(net_socket_tls, test_v6_dtls_sendmsg_no_buf)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE > 0) {
 		ztest_test_skip();
 	}
+#else
+	ztest_test_skip();
+#endif
 
 	test_dtls_sendmsg_no_buf(NET_AF_INET6);
 }
@@ -828,18 +995,22 @@ static void test_dtls_sendmsg_overflow(net_sa_family_t family)
 
 ZTEST(net_socket_tls, test_v4_dtls_sendmsg)
 {
-	if (CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE == 0) {
-		ztest_test_skip();
-	}
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#elif CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE <= 0
+	ztest_test_skip();
+#endif
 
 	test_dtls_sendmsg(NET_AF_INET);
 }
 
 ZTEST(net_socket_tls, test_v6_dtls_sendmsg)
 {
-	if (CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE == 0) {
-		ztest_test_skip();
-	}
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#elif CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE <= 0
+	ztest_test_skip();
+#endif
 
 	test_dtls_sendmsg(NET_AF_INET6);
 }
@@ -1220,7 +1391,21 @@ ZTEST(net_socket_tls, test_recv_eof_on_close)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+/* Per-record framing overhead the test uses to right-size SO_RCVBUF for
+ * exactly one TLS application record carrying TEST_STR_SMALL. Both numbers
+ * are observed values for these suites' default ciphersuite (TLS 1.2 AES
+ * GCM), measured by running the suite with an oversized buffer and printing
+ * the inbound record length. Different values per backend reflect different
+ * implementation choices for the record-layer framing (header layout, IV
+ * placement, padding) — they are not part of any wire-format ABI. If a
+ * test starts failing here after a backend or ciphersuite change, re-measure
+ * with an oversized buffer and update.
+ */
+#if defined(CONFIG_WOLFSSL)
+#define TLS_RECORD_OVERHEAD 29
+#else
 #define TLS_RECORD_OVERHEAD 81
+#endif
 
 ZTEST(net_socket_tls, test_send_non_block)
 {
@@ -1371,7 +1556,7 @@ ZTEST(net_socket_tls, test_send_on_close)
 	new_sock = -1;
 
 	/* Small delay for packets to propagate. */
-	k_msleep(10);
+	k_msleep(20);
 
 	/* Verify send() reports an error after connection is closed. */
 	ret = zsock_send(c_sock, TEST_STR_SMALL, strlen(TEST_STR_SMALL), 0);
@@ -1393,7 +1578,7 @@ ZTEST(net_socket_tls, test_send_on_close)
 	new_sock = -1;
 
 	/* Small delay for packets to propagate. */
-	k_msleep(10);
+	k_msleep(20);
 
 	/* Graceful connection close should be reported first. */
 	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
@@ -1544,10 +1729,13 @@ ZTEST(net_socket_tls, test_shutdown_rd_while_recv)
 
 	test_prepare_tls_connection(NET_AF_INET6);
 
-	/* Schedule reception shutdown from workqueue */
+	/* Schedule reception shutdown from workqueue. 50ms margin guards
+	 * against slow CI runners where recv() hasn't reached its blocking
+	 * point at the 10ms mark.
+	 */
 	k_work_init_delayable(&test_data.work, shutdown_work);
 	test_data.sock = c_sock;
-	test_work_reschedule(&test_data.work, K_MSEC(10));
+	test_work_reschedule(&test_data.work, K_MSEC(50));
 
 	/* EOF should be notified by recv() */
 	test_eof(c_sock);
@@ -1555,6 +1743,78 @@ ZTEST(net_socket_tls, test_shutdown_rd_while_recv)
 	test_sockets_close();
 
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+/* wolfSSL-only: exercises the recv_eof shortcut in
+ * recvfrom_dtls_common_wolfssl that turns local SHUT_RD/SHUT_RDWR into
+ * an EOF on the next recv(). The mbedTLS backend matches upstream
+ * Zephyr behavior (no local-shutdown shortcut on DTLS), so this test
+ * is gated to wolfSSL builds to preserve the upstream interface
+ * contract for mbedTLS users.
+ */
+static void test_dtls_shutdown_synchronous_body(net_sa_family_t family, int how)
+{
+	test_prepare_dtls_connection(family);
+
+	test_shutdown(c_sock, how);
+
+	/* EOF should be notified by recv() */
+	test_eof(c_sock);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+#endif
+
+ZTEST(net_socket_tls, test_dtls_shutdown_rd_synchronous_v6)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+	test_dtls_shutdown_synchronous_body(NET_AF_INET6, ZSOCK_SHUT_RD);
+#else
+	ztest_test_skip();
+#endif
+}
+
+ZTEST(net_socket_tls, test_dtls_shutdown_rd_synchronous_v4)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+	test_dtls_shutdown_synchronous_body(NET_AF_INET, ZSOCK_SHUT_RD);
+#else
+	ztest_test_skip();
+#endif
+}
+
+ZTEST(net_socket_tls, test_dtls_shutdown_rd_while_recv)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+	struct shutdown_data test_data = {
+		.how = ZSOCK_SHUT_RD,
+	};
+
+	test_prepare_dtls_connection(NET_AF_INET6);
+
+	/* Schedule reception shutdown from workqueue while recv() is blocked
+	 * — exercises the recv_eof check inside the wolfSSL DTLS recv loop
+	 * (recvfrom_dtls_common_wolfssl). The TCP/TLS variant lives in
+	 * test_shutdown_rd_while_recv. 50ms margin guards against slow CI
+	 * runners where recv() hasn't reached its blocking point yet at the
+	 * 10ms mark — short enough to keep the test fast.
+	 */
+	k_work_init_delayable(&test_data.work, shutdown_work);
+	test_data.sock = c_sock;
+	test_work_reschedule(&test_data.work, K_MSEC(50));
+
+	/* EOF should be notified by recv() */
+	test_eof(c_sock);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(net_socket_tls, test_send_while_recv)
@@ -1597,6 +1857,591 @@ ZTEST(net_socket_tls, test_send_while_recv)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+void tls_set_cs_cb(void)
+{
+	int ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+				   (void *)cipher_list_psk, sizeof(cipher_list_psk));
+	zassert_equal(ret, 0, "Unable to set ciphersuites on server");
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)cipher_list_psk2, sizeof(cipher_list_psk2));
+	zassert_equal(ret, 0, "Unable to set ciphersuites on client");
+}
+
+void tls_set_cs_mismatch_cb(void)
+{
+	/* Set mismatched ciphersuites, should not connect */
+	int ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+				   (void *)cipher_list_psk2, sizeof(cipher_list_psk2));
+	zassert_equal(ret, 0, "Unable to set ciphersuites on client");
+	ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)cipher_list_psk3, sizeof(cipher_list_psk3));
+	zassert_equal(ret, 0, "Unable to set ciphersuites on server");
+}
+
+ZTEST(net_socket_tls, test_set_ciphersuites)
+{
+#define TLS_CS_TEST_MAX_CS_NUM 3
+	int ret;
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1
+	};
+	int ciphersuites[TLS_CS_TEST_MAX_CS_NUM];
+	int cs_len = sizeof(ciphersuites);
+	int curr_cipher = 0;
+	int cc_len = sizeof(int);
+	int i;
+
+	for (i = 0; i < TLS_CS_TEST_MAX_CS_NUM; i++) {
+		ciphersuites[i] = 0;
+	}
+
+	test_prepare_tls_connection_ex(NET_AF_INET, false, tls_set_cs_cb, NULL);
+
+	/* Verify the ciphersuite list is what we set for server */
+	ret = zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)ciphersuites, (net_socklen_t *)&cs_len);
+	zassert_equal(ret, 0, "Unable to get ciphersuites for server");
+	zassert_equal(cs_len, sizeof(cipher_list_psk), "Incorrect get ciphersuite len");
+
+	for (i = 0; i < cs_len / sizeof(int); i++) {
+		zassert_equal(ciphersuites[i], cipher_list_psk[i],
+			      "Retrieved ciphersuite list element does not match set value");
+	}
+
+	/* Same for client */
+	for (i = 0; i < TLS_CS_TEST_MAX_CS_NUM; i++) {
+		ciphersuites[i] = 0;
+	}
+
+	cs_len = sizeof(ciphersuites);
+	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)ciphersuites, (net_socklen_t *)&cs_len);
+	zassert_equal(ret, 0, "Unable to get ciphersuites for client");
+	zassert_equal(cs_len, sizeof(cipher_list_psk2), "Incorrect get ciphersuite len");
+
+	for (i = 0; i < cs_len / sizeof(int); i++) {
+		zassert_equal(ciphersuites[i], cipher_list_psk2[i],
+			      "Retrieved ciphersuite list element does not match set value");
+	}
+
+	/* Check that the actual negotiated cipher is correct for server */
+	ret = zsock_getsockopt(new_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED,
+			       (void *)&curr_cipher, (net_socklen_t *)&cc_len);
+	zassert_equal(ret, 0, "Unable to get current ciphersuite for server");
+	zassert_equal(curr_cipher, cipher_list_psk2[0]);
+
+	/* Same for the client */
+	curr_cipher = 0;
+	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED,
+			       (void *)&curr_cipher, (net_socklen_t *)&cc_len);
+	zassert_equal(ret, 0, "Unable to get current ciphersuite for client");
+	zassert_equal(curr_cipher, cipher_list_psk2[0]);
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+
+	/* recv() shall block until send work sends the data. */
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+ZTEST(net_socket_tls, test_set_ciphersuites_err)
+{
+	/* Expect failure to connect and accept due to mismatched ciphersuites */
+	test_prepare_tls_connection_ex(NET_AF_INET, true,
+		tls_set_cs_mismatch_cb, client_connect_work_handler_err);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+void tls_set_hostname_cb(void)
+{
+	int ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME,
+				   (void *)MY_DEFLT_HOSTNAME, strlen(MY_DEFLT_HOSTNAME));
+	zassert_equal(ret, 0, "Unable to set hostname on client");
+}
+
+ZTEST(net_socket_tls, test_set_hostname)
+{
+	int ret;
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1
+	};
+
+	test_prepare_tls_connection_ex(NET_AF_INET, false, tls_set_hostname_cb, NULL);
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+
+	/* recv() shall block until send work sends the data. */
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+/* Verify that TLS options can still be set on an already-established
+ * connection without failing the setsockopt call. On the wolfSSL backend
+ * live changes are propagated to existing sessions best-effort (and apply
+ * fully to future sessions); on mbedTLS they update the shared config.
+ * Either way the call must succeed and the connection must stay usable.
+ */
+ZTEST(net_socket_tls, test_opt_set_after_connect)
+{
+	int ret;
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1
+	};
+#if defined(CONFIG_WOLFSSL)
+	static const int bad_cipher_list[] = { 0x1FFFF };
+#endif
+
+	test_prepare_tls_connection(NET_AF_INET);
+
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME,
+			       (void *)MY_DEFLT_HOSTNAME,
+			       strlen(MY_DEFLT_HOSTNAME));
+	zassert_equal(ret, 0, "setting hostname after connect failed (%d)",
+		      errno);
+
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)cipher_list_psk2, sizeof(cipher_list_psk2));
+	zassert_equal(ret, 0, "setting ciphersuites after connect failed (%d)",
+		      errno);
+
+#if defined(CONFIG_WOLFSSL)
+	/* Argument validation must happen before the option is stored,
+	 * independent of the (best-effort) live application.
+	 */
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+			       (void *)bad_cipher_list, sizeof(bad_cipher_list));
+	zassert_equal(ret, -1, "invalid ciphersuite ID not rejected");
+	zassert_equal(errno, EINVAL, "wrong errno value: %d", errno);
+#endif
+
+	/* Connection must still be usable. */
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+/* Defined further below with the DTLS multi-client tests. */
+static void dtls_verify_address(struct net_sockaddr *addr, net_socklen_t addrlen,
+				struct net_sockaddr *expected);
+#endif
+
+/* wolfSSL-only: an empty UDP datagram spoofed from the peer's address must
+ * not tear down an established DTLS server session (it carries no TLS
+ * record and source addresses are trivially forgeable). The mbedTLS
+ * backend inherits upstream behavior here (a 0-byte BIO read is treated
+ * as EOF), so the test is gated to the wolfSSL backend.
+ */
+ZTEST(net_socket_tls, test_dtls_server_empty_datagram)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct net_sockaddr c_saddr;
+	struct net_sockaddr s_saddr;
+	struct net_sockaddr recv_addr;
+	net_socklen_t recv_addrlen = sizeof(recv_addr);
+	struct connect_data test_data;
+	struct timeval timeo_optval = {
+		.tv_sec = 1,
+		.tv_usec = 0,
+	};
+	int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	int yes = 1;
+	uint8_t rx_buf;
+	uint8_t tx_buf = 0;
+	int helper_sock;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct net_sockaddr_in *)&c_saddr,
+			     NET_IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct net_sockaddr_in *)&s_saddr,
+			     NET_IPPROTO_DTLS_1_2);
+
+	test_config_psk(s_sock, c_sock);
+
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE,
+				    &role, sizeof(role)),
+		   "setsockopt failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO,
+				    &timeo_optval, sizeof(timeo_optval)),
+		   "setsockopt failed (%d)", errno);
+	/* Allow the helper socket below to bind to the client's port. */
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_REUSEPORT,
+				    &yes, sizeof(yes)),
+		   "setsockopt failed (%d)", errno);
+
+	test_bind(c_sock, &c_saddr, sizeof(struct net_sockaddr_in));
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+
+	/* Client handshake + initial data. */
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+			     &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	test_work_wait(&test_data.work);
+
+	/* Inject a 0-byte datagram with the client's exact source address. */
+	helper_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(helper_sock >= 0, "helper socket failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(helper_sock, ZSOCK_SOL_SOCKET,
+				    ZSOCK_SO_REUSEPORT, &yes, sizeof(yes)),
+		   "setsockopt failed (%d)", errno);
+	zassert_ok(zsock_bind(helper_sock, &c_saddr,
+			      sizeof(struct net_sockaddr_in)),
+		   "helper bind failed (%d)", errno);
+	ret = zsock_sendto(helper_sock, &tx_buf, 0, 0, &s_saddr,
+			   sizeof(struct net_sockaddr_in));
+	zassert_equal(ret, 0, "empty sendto() failed (%d)", errno);
+
+	k_msleep(10);
+
+	/* The empty datagram must be dropped: no EOF, no session teardown. */
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should not have returned data/EOF");
+	zassert_equal(errno, EAGAIN, "wrong errno value: %d", errno);
+
+	/* The established session must still carry data. */
+	test_send(c_sock, &tx_buf, sizeof(tx_buf), 0);
+
+	recv_addrlen = sizeof(recv_addr);
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+			     &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() after empty datagram failed");
+	dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr);
+
+	(void)zsock_close(helper_sock);
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
+}
+
+void tls_set_session_cache_cb(void)
+{
+	int t = ZSOCK_TLS_SESSION_CACHE_ENABLED;
+	int l = sizeof(int);
+
+	int ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+				   (void *)&t, l);
+	zassert_equal(ret, 0, "Unable to set session cache on server");
+}
+
+ZTEST(net_socket_tls, test_session_cache)
+{
+	int ret;
+	int enabled = 0;
+	int len = sizeof(int);
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1
+	};
+
+	test_prepare_tls_connection_ex(NET_AF_INET, false, tls_set_session_cache_cb, NULL);
+
+	/* Check that the session cache is enabled */
+	ret = zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+			       (void *)&enabled, (net_socklen_t *)&len);
+	zassert_equal(ret, 0, "Unable to get session cache enabled status");
+	zassert_equal(enabled, ZSOCK_TLS_SESSION_CACHE_ENABLED,
+		      "Session cache value does not match what was set");
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+
+	/* recv() shall block until send work sends the data. */
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+/* Helper enabling session cache on both client and server sockets. Used by
+ * test_session_cache_client_resume to exercise the wolfSSL tls_session_store /
+ * tls_session_restore marshalling code path.
+ */
+static void tls_set_session_cache_client_cb(void)
+{
+	int t = ZSOCK_TLS_SESSION_CACHE_ENABLED;
+	int l = sizeof(int);
+	int ret;
+
+	ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+			       (void *)&t, l);
+	zassert_equal(ret, 0, "Unable to set session cache on server");
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+			       (void *)&t, l);
+	zassert_equal(ret, 0, "Unable to set session cache on client");
+}
+
+/* Sets up a TLS client/server connection on a FIXED server port so two
+ * consecutive connections present the same peer address (which is the key
+ * into client_cache). Used by test_session_cache_client_resume — the
+ * main test_prepare_* helpers use ANY_PORT, which prevents resumption
+ * lookup from matching across connections.
+ */
+static void prepare_tls_session_resume_connection(uint16_t server_port)
+{
+	struct net_sockaddr_in c_saddr;
+	struct net_sockaddr_in s_saddr;
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+	int reuse = 1;
+	int ret;
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr,
+			    NET_IPPROTO_TLS_1_2);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, server_port, &s_sock, &s_saddr,
+			    NET_IPPROTO_TLS_1_2);
+
+	tls_set_session_cache_client_cb();
+
+	test_config_psk(s_sock, c_sock);
+
+	/* Fixed server port + back-to-back binds in the same suite: ask the
+	 * stack to allow rebind so the test isn't fragile if a previous
+	 * teardown's TIME_WAIT entry is still around.
+	 */
+	ret = zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_REUSEADDR,
+			       &reuse, sizeof(reuse));
+	zassert_equal(ret, 0, "ZSOCK_SO_REUSEADDR on server socket failed");
+
+	test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct net_sockaddr *)&s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+}
+
+/* Verifies that the second connect to the same peer actually resumes via the
+ * client-side session marshalling (mbedTLS: tls_session_save/get; wolfSSL:
+ * wolfSSL_i2d_SSL_SESSION / wolfSSL_d2i_SSL_SESSION in tls_session_store /
+ * tls_session_restore). Purges first so state is isolated.
+ */
+ZTEST(net_socket_tls, test_session_cache_client_resume)
+{
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1,
+	};
+	int ret;
+
+	/* Purge any sessions left by earlier tests so we can observe the
+	 * transition from "no cached session" to "cached session".
+	 */
+	{
+		int dummy = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+
+		zassert_true(dummy >= 0, "purge socket open failed");
+		ret = zsock_setsockopt(dummy, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE_PURGE,
+				       NULL, 0);
+		zassert_equal(ret, 0, "purge setsockopt failed");
+		zsock_close(dummy);
+	}
+
+	/* First connection — should perform full handshake, then store. */
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+
+#if defined(CONFIG_WOLFSSL)
+	{
+		WOLFSSL *ssl = ztls_get_wolfssl_context(c_sock);
+		int reused;
+
+		zassert_not_null(ssl, "Failed to get wolfSSL context");
+		reused = wolfSSL_session_reused(ssl);
+		zassert_equal(reused, 0,
+			      "First connect should not be a resumption (got %d)",
+			      reused);
+	}
+#endif
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	/* Second connection to the SAME server port — should restore the
+	 * stored session and resume.
+	 */
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+
+#if defined(CONFIG_WOLFSSL)
+	{
+		WOLFSSL *ssl = ztls_get_wolfssl_context(c_sock);
+		int reused;
+
+		zassert_not_null(ssl, "Failed to get wolfSSL context");
+		reused = wolfSSL_session_reused(ssl);
+		zassert_not_equal(reused, 0,
+				  "Second connect did not reuse session");
+	}
+#endif
+
+	memset(rx_buf, 0, sizeof(rx_buf));
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+/* Smoke test for M01: verify that a TLS handshake completes when wolfSSL
+ * secure renegotiation is enabled. With HAVE_SECURE_RENEGOTIATION the TLS
+ * init path calls wolfSSL_UseSecureRenegotiation() on each new SSL object;
+ * a failure there fails ztls_connect_ctx/ztls_accept_ctx. A successful
+ * handshake proves the call is reachable and the API is wired up. A full
+ * renegotiation round-trip would require additional hooks into the Zephyr
+ * TLS socket API which are out of scope here.
+ */
+ZTEST(net_socket_tls, test_tls_renegotiation_smoke)
+{
+#if defined(CONFIG_WOLFSSL)
+#if !defined(HAVE_SECURE_RENEGOTIATION)
+	ztest_test_skip();
+	return;
+#endif
+#elif !defined(CONFIG_MBEDTLS_SSL_RENEGOTIATION)
+	ztest_test_skip();
+	return;
+#endif
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1,
+	};
+	int ret;
+
+	test_prepare_tls_connection(NET_AF_INET);
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+const char *alpn_list[] = {
+	"http/1.0",
+	"http/1.1"
+};
+
+void tls_set_alpn_cb(void)
+{
+	net_socklen_t len = sizeof(alpn_list);
+	int ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_ALPN_LIST,
+				   (void *)alpn_list, len);
+	zassert_equal(ret, 0, "Unable to set alpn on server");
+}
+
+ZTEST(net_socket_tls, test_alpn)
+{
+#if CONFIG_NET_SOCKETS_TLS_MAX_APP_PROTOCOLS > 0
+	int ret;
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
+	struct send_data test_data = {
+		.data = TEST_STR_SMALL,
+		.datalen = sizeof(TEST_STR_SMALL) - 1
+	};
+	const char *alpn_buf[2];
+	int alpn_len = sizeof(alpn_buf);
+
+	alpn_buf[0] = NULL;
+	alpn_buf[1] = NULL;
+
+	test_prepare_tls_connection_ex(NET_AF_INET, false, tls_set_alpn_cb, NULL);
+
+	/* Check that the ALPN list is the one we set */
+	ret = zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_ALPN_LIST,
+			       (void *)alpn_buf, (net_socklen_t *)&alpn_len);
+	zassert_equal(ret, 0, "Unable to get alpn list");
+	zassert_equal(alpn_len, sizeof(alpn_list), "Retrieved ALPN list length incorrect");
+	zassert_equal(strlen(alpn_buf[0]), strlen(alpn_list[0]),
+		      "Retrieved ALPN list element length incorrect");
+	zassert_mem_equal(alpn_buf[0], alpn_list[0], strlen(alpn_list[0]),
+			  "Retrieved ALPN element does not match what was set");
+	zassert_equal(strlen(alpn_buf[1]), strlen(alpn_list[1]),
+		      "Retrieved ALPN list element length incorrect");
+	zassert_mem_equal(alpn_buf[1], alpn_list[1], strlen(alpn_list[1]),
+			  "Retrieved ALPN element does not match what was set");
+
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.tx_work, send_work_handler);
+	test_work_reschedule(&test_data.tx_work, K_MSEC(10));
+
+	/* recv() shall block until send work sends the data. */
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed");
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#else
+	ztest_test_skip();
+#endif
+}
+
 ZTEST(net_socket_tls, test_poll_tls_pollin)
 {
 	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
@@ -1630,6 +2475,7 @@ ZTEST(net_socket_tls, test_poll_tls_pollin)
 
 ZTEST(net_socket_tls, test_poll_dtls_pollin)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
 	struct send_data test_data = {
 		.data = TEST_STR_SMALL,
@@ -1663,6 +2509,9 @@ ZTEST(net_socket_tls, test_poll_dtls_pollin)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(net_socket_tls, test_poll_tls_pollout)
@@ -1715,6 +2564,7 @@ ZTEST(net_socket_tls, test_poll_tls_pollout)
 
 ZTEST(net_socket_tls, test_poll_dtls_pollout)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	struct zsock_pollfd fds[1];
 	int ret;
 
@@ -1732,6 +2582,9 @@ ZTEST(net_socket_tls, test_poll_dtls_pollout)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(net_socket_tls, test_poll_tls_pollhup)
@@ -1764,6 +2617,7 @@ ZTEST(net_socket_tls, test_poll_tls_pollhup)
 
 ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	struct zsock_pollfd fds[1];
 	uint8_t rx_buf;
 	int ret;
@@ -1789,6 +2643,9 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(net_socket_tls, test_poll_tls_pollerr)
@@ -1798,7 +2655,11 @@ ZTEST(net_socket_tls, test_poll_tls_pollerr)
 	struct zsock_pollfd fds[1];
 	int optval;
 	net_socklen_t optlen = sizeof(optval);
+#if defined(CONFIG_WOLFSSL)
+	WOLFSSL *ssl_ctx;
+#else
 	mbedtls_ssl_context *ssl_ctx;
+#endif
 
 	test_prepare_tls_connection(NET_AF_INET6);
 
@@ -1806,9 +2667,14 @@ ZTEST(net_socket_tls, test_poll_tls_pollerr)
 	fds[0].events = ZSOCK_POLLIN;
 
 	/* Get access to the underlying ssl context, and send alert. */
+#if defined(CONFIG_WOLFSSL)
+	ssl_ctx = ztls_get_wolfssl_context(c_sock);
+	test_wolfssl_send_fatal_alert(ssl_ctx);
+#else
 	ssl_ctx = ztls_get_mbedtls_ssl_context(c_sock);
 	mbedtls_ssl_send_alert_message(ssl_ctx, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
 				       MBEDTLS_SSL_ALERT_MSG_INTERNAL_ERROR);
+#endif
 
 	ret = zsock_poll(fds, 1, 100);
 	zassert_equal(ret, 1, "poll() should've report event");
@@ -1829,12 +2695,17 @@ ZTEST(net_socket_tls, test_poll_tls_pollerr)
 
 ZTEST(net_socket_tls, test_poll_dtls_pollerr)
 {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	uint8_t rx_buf;
 	int ret;
 	struct zsock_pollfd fds[1];
 	int optval;
 	net_socklen_t optlen = sizeof(optval);
+#if defined(CONFIG_WOLFSSL)
+	WOLFSSL *ssl_ctx;
+#else
 	mbedtls_ssl_context *ssl_ctx;
+#endif
 
 	test_prepare_dtls_connection(NET_AF_INET6);
 
@@ -1842,9 +2713,14 @@ ZTEST(net_socket_tls, test_poll_dtls_pollerr)
 	fds[0].events = ZSOCK_POLLIN;
 
 	/* Get access to the underlying ssl context, and send alert. */
+#if defined(CONFIG_WOLFSSL)
+	ssl_ctx = ztls_get_wolfssl_context(c_sock);
+	test_wolfssl_send_fatal_alert(ssl_ctx);
+#else
 	ssl_ctx = ztls_get_mbedtls_ssl_context(c_sock);
 	mbedtls_ssl_send_alert_message(ssl_ctx, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
 				       MBEDTLS_SSL_ALERT_MSG_INTERNAL_ERROR);
+#endif
 
 	ret = zsock_poll(fds, 1, 100);
 	zassert_equal(ret, 1, "poll() should've report event");
@@ -1863,6 +2739,9 @@ ZTEST(net_socket_tls, test_poll_dtls_pollerr)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
 }
 
 #define BAD_CA_CERT_TAG 11
@@ -2728,6 +3607,71 @@ ZTEST(net_socket_tls, test_v4_dtls_server_session_timeout_recvfrom)
 ZTEST(net_socket_tls, test_v6_dtls_server_session_timeout_recvfrom)
 {
 	test_dtls_server_session_timeout_recvfrom(NET_AF_INET6);
+}
+
+ZTEST(net_socket_tls, test_tls13_psk_handshake)
+{
+#if !defined(WOLFSSL_TLS13) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+	return;
+#else
+	struct net_sockaddr_in6 c_saddr, s_saddr;
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+	uint8_t tx_buf[] = TEST_STR_SMALL;
+	uint8_t rx_buf[sizeof(tx_buf)];
+	int ret;
+	int optval;
+	net_socklen_t optlen = sizeof(optval);
+
+	prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &c_sock,
+			    &c_saddr, NET_IPPROTO_TLS_1_3);
+	prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &s_sock,
+			    &s_saddr, NET_IPPROTO_TLS_1_3);
+
+	test_config_psk(s_sock, c_sock);
+
+	test_bind(s_sock, (struct net_sockaddr *)&s_saddr,
+		  sizeof(struct net_sockaddr_in6));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct net_sockaddr *)&s_saddr;
+	k_work_init_delayable(&test_data.work,
+			      client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	/* Verify protocol is TLS 1.3 via socket option */
+	ret = zsock_getsockopt(new_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_PROTOCOL,
+			       &optval, &optlen);
+	zassert_equal(ret, 0, "getsockopt failed (%d)", errno);
+	zassert_equal(optval, NET_IPPROTO_TLS_1_3,
+		      "Expected TLS 1.3 protocol");
+
+	/* Verify TLS 1.3 was actually negotiated, not just requested */
+	{
+		WOLFSSL *ssl = ztls_get_wolfssl_context(new_sock);
+
+		zassert_not_null(ssl, "Failed to get wolfSSL context");
+		zassert_equal(wolfSSL_GetVersion(ssl), WOLFSSL_TLSV1_3,
+			      "Negotiated version is not TLS 1.3");
+	}
+
+	/* Send and receive */
+	test_send(c_sock, tx_buf, sizeof(tx_buf), 0);
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(tx_buf), "recv() failed");
+	zassert_mem_equal(rx_buf, tx_buf, sizeof(tx_buf),
+			  "Data mismatch");
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
 }
 
 static void *tls_tests_setup(void)

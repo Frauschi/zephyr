@@ -7,20 +7,40 @@ common:
     - socket
     - tls
   filter: CONFIG_FULL_LIBC_SUPPORTED
-  integration_platforms:
-    - qemu_x86
   platform_exclude: vmu_rt1170/mimxrt1176/cm7 # See #61129
+  # NOTE: integration_platforms is set per-scenario rather than here.
+  # Twister merges common list keys into every scenario, so a common
+  # qemu_x86 entry would become an (invalid) integration platform of
+  # the wolfssl scenario, whose platform_allow is native_sim only.
+  # Remember to add integration_platforms to new scenarios.
 tests:
   net.socket.tls:
     extra_configs:
       - CONFIG_NET_TC_THREAD_COOPERATIVE=y
+    integration_platforms:
+      - qemu_x86
   net.socket.tls.preempt:
     extra_configs:
       - CONFIG_NET_TC_THREAD_PREEMPTIVE=y
     platform_exclude: mps2/an385
+    integration_platforms:
+      - qemu_x86
   net.socket.tls.sendmsg_no_buf:
     extra_configs:
       - CONFIG_NET_SOCKETS_DTLS_SENDMSG_BUF_SIZE=0
+    integration_platforms:
+      - qemu_x86
   net.socket.tls.no_dtls_cid:
     extra_configs:
       - CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID=n
+    integration_platforms:
+      - qemu_x86
+  net.socket.tls.wolfssl:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - CONF_FILE=prj_wolfssl.conf

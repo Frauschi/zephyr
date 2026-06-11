@@ -20,3 +20,12 @@ tests:
     integration_toolchains:
       - host
       - llvm
+  net.http.server.tls.wolfssl:
+    tags: wolfssl
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim/native/64
+    extra_args:
+      - OVERLAY_CONFIG=overlay-wolfssl.conf
