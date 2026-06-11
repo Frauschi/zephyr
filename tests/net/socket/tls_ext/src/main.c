@@ -634,19 +634,6 @@ static void *setup(void)
 {
 	int r;
 
-#if defined(CONFIG_WOLFSSL)
-	/* native_sim starts with CLOCK_REALTIME at epoch 0 (1970).
-	 * wolfSSL validates certificate dates, so set the clock to a
-	 * date within the test certificates' validity period.
-	 */
-	const struct timespec ts = {
-		.tv_sec = 1704067200, /* 2024-01-01T00:00:00Z */
-		.tv_nsec = 0,
-	};
-
-	(void)clock_settime(CLOCK_REALTIME, &ts);
-#endif /* CONFIG_WOLFSSL */
-
 	/*
 	 * Load both client & server credentials
 	 *
@@ -1011,4 +998,27 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
 
-ZTEST_SUITE(net_socket_tls_api_extension, NULL, setup, NULL, NULL, NULL);
+#if defined(CONFIG_WOLFSSL)
+/* 2025-06-01, inside the 2020..2119 validity of the test certificates */
+#define WOLFSSL_CERT_VALID_TIME 1748736000
+
+static void set_cert_validity_clock(void *fixture)
+{
+	const struct timespec ts = {
+		.tv_sec = WOLFSSL_CERT_VALID_TIME,
+		.tv_nsec = 0,
+	};
+	int ret;
+
+	ARG_UNUSED(fixture);
+
+	/* ztest resets the realtime clock to 1970 after each test, so set it before each one */
+	ret = clock_settime(CLOCK_REALTIME, &ts);
+	zassert_ok(ret, "failed to set CLOCK_REALTIME (%d)", ret);
+}
+#define TLS_EXT_BEFORE set_cert_validity_clock
+#else
+#define TLS_EXT_BEFORE NULL
+#endif /* CONFIG_WOLFSSL */
+
+ZTEST_SUITE(net_socket_tls_api_extension, NULL, setup, TLS_EXT_BEFORE, NULL, NULL);

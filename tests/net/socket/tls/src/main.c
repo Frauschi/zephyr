@@ -3749,6 +3749,25 @@ ZTEST(net_socket_tls, test_v6_dtls_server_cid_matching_on_addr_change)
 	test_dtls_server_cid_matching_on_addr_change(NET_AF_INET6);
 }
 
+/* Waits a bounded time for the peer's close_notify, which real targets deliver
+ * asynchronously; a missing one still fails the caller's ENOTCONN check.
+ */
+static int recv_await_peer_closed(int sock)
+{
+	uint8_t rx_buf;
+	int ret = -1;
+
+	for (int i = 0; i < 20; i++) {
+		ret = zsock_recv(sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		if (ret == -1 && errno == ENOTCONN) {
+			break;
+		}
+		k_msleep(5);
+	}
+
+	return ret;
+}
+
 static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 {
 	struct net_sockaddr c_saddr_1;
@@ -3771,11 +3790,8 @@ static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* The client sees the server's close_notify, which may still be in flight */
+	ret = recv_await_peer_closed(c_sock);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 
@@ -3793,11 +3809,8 @@ static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
 	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify second client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify second client socket reports error (server closed the session). */
+	ret = recv_await_peer_closed(c_sock_2);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 }
@@ -3841,11 +3854,8 @@ static void test_dtls_server_session_timeout_recvfrom(net_sa_family_t family)
 	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Small delay for the alerts exchange */
-	k_msleep(10);
-
-	/* Verify client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* The client sees the server's close_notify, which may still be in flight */
+	ret = recv_await_peer_closed(c_sock);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 
@@ -3861,8 +3871,8 @@ static void test_dtls_server_session_timeout_recvfrom(net_sa_family_t family)
 	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
-	/* Verify second client socket reports error (server closed the session) */
-	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Verify second client socket reports error (server closed the session). */
+	ret = recv_await_peer_closed(c_sock_2);
 	zassert_equal(ret, -1, "recv() should've failed");
 	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
 }
