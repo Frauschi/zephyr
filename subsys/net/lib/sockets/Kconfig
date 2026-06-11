@@ -129,11 +129,75 @@ config NET_SOCKETS_SERVICE_STACK_SIZE
 config NET_SOCKETS_SOCKOPT_TLS
 	bool "TCP TLS socket option support"
 	imply TLS_CREDENTIALS
-	select MBEDTLS if NET_NATIVE
-	select PSA_CRYPTO if NET_NATIVE
+	select MBEDTLS if NET_NATIVE && !WOLFSSL
+	select PSA_CRYPTO if NET_NATIVE && !WOLFSSL
+	# wolfSSL backend requirements. The integration calls a narrow set of
+	# non-base wolfSSL APIs; only the strict minimum is force-selected
+	# here to keep flash/RAM cost on constrained targets low:
+	#   SET_CIPHER_BYTES - wolfSSL_set_cipher_list_bytes (small)
+	#   OPENSSL_EXTRA_X509_SMALL - exposes WOLFSSL_X509_STORE_CTX::current_cert
+	#                      which the verify callback reads to perform the
+	#                      leaf CN/SAN match. wolfSSL gates the whole
+	#                      X509_STORE_CTX struct member on this flag.
+	#   ALWAYS_VERIFY_CB - fires verify cb on chain success too. Load-
+	#                      bearing: without it the leaf CN/SAN match in
+	#                      tls_wolfssl_verify_accumulate_cb is silently
+	#                      bypassed and a cert with mismatched CN/SAN
+	#                      would be accepted by TLS_PEER_VERIFY_REQUIRED.
+	# Session resumption (CONFIG_WOLFSSL_SESSION_EXPORT) is NOT forced:
+	# the integration's tls_session_store/restore become no-ops when
+	# HAVE_EXT_CACHE is undefined, so enabling it is an explicit opt-in.
+	# (wolfSSL_clear, wolfSSL_X509_check_host and wolfSSL_set_verify are
+	# always available in src/ssl.c / src/x509.c / src/ssl_api_cert.c.)
+	# Gated on `WOLFSSL && !MBEDTLS` because the backends are mutually
+	# exclusive: pulling these wolfSSL knobs in on an mbedTLS build (e.g.
+	# when CONFIG_WOLFSSL=y is enabled for the random subsystem only) is
+	# pure bloat and risks user confusion.
+	select WOLFSSL_SET_CIPHER_BYTES if WOLFSSL && !MBEDTLS
+	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS
+	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS
 	help
 	  Enable TLS socket option support which automatically establishes
 	  a TLS connection to the remote host.
+
+choice NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE_CHOICE
+	prompt "wolfSSL TLS 1.3 PSK default ciphersuite"
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && WOLFSSL_TLS_VERSION_1_3 \
+		&& WOLFSSL_PSK
+	default NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
+	help
+	  TLS 1.3 PSK exchange binds a PSK to a single hash algorithm, but
+	  the Zephyr TLS_CREDENTIAL_PSK API doesn't carry that information.
+	  This choice fixes which ciphersuite the wolfSSL TLS 1.3 PSK
+	  callbacks return for any PSK presented. Enumerated rather than
+	  free-text so typos surface as a build-time Kconfig error.
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
+	bool "TLS13-AES128-GCM-SHA256 (mandatory-to-implement)"
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES256_GCM_SHA384
+	bool "TLS13-AES256-GCM-SHA384"
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CHACHA20_POLY1305_SHA256
+	bool "TLS13-CHACHA20-POLY1305-SHA256"
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_SHA256
+	bool "TLS13-AES128-CCM-SHA256"
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_8_SHA256
+	bool "TLS13-AES128-CCM-8-SHA256"
+
+endchoice
+
+config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE
+	string
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && WOLFSSL_TLS_VERSION_1_3 \
+		&& WOLFSSL_PSK
+	default "TLS13-AES128-GCM-SHA256"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
+	default "TLS13-AES256-GCM-SHA384"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES256_GCM_SHA384
+	default "TLS13-CHACHA20-POLY1305-SHA256" if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CHACHA20_POLY1305_SHA256
+	default "TLS13-AES128-CCM-SHA256"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_SHA256
+	default "TLS13-AES128-CCM-8-SHA256"      if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_8_SHA256
 
 config NET_SOCKETS_TLS_CONNECT_TIMEOUT
 	int "Timeout value in milliseconds for TLS handshake"
@@ -155,15 +219,18 @@ config NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 	bool "Set Maximum Fragment Length (MFL)"
 	default y
 	help
-	  Call mbedtls_ssl_conf_max_frag_len() on created TLS context
-	  configuration, so that Maximum Fragment Length (MFL) will be sent to
-	  peer using RFC 6066 max_fragment_length extension.
+	  Configure the created TLS context so that Maximum Fragment Length (MFL)
+	  will be sent to peer using RFC 6066 max_fragment_length extension.
 
-	  Maximum Fragment Length (MFL) value is automatically chosen based on
-	  MBEDTLS_SSL_OUT_CONTENT_LEN and MBEDTLS_SSL_IN_CONTENT_LEN mbed TLS
-	  macros (which are configured by CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN in
-	  case of default mbed TLS config). With DTLS, MFL value may be further
-	  limited with NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH.
+	  For MbedTLS, Maximum Fragment Length (MFL) value is automatically
+	  chosen based on MBEDTLS_SSL_OUT_CONTENT_LEN and
+	  MBEDTLS_SSL_IN_CONTENT_LEN mbed TLS macros (which are configured by
+	  CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN in case of default mbed TLS config).
+	  With DTLS, MFL value may be further limited with
+	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH.
+
+	  For WolfSSL, Maximum Fragment Length (MFL) value is set by the
+	  configuration option WOLFSSL_MAX_FRAGMENT_LEN.
 
 	  This is mostly useful for TLS client side to tell TLS server what is
 	  the maximum supported receive record length.
@@ -171,7 +238,7 @@ config NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 config NET_SOCKETS_ENABLE_DTLS
 	bool "DTLS socket support"
 	depends on NET_SOCKETS_SOCKOPT_TLS
-	select MBEDTLS_SSL_PROTO_DTLS if NET_NATIVE
+	select MBEDTLS_SSL_PROTO_DTLS if NET_NATIVE && !WOLFSSL
 	help
 	  Enable DTLS socket support. By default only TLS over TCP is supported.
 
@@ -261,7 +328,7 @@ config NET_SOCKETS_TLS_MAX_CIPHERSUITES
 config NET_SOCKETS_TLS_MAX_APP_PROTOCOLS
 	int "Maximum number of supported application layer protocols"
 	default 2
-	depends on NET_SOCKETS_SOCKOPT_TLS && MBEDTLS_SSL_ALPN
+	depends on NET_SOCKETS_SOCKOPT_TLS && (MBEDTLS_SSL_ALPN || WOLFSSL_ALPN)
 	help
 	  This variable sets maximum number of supported application layer
 	  protocols over TLS/DTLS that can be set explicitly by a socket option.
@@ -276,12 +343,41 @@ config NET_SOCKETS_TLS_MAX_CLIENT_SESSION_COUNT
 	  used for TLS/DTLS session resumption.
 
 config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
-	bool "TLS certificate verification callback support"
+	bool "TLS certificate verification callback support (mbedTLS backend only)"
 	depends on NET_SOCKETS_SOCKOPT_TLS
 	help
-	  This option controls whether TLS_CERT_VERIFY_CALLBACK TLS socket option
-	  is available to use. It allows to register a certificate verification
-	  callback, which is called by the TLS backend during the TLS handshake.
+	  This option controls whether the TLS_CERT_VERIFY_CALLBACK TLS
+	  socket option is available to use. When set, applications can
+	  register a certificate verification callback that is invoked by
+	  the TLS backend during the handshake.
+
+	  This option is only honored by the mbedTLS backend. On the
+	  wolfSSL backend, setsockopt(TLS_CERT_VERIFY_CALLBACK) returns
+	  -ENOTSUP. wolfSSL users should use TLS_CERT_VERIFY_CALLBACK_WOLFSSL
+	  (CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK) instead.
+
+config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
+	bool "wolfSSL-style cert-verify callback"
+	depends on WOLFSSL
+	depends on NET_SOCKETS_SOCKOPT_TLS
+	select WOLFSSL_ALWAYS_VERIFY_CB
+	help
+	  Enable registration of wolfSSL-style VerifyCallback functions
+	  via the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.
+
+	  The wolfSSL-style callback receives the standard wolfSSL
+	  arguments:
+	    int callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *ctx)
+
+	  This option may be enabled alongside
+	  CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK; the mbedTLS-style
+	  TLS_CERT_VERIFY_CALLBACK setsockopt simply returns -ENOTSUP
+	  when the wolfSSL backend is active.
+
+	  When a wolfSSL-style callback is registered, TLS_CERT_VERIFY_RESULT
+	  still returns accumulated MBEDTLS_X509_BADCERT_* flags for chain
+	  errors observed during verification; the callback additionally
+	  controls whether the handshake proceeds.
 
 config NET_SOCKETS_OFFLOAD
 	bool "Offload Socket APIs"
