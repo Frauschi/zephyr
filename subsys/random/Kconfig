@@ -161,6 +161,17 @@ config PSA_CSPRNG_GENERATOR
 	  security-sensitive applications.
 
 
+config WOLFSSL_CSPRNG_GENERATOR
+	bool "Use wolfSSL Hash-DRBG CSPRNG"
+	depends on WOLFSSL
+	depends on ENTROPY_HAS_DRIVER
+	help
+	  Enables the wolfSSL DRBG cryptographically secure pseudo-random
+	  number generator (wc_RNG). The DRBG uses the entropy API for
+	  its initialization seed and reseeding. The wolfSSL Hash-DRBG is
+	  a NIST SP 800-90A compliant cryptographically secure random
+	  number generator.
+
 config TEST_CSPRNG_GENERATOR
 	bool "Use insecure CSPRNG for testing purposes"
 	depends on TEST_RANDOM_GENERATOR
@@ -169,6 +180,15 @@ config TEST_CSPRNG_GENERATOR
 	  libraries that use the former to be tested with ZTEST.
 
 endchoice # CSPRNG_GENERATOR_CHOICE
+
+config WOLFSSL_CSPRNG_PERSONALIZATION
+	string "wolfSSL DRBG personalization string"
+	default "zephyr wolfssl-rng seed"
+	depends on WOLFSSL_CSPRNG_GENERATOR
+	help
+	  Personalization (nonce) string fed into the wolfSSL DRBG at
+	  instantiation, in addition to the entropy input from the
+	  entropy driver.
 
 config CS_CTR_DRBG_PERSONALIZATION
 	string "CTR-DRBG Personalization string"
