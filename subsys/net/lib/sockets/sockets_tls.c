@@ -3837,22 +3837,24 @@ err_cleanup:
 
 #if defined(CONFIG_WOLFSSL)
 /* wolfSSL_X509_load_certificate_buffer is gated in
- * modules/crypto/wolfssl/src/x509.c around line 6055 on
+ * modules/crypto/wolfssl/src/x509.c on
  *   OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL || WOLFSSL_WPAS_SMALL ||
  *   KEEP_PEER_CERT || SESSION_CERTS
- * (the OPENSSL_EXTRA_X509_SMALL arm is our downstream patch). The Zephyr
- * TLS sockets backend force-selects WOLFSSL_OPENSSL_EXTRA_X509_SMALL, so
- * the function is normally available — but if a wolfSSL uprev drops the
- * downstream patch and no user-supplied flag fills the gap, the build
- * would fail with an obscure linker error. Fail loudly here instead.
+ * The OPENSSL_EXTRA_X509_SMALL arm is upstream as of wolfSSL 5.9.2, and the
+ * Zephyr TLS sockets backend force-selects WOLFSSL_OPENSSL_EXTRA_X509_SMALL
+ * (subsys/net/lib/sockets/Kconfig). The same flag is required regardless for
+ * the client hostname/verify path (wolfSSL_X509_check_host,
+ * WOLFSSL_X509_STORE_CTX), so the X509 layer is always compiled in and this
+ * function is normally available. If a minimal or future config leaves all
+ * of these gate flags undefined, the build would fail with an obscure linker
+ * error; fail loudly here instead.
  */
 #if !defined(OPENSSL_EXTRA) && !defined(OPENSSL_EXTRA_X509_SMALL) && \
     !defined(WOLFSSL_WPAS_SMALL) && !defined(KEEP_PEER_CERT) && \
     !defined(SESSION_CERTS)
-#error "tls_check_cert needs wolfSSL_X509_load_certificate_buffer. Either "\
-       "re-apply the modules/crypto/wolfssl/src/x509.c gate-relaxation "\
-       "patch (OPENSSL_EXTRA_X509_SMALL) or enable one of OPENSSL_EXTRA, "\
-       "WOLFSSL_WPAS_SMALL, KEEP_PEER_CERT, SESSION_CERTS."
+#error "tls_check_cert needs wolfSSL_X509_load_certificate_buffer. Enable one "\
+       "of OPENSSL_EXTRA_X509_SMALL (CONFIG_WOLFSSL_OPENSSL_EXTRA_X509_SMALL), "\
+       "OPENSSL_EXTRA, WOLFSSL_WPAS_SMALL, KEEP_PEER_CERT, or SESSION_CERTS."
 #endif /* X509 gate flags */
 #endif /* CONFIG_WOLFSSL */
 
@@ -3862,9 +3864,10 @@ static int tls_check_cert(struct tls_credential *cert)
 	/* Parse the cert here so setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
 	 * on malformed credentials (mbedTLS-parity contract exercised by
 	 * test_tls_bad_cred). The X509 is freed immediately so no peer-cert
-	 * retention is needed — the OPENSSL_EXTRA_X509_SMALL arm of the gate
-	 * (see modules/crypto/wolfssl/src/x509.c:6055) is our downstream
-	 * relaxation so KEEP_PEER_CERT isn't forced just for validation.
+	 * retention is needed — OPENSSL_EXTRA_X509_SMALL (upstream in wolfSSL
+	 * 5.9.2, force-selected by the sockets backend and already required by
+	 * the hostname/verify path) satisfies the gate, so KEEP_PEER_CERT is
+	 * not forced just for validation.
 	 */
 	WOLFSSL_X509 *x509;
 	int fmt;
