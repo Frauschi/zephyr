@@ -121,6 +121,13 @@ config CSPRNG_ENABLED
 
 choice CSPRNG_GENERATOR_CHOICE
 	prompt "Cryptographically secure random generator"
+	# When wolfSSL is the crypto backend, prefer the standard PSA CSPRNG backed
+	# by the wolfPSA provider (sys_csrand_get -> psa_generate_random -> wolfPSA);
+	# with wolfSSL but no PSA provider, fall back to the wolfSSL Hash-DRBG CSPRNG.
+	# These lead the list so the whole image draws randomness through one
+	# wolfCrypt RNG path; the original hardware/test defaults follow unchanged.
+	default PSA_CSPRNG_GENERATOR if WOLFPSA
+	default WOLFSSL_CSPRNG_GENERATOR if WOLFSSL
 	default HARDWARE_DEVICE_CS_GENERATOR
 	default TEST_CSPRNG_GENERATOR
 	help
