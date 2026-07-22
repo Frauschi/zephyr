@@ -121,6 +121,9 @@ config CSPRNG_ENABLED
 
 choice CSPRNG_GENERATOR_CHOICE
 	prompt "Cryptographically secure random generator"
+	# A wolfSSL image draws randomness from wolfCrypt: wolfPSA if present, else the Hash-DRBG
+	default PSA_CSPRNG_GENERATOR if WOLFPSA
+	default WOLFSSL_CSPRNG_GENERATOR if WOLFSSL
 	default HARDWARE_DEVICE_CS_GENERATOR
 	default TEST_CSPRNG_GENERATOR
 	help
