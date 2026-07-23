@@ -62,6 +62,15 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr_mbedtls_priv.h>
 #endif
 
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_MBEDTLS)
+/* The two TLS-socket backends are mutually exclusive: their function blocks
+ * define the same ZTLS_* macros and IO callbacks. Fail early with an actionable
+ * message instead of a downstream macro-redefinition / VERIFY_CB #error.
+ */
+#error "wolfSSL and mbedTLS TLS-socket backends are mutually exclusive; " \
+       "enable exactly one of CONFIG_WOLFSSL / CONFIG_MBEDTLS."
+#endif
+
 #if defined(CONFIG_WOLFSSL)
 /* wolfssl/wolfcrypt/settings.h's WOLFSSL_ZEPHYR block #defines POSIX
  * socket names (socket, bind, connect, ..., getsockname) to their
@@ -459,6 +468,11 @@ static void tls_session_cache_reset(void)
 	k_mutex_lock(&client_cache_lock, K_FOREVER);
 	for (int i = 0; i < ARRAY_SIZE(client_cache); i++) {
 		if (client_cache[i].session != NULL) {
+			/* Serialized session holds the TLS master/resumption
+			 * secret; scrub before releasing to the heap.
+			 */
+			wc_ForceZero(client_cache[i].session,
+				     client_cache[i].session_len);
 			XFREE(client_cache[i].session, NULL,
 			      DYNAMIC_TYPE_TMP_BUFFER);
 		}
@@ -1069,9 +1083,13 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 				break;
 			}
 
+			/* No free slot and no peer match yet: keep the
+			 * least-recently-used (oldest, i.e. smallest timestamp)
+			 * used slot as the eviction candidate.
+			 */
 			if (entry == NULL ||
 			    (entry->session != NULL &&
-			     entry->timestamp < client_cache[i].timestamp)) {
+			     entry->timestamp > client_cache[i].timestamp)) {
 				entry = &client_cache[i];
 			}
 		}
@@ -1082,6 +1100,8 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 	}
 
 	if (entry->session != NULL) {
+		/* Evicted blob holds session secret material; scrub it. */
+		wc_ForceZero(entry->session, entry->session_len);
 		XFREE(entry->session, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		entry->session = NULL;
 		entry->session_len = 0;
@@ -1167,6 +1187,13 @@ static void tls_session_store(struct tls_context *context,
 
 exit:
 	if (serialized != NULL) {
+		/* On the reserve-failure path this still holds the fully
+		 * serialized session (secret); scrub the written bytes. size is
+		 * the i2d length (>0 only once serialization succeeded).
+		 */
+		if (size > 0) {
+			wc_ForceZero(serialized, (size_t)size);
+		}
 		XFREE(serialized, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	}
 	wolfSSL_SESSION_free(session);
@@ -1237,6 +1264,8 @@ static void tls_session_restore(struct tls_context *context,
 			if (client_cache[i].session != NULL &&
 			    peer_addr_cmp(&client_cache[i].peer_addr,
 					  &peer_addr)) {
+				wc_ForceZero(client_cache[i].session,
+					     client_cache[i].session_len);
 				XFREE(client_cache[i].session, NULL,
 				      DYNAMIC_TYPE_TMP_BUFFER);
 				client_cache[i].session = NULL;
@@ -1245,6 +1274,7 @@ static void tls_session_restore(struct tls_context *context,
 			}
 		}
 		k_mutex_unlock(&client_cache_lock);
+		wc_ForceZero(serialized_copy, serialized_len);
 		XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		return;
 	}
@@ -1254,6 +1284,7 @@ static void tls_session_restore(struct tls_context *context,
 	}
 
 	wolfSSL_SESSION_free(session);
+	wc_ForceZero(serialized_copy, serialized_len);
 	XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 #endif /* HAVE_EXT_CACHE */
 }
@@ -2720,8 +2751,12 @@ static int tls_wolfssl_connect(struct tls_context *context, k_timeout_t timeout)
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 			if (context->type == SOCK_DGRAM) {
+				/* wolfSSL reports the DTLS retransmit timeout in
+				 * seconds; convert to ms.
+				 */
 				int timeout_dtls =
-					wolfSSL_dtls_get_current_timeout(context->wssl);
+					wolfSSL_dtls_get_current_timeout(context->wssl)
+						* MSEC_PER_SEC;
 
 				if (timeout_ms == SYS_FOREVER_MS) {
 					timeout_ms = timeout_dtls;
@@ -2799,8 +2834,12 @@ static int tls_wolfssl_accept(struct tls_context *context, k_timeout_t timeout)
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 			if (context->type == SOCK_DGRAM) {
+				/* wolfSSL reports the DTLS retransmit timeout in
+				 * seconds; convert to ms.
+				 */
 				int timeout_dtls =
-					wolfSSL_dtls_get_current_timeout(context->wssl);
+					wolfSSL_dtls_get_current_timeout(context->wssl)
+						* MSEC_PER_SEC;
 
 				if (timeout_ms == SYS_FOREVER_MS) {
 					timeout_ms = timeout_dtls;
@@ -3363,12 +3402,32 @@ static int tls_wolfssl_set_alpn(struct tls_context *context)
 static int tls_wolfssl_set_dtls_timeouts(struct tls_context *context)
 {
 	if (context->type == SOCK_DGRAM) {
-		if (wolfSSL_dtls_set_timeout_max(context->wssl,
-				(int)context->options.dtls_handshake_timeout_max) != WOLFSSL_SUCCESS) {
+		int init_s;
+		int max_s;
+
+		/* wolfSSL's DTLS retransmit timeout API takes whole seconds, but
+		 * dtls_handshake_timeout_min/max are stored in milliseconds (the
+		 * socket-option and mbedTLS-shared unit). Convert here, rounding
+		 * up so a sub-second value never collapses to 0, and keep
+		 * init <= max.
+		 */
+		init_s = (int)((context->options.dtls_handshake_timeout_min +
+				MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		if (init_s < 1) {
+			init_s = 1;
+		}
+		max_s = (int)((context->options.dtls_handshake_timeout_max +
+			       MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		if (max_s < init_s) {
+			max_s = init_s;
+		}
+
+		if (wolfSSL_dtls_set_timeout_max(context->wssl, max_s)
+				!= WOLFSSL_SUCCESS) {
 			return -EINVAL;
 		}
-		if (wolfSSL_dtls_set_timeout_init(context->wssl,
-				(int)context->options.dtls_handshake_timeout_min) != WOLFSSL_SUCCESS) {
+		if (wolfSSL_dtls_set_timeout_init(context->wssl, init_s)
+				!= WOLFSSL_SUCCESS) {
 			return -EINVAL;
 		}
 
@@ -3532,13 +3591,17 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	}
 #endif /* !NO_PSK */
 
-#if defined(CONFIG_WOLFSSL_MAX_FRAGMENT_LEN)
+#if defined(CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) && \
+	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+	/* Gate on the socket-layer MFL toggle too, so setting it n disables
+	 * max_fragment_length negotiation on wolfSSL as the option advertises.
+	 */
 	if (wolfSSL_CTX_UseMaxFragment(context->ctx,
 				       CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) != WOLFSSL_SUCCESS) {
 		ret = -EINVAL;
 		goto err_cleanup;
 	}
-#endif /* CONFIG_WOLFSSL_MAX_FRAGMENT_LEN */
+#endif /* WOLFSSL_MAX_FRAGMENT_LEN && NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH */
 
 	if (NULL == context->wssl) {
 		if ((context->wssl = wolfSSL_new(context->ctx)) == NULL) {
@@ -3676,6 +3739,11 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	 * unsigned, so the lower bound is implicit.
 	 */
 	if (optlen > UINT16_MAX) {
+		/* Mirror the NULL / ENOMEM paths: host_name was already freed to
+		 * NULL above, so leaving is_hostname_set true would drive a later
+		 * connect() into wolfSSL_UseSNI(..., NULL, 0) and break the socket.
+		 */
+		context->options.is_hostname_set = false;
 		return -EINVAL;
 	}
 
@@ -4453,6 +4521,10 @@ static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
 						    const void *optval,
 						    socklen_t optlen)
 {
+	ARG_UNUSED(context);
+	ARG_UNUSED(optval);
+	ARG_UNUSED(optlen);
+
 	return -ENOPROTOOPT;
 }
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
@@ -5313,9 +5385,12 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 				}
 
 				{
+					/* wolfSSL reports the DTLS timeout in
+					 * seconds; convert to ms.
+					 */
 					int timeout_dtls =
 						wolfSSL_dtls_get_current_timeout(
-							ctx->wssl);
+							ctx->wssl) * MSEC_PER_SEC;
 					int timeout_sock =
 						timeout_to_ms(&timeout);
 
