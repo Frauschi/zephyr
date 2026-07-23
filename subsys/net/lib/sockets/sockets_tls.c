@@ -5496,12 +5496,15 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 			int r = wolfSSL_read(ctx->wssl, dummy, to_read);
 
 			if (r <= 0) {
+				wc_ForceZero(dummy, sizeof(dummy));
 				NET_ERR("Error while flushing the rest of the"
 					" datagram, err %d", r);
 				ret = -EIO;
 				break;
 			}
 			remaining -= r;
+			/* Scrub the plaintext drained into the discard buffer */
+			wc_ForceZero(dummy, sizeof(dummy));
 		}
 
 		return ret;
