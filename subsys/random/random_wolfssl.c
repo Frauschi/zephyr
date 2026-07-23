@@ -6,6 +6,7 @@
 
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
+#include <zephyr/random/random.h>
 #include <string.h>
 
 #ifndef WOLFSSL_USER_SETTINGS
@@ -43,7 +44,7 @@ static int wolfssl_rng_initialize(void)
 	return 0;
 }
 
-int z_impl_sys_csrand_get(void *dst, uint32_t outlen)
+int z_impl_sys_csrand_get(void *dst, size_t outlen)
 {
 	int ret;
 
