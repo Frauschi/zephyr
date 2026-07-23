@@ -548,7 +548,7 @@ struct test_cert_verify_ctx {
 };
 
 static int cert_verify_cb(void *ctx, mbedtls_x509_crt *crt, int depth,
-			   uint32_t *flags)
+			  uint32_t *flags)
 {
 	struct test_cert_verify_ctx *test_ctx = (struct test_cert_verify_ctx *)ctx;
 

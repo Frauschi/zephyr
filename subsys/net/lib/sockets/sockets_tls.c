@@ -57,6 +57,15 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr_mbedtls_priv.h>
 #endif
 
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_MBEDTLS)
+/* The two TLS-socket backends are mutually exclusive: their function blocks
+ * define the same ZTLS_* macros and IO callbacks. Fail early with an actionable
+ * message instead of a downstream macro-redefinition / VERIFY_CB #error.
+ */
+#error "wolfSSL and mbedTLS TLS-socket backends are mutually exclusive; " \
+       "enable exactly one of CONFIG_WOLFSSL / CONFIG_MBEDTLS."
+#endif
+
 #if defined(CONFIG_WOLFSSL)
 /* wolfssl/wolfcrypt/settings.h's WOLFSSL_ZEPHYR block #defines POSIX
  * socket names (socket, bind, connect, ..., getsockname) to their
@@ -526,6 +535,9 @@ static void tls_session_cache_reset(void)
 	k_mutex_lock(&session_cache_lock, K_FOREVER);
 	for (int i = 0; i < ARRAY_SIZE(client_cache); i++) {
 		if (client_cache[i].session != NULL) {
+			/* The serialized session holds the resumption secret */
+			wc_ForceZero(client_cache[i].session,
+				     client_cache[i].session_len);
 			XFREE(client_cache[i].session, NULL,
 			      DYNAMIC_TYPE_TMP_BUFFER);
 		}
@@ -1226,9 +1238,10 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 				break;
 			}
 
+			/* Otherwise evict the least recently used slot */
 			if (entry == NULL ||
 			    (entry->session != NULL &&
-			     entry->timestamp < client_cache[i].timestamp)) {
+			     entry->timestamp > client_cache[i].timestamp)) {
 				entry = &client_cache[i];
 			}
 		}
@@ -1239,6 +1252,8 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 	}
 
 	if (entry->session != NULL) {
+		/* Evicted blob holds session secret material; scrub it. */
+		wc_ForceZero(entry->session, entry->session_len);
 		XFREE(entry->session, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		entry->session = NULL;
 		entry->session_len = 0;
@@ -1325,6 +1340,13 @@ static void tls_session_store(struct tls_context *context,
 
 exit:
 	if (serialized != NULL) {
+		/* On the reserve-failure path this still holds the fully
+		 * serialized session (secret); scrub the written bytes. size is
+		 * the i2d length (>0 only once serialization succeeded).
+		 */
+		if (size > 0) {
+			wc_ForceZero(serialized, (size_t)size);
+		}
 		XFREE(serialized, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	}
 	wolfSSL_SESSION_free(session);
@@ -1345,6 +1367,8 @@ static void tls_session_restore(struct tls_context *context,
 	struct net_sockaddr_storage peer_addr = { 0 };
 	unsigned char *serialized_copy = NULL;
 	size_t serialized_len = 0;
+	const uint8_t *stale;
+	int64_t stale_ts;
 	const unsigned char *p;
 
 	if (!context->options.cache_enabled ||
@@ -1385,18 +1409,21 @@ static void tls_session_restore(struct tls_context *context,
 	}
 	memcpy(serialized_copy, entry->session, entry->session_len);
 	serialized_len = entry->session_len;
+	stale = entry->session;
+	stale_ts = entry->timestamp;
 	k_mutex_unlock(&session_cache_lock);
 
 	p = serialized_copy;
 	session = wolfSSL_d2i_SSL_SESSION(NULL, &p, (long)serialized_len);
 	if (session == NULL) {
 		NET_ERR("Failed to load TLS session");
-		/* Evict any stale entry that still matches this peer. */
+		/* Evict the entry only if no other socket replaced it meanwhile. */
 		k_mutex_lock(&session_cache_lock, K_FOREVER);
 		for (int i = 0; i < ARRAY_SIZE(client_cache); i++) {
-			if (client_cache[i].session != NULL &&
-			    peer_addr_cmp(net_sad(&client_cache[i].peer_addr),
-					  net_sad(&peer_addr))) {
+			if (client_cache[i].session == stale &&
+			    client_cache[i].timestamp == stale_ts) {
+				wc_ForceZero(client_cache[i].session,
+					     client_cache[i].session_len);
 				XFREE(client_cache[i].session, NULL,
 				      DYNAMIC_TYPE_TMP_BUFFER);
 				client_cache[i].session = NULL;
@@ -1405,6 +1432,7 @@ static void tls_session_restore(struct tls_context *context,
 			}
 		}
 		k_mutex_unlock(&session_cache_lock);
+		wc_ForceZero(serialized_copy, serialized_len);
 		XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		return;
 	}
@@ -1415,6 +1443,7 @@ static void tls_session_restore(struct tls_context *context,
 	}
 
 	wolfSSL_SESSION_free(session);
+	wc_ForceZero(serialized_copy, serialized_len);
 	XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 #endif /* HAVE_EXT_CACHE */
 }
@@ -3348,12 +3377,25 @@ static int tls_wolfssl_set_dtls_timeouts(struct tls_context *context,
 					 struct tls_session_context *session_ctx)
 {
 	if (context->type == NET_SOCK_DGRAM) {
-		if (wolfSSL_dtls_set_timeout_max(session_ctx->wssl,
-				(int)context->options.dtls_handshake_timeout_max) != WOLFSSL_SUCCESS) {
-			return -EINVAL;
+		int init_s;
+		int max_s;
+
+		/* wolfSSL takes whole seconds; round up so a sub-second value does not become 0. */
+		init_s = (int)((context->options.dtls_handshake_timeout_min +
+				MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		if (init_s < 1) {
+			init_s = 1;
 		}
-		if (wolfSSL_dtls_set_timeout_init(session_ctx->wssl,
-				(int)context->options.dtls_handshake_timeout_min) != WOLFSSL_SUCCESS) {
+		max_s = (int)((context->options.dtls_handshake_timeout_max +
+			       MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		if (max_s < init_s) {
+			max_s = init_s;
+		}
+
+		/* Lower init first: wolfSSL rejects a max below the current init. */
+		if (wolfSSL_dtls_set_timeout_init(session_ctx->wssl, 1) != WOLFSSL_SUCCESS ||
+		    wolfSSL_dtls_set_timeout_max(session_ctx->wssl, max_s) != WOLFSSL_SUCCESS ||
+		    wolfSSL_dtls_set_timeout_init(session_ctx->wssl, init_s) != WOLFSSL_SUCCESS) {
 			return -EINVAL;
 		}
 
@@ -3788,13 +3830,17 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	}
 #endif /* !NO_PSK */
 
-#if defined(CONFIG_WOLFSSL_MAX_FRAGMENT_LEN)
+#if defined(CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) && \
+	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+	/* Gate on the socket-layer MFL toggle too, so setting it n disables
+	 * max_fragment_length negotiation on wolfSSL as the option advertises.
+	 */
 	if (wolfSSL_CTX_UseMaxFragment(context->ctx,
 				       CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) != WOLFSSL_SUCCESS) {
 		ret = -EINVAL;
 		goto err_cleanup;
 	}
-#endif /* CONFIG_WOLFSSL_MAX_FRAGMENT_LEN */
+#endif /* WOLFSSL_MAX_FRAGMENT_LEN && NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH */
 
 	ret = tls_wolfssl_set_session_cache_mode(context);
 	if (ret != 0) {
@@ -4138,6 +4184,11 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	 * unsigned, so the lower bound is implicit.
 	 */
 	if (optlen > UINT16_MAX) {
+		/* Mirror the NULL / ENOMEM paths: host_name was already freed to
+		 * NULL above, so leaving is_hostname_set true would drive a later
+		 * connect() into wolfSSL_UseSNI(..., NULL, 0) and break the socket.
+		 */
+		context->options.is_hostname_set = false;
 		return -EINVAL;
 	}
 
@@ -4982,6 +5033,10 @@ static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
 						    const void *optval,
 						    net_socklen_t optlen)
 {
+	ARG_UNUSED(context);
+	ARG_UNUSED(optval);
+	ARG_UNUSED(optlen);
+
 	return -ENOPROTOOPT;
 }
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
