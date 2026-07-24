@@ -11,8 +11,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include <mbedtls/constant_time.h>
-
 /*
  * BLAKE2S IMPLEMENTATION
  * Note: BLAKE2s is not available in PSA Crypto API, so we always use
@@ -82,7 +80,33 @@
 		(p)[0] = U8V((v) >> 56);                                                           \
 	} while (0)
 
-#define crypto_zero(dest, len) mbedtls_platform_zeroize(dest, len)
-#define crypto_equal(a, b, n) (mbedtls_ct_memcmp(a, b, n) == 0 ? true : false)
+/*
+ * Constant-time helpers, provided locally so WireGuard does not depend on
+ * mbedTLS. crypto_equal MUST run in constant time - it compares message
+ * authentication tags, where a data-dependent early exit would leak timing.
+ * crypto_zero clears secrets through a volatile pointer so the stores are not
+ * optimized away.
+ */
+static inline void crypto_zero(void *dest, size_t len)
+{
+	volatile uint8_t *p = (volatile uint8_t *)dest;
+
+	while (len--) {
+		*p++ = 0U;
+	}
+}
+
+static inline bool crypto_equal(const void *a, const void *b, size_t n)
+{
+	const volatile uint8_t *pa = (const volatile uint8_t *)a;
+	const volatile uint8_t *pb = (const volatile uint8_t *)b;
+	uint8_t diff = 0U;
+
+	while (n--) {
+		diff |= (uint8_t)(*pa++ ^ *pb++);
+	}
+
+	return diff == 0U;
+}
 
 #endif /* _CRYPTO_H_ */

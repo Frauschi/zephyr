@@ -72,8 +72,8 @@ config UPDATEHUB_SHELL
 
 config UPDATEHUB_DTLS
 	bool "Activate communication CoAPS/DTLS"
-	select MBEDTLS
-	select MBEDTLS_ENABLE_HEAP
+	select MBEDTLS if !WOLFSSL
+	select MBEDTLS_ENABLE_HEAP if !WOLFSSL
 	select NET_SOCKETS_SOCKOPT_TLS
 	select NET_SOCKETS_ENABLE_DTLS
 	help
