@@ -1299,6 +1299,7 @@ static void tls_session_store(struct tls_context *context,
 	struct tls_session_cache *entry;
 	struct net_sockaddr_storage peer_addr = { 0 };
 	unsigned char *serialized = NULL;
+	size_t alloc_len = 0;
 	int size;
 
 	if (!context->options.cache_enabled ||
@@ -1325,7 +1326,9 @@ static void tls_session_store(struct tls_context *context,
 		goto exit;
 	}
 
-	serialized = XMALLOC((size_t)size, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	alloc_len = (size_t)size;
+
+	serialized = XMALLOC(alloc_len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (serialized == NULL) {
 		NET_ERR("Failed to allocate session buffer.");
 		goto exit;
@@ -1358,13 +1361,11 @@ static void tls_session_store(struct tls_context *context,
 
 exit:
 	if (serialized != NULL) {
-		/* On the reserve-failure path this still holds the fully
-		 * serialized session (secret); scrub the written bytes. size is
-		 * the i2d length (>0 only once serialization succeeded).
+		/* Holds session secrets on the reserve-failure path, and a
+		 * partial serialization when i2d itself failed. Scrub the whole
+		 * allocation: the sizing query bounds whatever i2d wrote.
 		 */
-		if (size > 0) {
-			wc_ForceZero(serialized, (size_t)size);
-		}
+		wc_ForceZero(serialized, alloc_len);
 		XFREE(serialized, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	}
 	wolfSSL_SESSION_free(session);
@@ -2922,7 +2923,12 @@ static unsigned int tls_psk_server_cb(WOLFSSL *ssl, const char *identity,
 		return 0;
 	}
 
-	if (XSTRCMP(identity, (const char *)context->psk_id) != 0) {
+	/* TLS_CREDENTIAL_PSK_ID is length-delimited, so compare the full
+	 * registered length. XSTRCMP would stop at an embedded NUL and accept
+	 * a shorter identity that is a prefix of the registered one.
+	 */
+	if (XSTRLEN(identity) != context->psk_id_len ||
+	    XMEMCMP(identity, context->psk_id, context->psk_id_len) != 0) {
 		return 0;
 	}
 
