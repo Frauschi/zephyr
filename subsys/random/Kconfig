@@ -188,15 +188,6 @@ config TEST_CSPRNG_GENERATOR
 
 endchoice # CSPRNG_GENERATOR_CHOICE
 
-config WOLFSSL_CSPRNG_PERSONALIZATION
-	string "wolfSSL DRBG personalization string"
-	default "zephyr wolfssl-rng seed"
-	depends on WOLFSSL_CSPRNG_GENERATOR
-	help
-	  Personalization (nonce) string fed into the wolfSSL DRBG at
-	  instantiation, in addition to the entropy input from the
-	  entropy driver.
-
 config CS_CTR_DRBG_PERSONALIZATION
 	string "CTR-DRBG Personalization string"
 	default "zephyr ctr-drbg seed"
