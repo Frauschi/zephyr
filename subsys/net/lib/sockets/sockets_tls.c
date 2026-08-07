@@ -132,6 +132,22 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #error "DTLS sockets enabled but wolfssl DTLS not enabled"
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && !WOLFSSL_DTLS */
 
+/* WOLFCRYPT_ONLY compiles the whole wolfSSL TLS layer out, so every
+ * wolfSSL_* call below would fail to link.
+ */
+#if defined(WOLFCRYPT_ONLY)
+#error "Zephyr TLS sockets need the wolfSSL TLS layer " \
+       "(disable CONFIG_WOLFSSL_CRYPTO_ONLY)"
+#endif /* WOLFCRYPT_ONLY */
+
+/* The session-cache paths below call wolfSSL_CTX_set_session_cache_mode(),
+ * wolfSSL_get1_session() and friends, all compiled out by NO_SESSION_CACHE.
+ */
+#if defined(NO_SESSION_CACHE)
+#error "Zephyr TLS sockets with wolfSSL require the session cache " \
+       "(enable CONFIG_WOLFSSL_SESSION_CACHE)"
+#endif /* NO_SESSION_CACHE */
+
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
@@ -771,13 +787,7 @@ static int tls_init(void)
 	tls_session_cache_settings_load();
 #endif
 #if defined(CONFIG_WOLFSSL) && defined(WOLFSSL_TLS13) && !defined(NO_PSK)
-	/* Validate the configured TLS 1.3 PSK ciphersuite at init: a typo in
-	 * CONFIG_NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE is a build-
-	 * time bug, not a transient runtime issue, so fail loudly here
-	 * rather than at first handshake. __ASSERT panics dev builds (CONFIG_
-	 * ASSERT=y); returning non-zero from tls_init signals SYS_INIT
-	 * failure so release builds also surface the misconfiguration.
-	 */
+	/* SYS_INIT ignores the return value, so only the assert stops a bad ciphersuite at boot */
 	{
 		byte cs0, cs1;
 		int  cs_flags = 0;
@@ -3334,6 +3344,7 @@ static int tls_wolfssl_set_hostname(struct tls_context *context,
 		return 0;
 	}
 
+#if defined(HAVE_SNI)
 	if (context->options.is_hostname_set) {
 		if (wolfSSL_UseSNI(session_ctx->wssl, WOLFSSL_SNI_HOST_NAME,
 				   (const char *)context->host_name,
@@ -3341,6 +3352,12 @@ static int tls_wolfssl_set_hostname(struct tls_context *context,
 			return -EINVAL;
 		}
 	}
+#endif /* HAVE_SNI */
+
+	/* Without HAVE_SNI the extension is simply not sent. The hostname is
+	 * still recorded and still drives the CN/SAN match in the verify
+	 * callback, which is what TLS_PEER_VERIFY depends on.
+	 */
 
 	return 0;
 }
@@ -4244,7 +4261,12 @@ static int tls_check_priv_key(struct tls_credential *priv_key)
 	int fmt;
 	int ret;
 
+	/* Without OPENSSL_EXTRA, wolfSSL parses a key only through a CTX */
+#ifndef NO_WOLFSSL_CLIENT
 	tmp_ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
+#else
+	tmp_ctx = wolfSSL_CTX_new(wolfSSLv23_server_method());
+#endif
 	if (tmp_ctx == NULL) {
 		return -ENOMEM;
 	}
