@@ -342,9 +342,14 @@ static int test_configure_client(struct net_sockaddr_in *sa, bool own_cert,
 			     sec_tag_list, sec_tag_list_size);
 	zassert_not_equal(r, -1, "failed to set ZSOCK_TLS_SEC_TAG_LIST (%d)", errno);
 
-	r = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, hostname,
-			     strlen(hostname) + 1);
-	zassert_not_equal(r, -1, "failed to set ZSOCK_TLS_HOSTNAME (%d)", errno);
+	/* A NULL hostname leaves TLS_HOSTNAME unset, which both backends treat
+	 * as a peer identity that cannot be verified.
+	 */
+	if (hostname != NULL) {
+		r = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, hostname,
+				     strlen(hostname) + 1);
+		zassert_not_equal(r, -1, "failed to set ZSOCK_TLS_HOSTNAME (%d)", errno);
+	}
 
 	sa->sin_family = NET_PF_INET;
 	sa->sin_port = net_htons(PORT);
@@ -495,12 +500,52 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_bad_cn)
 	test_tls_cert_verify_result_opt_common(MBEDTLS_X509_BADCERT_CN_MISMATCH);
 }
 
-/* Applications commonly pass strlen(host) + 1 (or sizeof a literal) as
- * optlen for TLS_HOSTNAME. The mbedTLS backend ignores optlen and reads a
- * C string; the wolfSSL backend uses optlen as the hostname length and
- * strips a trailing NUL. Both must accept the NUL-terminated form and
- * still match the certificate CN - pin that here.
- */
+/* Without TLS_HOSTNAME, REQUIRED has no name to check, so the handshake fails */
+ZTEST(net_socket_tls_api_extension, test_tls_no_hostname_required_rejected)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	int peer_verify = ZSOCK_TLS_PEER_VERIFY_REQUIRED;
+
+	server_fd = test_configure_server(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_NONE,
+					  false, true);
+	client_fd = test_configure_client(&sa, false, NULL);
+
+	ret = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set ZSOCK_TLS_PEER_VERIFY (%d)", errno);
+
+	ret = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_equal(ret, -1, "connect succeeded without a hostname to verify");
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
+/* NONE skips the name check, so it is never stricter than OPTIONAL */
+ZTEST(net_socket_tls_api_extension, test_tls_verify_none_ignores_hostname)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	int peer_verify = ZSOCK_TLS_PEER_VERIFY_NONE;
+
+	server_fd = test_configure_server(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_NONE,
+					  false, false);
+	client_fd = test_configure_client(&sa, false, "dummy");
+
+	ret = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set ZSOCK_TLS_PEER_VERIFY (%d)", errno);
+
+	ret = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(ret, -1, "TLS_PEER_VERIFY_NONE rejected a hostname mismatch (%d)",
+			  errno);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
+/* optlen often counts the terminating NUL, which both backends accept */
 ZTEST(net_socket_tls_api_extension, test_tls_hostname_trailing_nul)
 {
 	int server_fd, client_fd, ret;
