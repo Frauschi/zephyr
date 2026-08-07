@@ -342,9 +342,14 @@ static int test_configure_client(struct sockaddr_in *sa, bool own_cert,
 		       sec_tag_list, sec_tag_list_size);
 	zassert_not_equal(r, -1, "failed to set TLS_SEC_TAG_LIST (%d)", errno);
 
-	r = setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, hostname,
-		       strlen(hostname) + 1);
-	zassert_not_equal(r, -1, "failed to set TLS_HOSTNAME (%d)", errno);
+	/* A NULL hostname leaves TLS_HOSTNAME unset, which both backends treat
+	 * as a peer identity that cannot be verified.
+	 */
+	if (hostname != NULL) {
+		r = setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, hostname,
+			       strlen(hostname) + 1);
+		zassert_not_equal(r, -1, "failed to set TLS_HOSTNAME (%d)", errno);
+	}
 
 	sa->sin_family = AF_INET;
 	sa->sin_port = htons(PORT);
@@ -493,6 +498,57 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_ok)
 ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_bad_cn)
 {
 	test_tls_cert_verify_result_opt_common(MBEDTLS_X509_BADCERT_CN_MISMATCH);
+}
+
+/* A client that never sets TLS_HOSTNAME has no name to check the peer
+ * certificate against, so TLS_PEER_VERIFY_REQUIRED must reject it rather
+ * than accept a certificate issued for any name.
+ */
+ZTEST(net_socket_tls_api_extension, test_tls_no_hostname_required_rejected)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	int peer_verify = TLS_PEER_VERIFY_REQUIRED;
+
+	server_fd = test_configure_server(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					  false, true);
+	client_fd = test_configure_client(&sa, false, NULL);
+
+	ret = setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+			 &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+	ret = connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_equal(ret, -1, "connect succeeded without a hostname to verify");
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
+/* TLS_PEER_VERIFY_NONE means no peer verification at all, so a hostname
+ * that cannot match must not fail the handshake. Guards against the name
+ * check making NONE stricter than OPTIONAL.
+ */
+ZTEST(net_socket_tls_api_extension, test_tls_verify_none_ignores_hostname)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	int peer_verify = TLS_PEER_VERIFY_NONE;
+
+	server_fd = test_configure_server(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					  false, false);
+	client_fd = test_configure_client(&sa, false, "dummy");
+
+	ret = setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+			 &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+	ret = connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(ret, -1, "TLS_PEER_VERIFY_NONE rejected a hostname mismatch (%d)",
+			  errno);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
 }
 
 /* --- Unified cert verify callback tests (mbedTLS backend only) --- */

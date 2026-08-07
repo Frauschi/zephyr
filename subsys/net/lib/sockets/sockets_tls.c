@@ -142,7 +142,23 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && !defined(WOLFSSL_DTLS)
 #error "DTLS sockets enabled but wolfssl DTLS not enabled"
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && !WOLFSSL_DTLS */
+#endif
+
+/* WOLFCRYPT_ONLY compiles the whole wolfSSL TLS layer out, so every
+ * wolfSSL_* call below would fail to link.
+ */
+#if defined(WOLFCRYPT_ONLY)
+#error "Zephyr TLS sockets need the wolfSSL TLS layer " \
+       "(disable CONFIG_WOLFSSL_CRYPTO_ONLY)"
+#endif /* WOLFCRYPT_ONLY */
+
+/* The session-cache paths below call wolfSSL_CTX_set_session_cache_mode(),
+ * wolfSSL_get1_session() and friends, all compiled out by NO_SESSION_CACHE.
+ */
+#if defined(NO_SESSION_CACHE)
+#error "Zephyr TLS sockets with wolfSSL require the session cache " \
+       "(enable CONFIG_WOLFSSL_SESSION_CACHE)"
+#endif /* NO_SESSION_CACHE */ /* CONFIG_NET_SOCKETS_ENABLE_DTLS && !WOLFSSL_DTLS */
 
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
@@ -258,6 +274,11 @@ __net_socket struct tls_context {
 	 *  to upstream.
 	 */
 	bool recv_eof : 1;
+
+	/* Set once the application configured TLS_DTLS_ROLE explicitly, so
+	 * tls_wolfssl_init() derives the role only when it was left to us.
+	 */
+	bool role_set : 1;
 #endif /* CONFIG_WOLFSSL */
 
 	/** Socket type. */
@@ -1743,7 +1764,12 @@ static int tls_add_own_cert(struct tls_context *tls,
 	if (crt_is_pem(own_cert->buf, own_cert->len)) {
 		format = WOLFSSL_FILETYPE_PEM;
 	}
-	ret = wolfSSL_CTX_use_certificate_buffer(tls->ctx, own_cert->buf,
+	/* Chain variant, not the single-certificate one: applications ship the
+	 * leaf and its intermediates as one concatenated credential, and
+	 * mbedtls_x509_crt_parse() on the other backend loads all of them.
+	 * Loading only the leaf sends an incomplete chain to the peer.
+	 */
+	ret = wolfSSL_CTX_use_certificate_chain_buffer_format(tls->ctx, own_cert->buf,
 						 own_cert->len, format);
 	if (ret != WOLFSSL_SUCCESS) {
 		NET_ERR("Failed to parse certificate");
@@ -2365,7 +2391,15 @@ static int tls_check_priv_key(struct tls_credential *priv_key)
 	int fmt;
 	int ret;
 
+	/* wolfSSL has no CTX-free private key parser without OPENSSL_EXTRA, so
+	 * validation borrows a throwaway CTX. Pick a method that exists in this
+	 * build: wolfSSLv23_client_method() is compiled out by NO_WOLFSSL_CLIENT.
+	 */
+#ifndef NO_WOLFSSL_CLIENT
 	tmp_ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
+#else
+	tmp_ctx = wolfSSL_CTX_new(wolfSSLv23_server_method());
+#endif
 	if (tmp_ctx == NULL) {
 		return -ENOMEM;
 	}
@@ -2582,6 +2616,14 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 
 		err = wolfSSL_get_error(ctx->wssl, ret);
 
+		/* A zero-length write is legal and wolfSSL reports it as 0 with
+		 * no error latched. Treat it as the no-op the mbedTLS backend
+		 * does, otherwise the catch-all below tears down the session.
+		 */
+		if (ret == 0 && err == WOLFSSL_ERROR_NONE) {
+			return 0;
+		}
+
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			int timeout_ms;
@@ -2607,9 +2649,17 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 			}
 		} else {
 			NET_ERR("TLS send error: %x", err);
-			tls_wolfssl_reset(ctx);
-			ctx->error = ECONNABORTED;
-			errno = ECONNABORTED;
+			/* Distinguish a failed session reset from a plain abort,
+			 * as the mbedTLS arm does: the SSL object is unusable in
+			 * that case, not merely disconnected.
+			 */
+			if (tls_wolfssl_reset(ctx) != 0) {
+				ctx->error = ENOMEM;
+				errno = ENOMEM;
+			} else {
+				ctx->error = ECONNABORTED;
+				errno = ECONNABORTED;
+			}
 			break;
 		}
 	} while (true);
@@ -2714,6 +2764,16 @@ err:
 		}
 
 		if (ret == 0) {
+			/* wolfSSL reports a clean TLS-level closure as 0 with the
+			 * reason latched in ssl->error. Mark the session closed so
+			 * a later send() fails like the mbedTLS backend instead of
+			 * writing to a shut-down session.
+			 */
+			err = wolfSSL_get_error(ctx->wssl, ret);
+			if (err == WOLFSSL_ERROR_ZERO_RETURN ||
+			    err == SOCKET_PEER_CLOSED_E) {
+				ctx->session_closed = true;
+			}
 			break;
 		}
 
@@ -2909,7 +2969,12 @@ static unsigned int tls_psk_server_cb(WOLFSSL *ssl, const char *identity,
 		return 0;
 	}
 
-	if (XSTRCMP(identity, context->psk_id) != 0) {
+	/* TLS_CREDENTIAL_PSK_ID is length-delimited, so compare the full
+	 * registered length. XSTRCMP would stop at an embedded NUL and accept
+	 * a shorter identity that is a prefix of the registered one.
+	 */
+	if (XSTRLEN(identity) != context->psk_id_len ||
+	    XMEMCMP(identity, context->psk_id, context->psk_id_len) != 0) {
 		return 0;
 	}
 
@@ -3067,6 +3132,7 @@ static int tls_wolfssl_set_hostname(struct tls_context *context)
 		return 0;
 	}
 
+#if defined(HAVE_SNI)
 	if (context->options.is_hostname_set) {
 		if (wolfSSL_UseSNI(context->wssl, WOLFSSL_SNI_HOST_NAME,
 				   (const char *)context->host_name,
@@ -3074,6 +3140,12 @@ static int tls_wolfssl_set_hostname(struct tls_context *context)
 			return -EINVAL;
 		}
 	}
+#endif /* HAVE_SNI */
+
+	/* Without HAVE_SNI the extension is simply not sent. The hostname is
+	 * still recorded and still drives the CN/SAN match in the verify
+	 * callback, which is what TLS_PEER_VERIFY depends on.
+	 */
 
 	return 0;
 }
@@ -3115,6 +3187,14 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 		return;
 	}
 	if (context->options.role != ZTLS_IS_CLIENT) {
+		return;
+	}
+	/* TLS_PEER_VERIFY_NONE means the application opted out of peer
+	 * verification entirely, so no name check applies. Without this the
+	 * mismatch below would fail a handshake that OPTIONAL lets through,
+	 * making NONE stricter than OPTIONAL.
+	 */
+	if (context->options.verify_level == TLS_PEER_VERIFY_NONE) {
 		return;
 	}
 	if (tls_wolfssl_leaf_hostname_matches(context, store->current_cert)) {
@@ -3533,7 +3613,14 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	WOLFSSL_METHOD *method;
 	int ret;
 
-	context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
+	/* Do not clobber an explicitly configured TLS_DTLS_ROLE: connect() on a
+	 * DTLS socket would otherwise demote a socket the application set up as
+	 * a server, and options.role drives verify level, BIO callbacks and the
+	 * session-reset path.
+	 */
+	if (!context->role_set) {
+		context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
+	}
 
 #if defined(CONFIG_WOLFSSL_DEBUG)
 	wolfSSL_Debugging_ON();
@@ -3543,6 +3630,15 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 
 	if (method == NULL) {
 		return -ENOTSUP;
+	}
+
+	/* wolfSSL_CTX_new() takes ownership of the method, so an already
+	 * initialized context (a DTLS client re-connecting) must release it
+	 * rather than allocate one per call.
+	 */
+	if (context->ctx != NULL) {
+		XFREE(method, NULL, DYNAMIC_TYPE_METHOD);
+		method = NULL;
 	}
 
 	if (context->ctx == NULL) {
@@ -3723,15 +3819,31 @@ static int tls_opt_hostname_set(struct tls_context *context,
 				const void *optval, socklen_t optlen)
 {
 #if defined(CONFIG_WOLFSSL)
-	if (NULL != context->host_name) {
-		XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		context->host_name = NULL;
-		context->host_len = 0;
-	}
+	char *host_name;
 
 	if (optval == NULL) {
+		if (context->host_name != NULL) {
+			XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			context->host_name = NULL;
+			context->host_len = 0;
+		}
 		context->options.is_hostname_set = false;
 		return 0;
+	}
+
+	/* The mbedTLS backend treats optval as a C string and ignores optlen
+	 * entirely, so trim any trailing NUL padding rather than carrying it
+	 * into the SNI extension and the certificate name match.
+	 */
+	while (optlen > 0 && ((const char *)optval)[optlen - 1] == '\0') {
+		optlen--;
+	}
+
+	/* An empty hostname cannot match any certificate and would silently
+	 * disable the name check, so reject it instead.
+	 */
+	if (optlen == 0) {
+		return -EINVAL;
 	}
 
 	/* RFC 6066 SNI HostName is at most 2^16 - 1; reject anything larger
@@ -3739,23 +3851,28 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	 * unsigned, so the lower bound is implicit.
 	 */
 	if (optlen > UINT16_MAX) {
-		/* Mirror the NULL / ENOMEM paths: host_name was already freed to
-		 * NULL above, so leaving is_hostname_set true would drive a later
-		 * connect() into wolfSSL_UseSNI(..., NULL, 0) and break the socket.
-		 */
-		context->options.is_hostname_set = false;
 		return -EINVAL;
 	}
 
+	/* mbedTLS validates before touching the configured hostname. Keep the
+	 * old one until the new one is committed, otherwise a rejected
+	 * setsockopt leaves the socket with no name check at all.
+	 */
+
 	/* +1 for NUL - wolfSSL APIs require C strings. */
-	context->host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-	if (context->host_name == NULL) {
-		context->options.is_hostname_set = false;
+	host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	if (host_name == NULL) {
 		return -ENOMEM;
 	}
 
-	XMEMCPY(context->host_name, optval, optlen);
-	context->host_name[optlen] = '\0';
+	XMEMCPY(host_name, optval, optlen);
+	host_name[optlen] = '\0';
+
+	if (context->host_name != NULL) {
+		XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	}
+
+	context->host_name = host_name;
 	context->host_len = optlen;
 	context->options.is_hostname_set = true;
 
@@ -4420,6 +4537,9 @@ static int tls_opt_dtls_role_set(struct tls_context *context,
 	}
 
 	context->options.role = *role;
+#if defined(CONFIG_WOLFSSL)
+	context->role_set = true;
+#endif
 
 	return 0;
 }
@@ -6040,8 +6160,12 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 	{
 		byte dummy[1];
 
+		/* <= 0, not < 0 - wolfSSL_peek returns 0 for a clean TLS-level
+		 * closure and latches the reason in ssl->error.
+		 */
 		ret = wolfSSL_peek(ctx->wssl, dummy, sizeof(dummy));
-		if (ret < 0) {
+		wc_ForceZero(dummy, sizeof(dummy));
+		if (ret <= 0) {
 			int err = wolfSSL_get_error(ctx->wssl, ret);
 
 			if (err == SOCKET_PEER_CLOSED_E ||
