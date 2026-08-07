@@ -499,7 +499,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_bad_cn)
  * optlen for TLS_HOSTNAME. The mbedTLS backend ignores optlen and reads a
  * C string; the wolfSSL backend uses optlen as the hostname length and
  * strips a trailing NUL. Both must accept the NUL-terminated form and
- * still match the certificate CN — pin that here.
+ * still match the certificate CN - pin that here.
  */
 ZTEST(net_socket_tls_api_extension, test_tls_hostname_trailing_nul)
 {
