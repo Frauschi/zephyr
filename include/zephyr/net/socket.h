@@ -328,7 +328,7 @@ struct zsock_tls_cert_verify_cb {
  *  int (*)(int preverify_ok, WOLFSSL_X509_STORE_CTX *ctx).
  *
  *  Constraints (the TLS layer wraps this callback): it is invoked
- *  synchronously per chain position and must return normally — it must NOT
+ *  synchronously per chain position and must return normally - it must NOT
  *  longjmp/throw out of the call. The application context registered via
  *  @ref zsock_tls_cert_verify_cb_wolfssl is presented through
  *  store_ctx->userCtx for the duration of the call only; the callback must

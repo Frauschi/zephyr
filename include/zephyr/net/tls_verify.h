@@ -9,7 +9,7 @@
  *
  * The wolfSSL backend accumulates certificate verification errors into the
  * TLS_CERT_VERIFY_RESULT getsockopt bitmask using the same hex values as
- * mbedtls/x509.h's MBEDTLS_X509_BADCERT_* macros — the layout is part of
+ * mbedtls/x509.h's MBEDTLS_X509_BADCERT_* macros - the layout is part of
  * the TLS_CERT_VERIFY_RESULT public contract and predates the wolfSSL
  * backend. Applications that already include mbedtls/x509.h are
  * automatically protected from redefinition by the #ifndef guards below.

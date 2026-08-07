@@ -77,11 +77,11 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
  * Suppress with a hard #undef right before each wolfSSL header include
  * rather than save-and-restore via #pragma push_macro/pop_macro: the
  * push form would silently capture (and later reinstall) whatever
- * upstream header had previously defined these names as macros — a
+ * upstream header had previously defined these names as macros - a
  * future addition would be invisible at review time and break the
  * vtable. The #undef form makes it a build error instead.
  *
- * List mirrors the WOLFSSL_ZEPHYR remappings as of wolfSSL master —
+ * List mirrors the WOLFSSL_ZEPHYR remappings as of wolfSSL master -
  * revisit on uprev.
  */
 #undef socket
@@ -477,7 +477,7 @@ BUILD_ASSERT(CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS >= CONFIG_NET_SOCKETS_T
 /* Client-side session cache. mbedTLS uses it unconditionally. wolfSSL only
  * uses it when HAVE_EXT_CACHE is defined (CONFIG_WOLFSSL_SESSION_EXPORT)
  * because session import/export requires the wolfSSL_d2i/i2d APIs gated
- * on that macro — without it tls_session_store/restore are no-ops and
+ * on that macro - without it tls_session_store/restore are no-ops and
  * the cache stays empty, so leave it (and its mutex / reset helper) out
  * of .bss entirely.
  */
@@ -1606,8 +1606,8 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	}
 
 	if (received == 0) {
-		/* Empty datagram (or local read-shutdown). Consume it here —
-		 * before the peer-address check — so a spoofed zero-length
+		/* Empty datagram (or local read-shutdown). Consume it here -
+		 * before the peer-address check - so a spoofed zero-length
 		 * packet can neither wedge the queue head nor drive session
 		 * switching/allocation. Then signal EOF if the local read side
 		 * was shut down (recv_eof), otherwise drop it: empty datagrams
@@ -1640,7 +1640,7 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	if (received == 0) {
 		/* Defensive fallback: empty datagrams are normally consumed by
 		 * the peek branch above, but a fresh one can race in between the
-		 * peek and this read. Same handling — EOF on local read-shutdown
+		 * peek and this read. Same handling - EOF on local read-shutdown
 		 * (recv_eof), otherwise drop the spoofable empty datagram
 		 * (WANT_READ) without refreshing the session timeout.
 		 */
@@ -1685,9 +1685,9 @@ static int dtls_wolf_client_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	}
 
 	if (received == 0) {
-		/* Local read shutdown (recv_eof) → EOF; an empty UDP
+		/* Local read shutdown (recv_eof) -> EOF; an empty UDP
 		 * datagram from the network (spoofable, carries no TLS
-		 * record) → drop and keep the session.
+		 * record) -> drop and keep the session.
 		 */
 		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
@@ -3168,7 +3168,7 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 
 	/* OPTIONAL: return 1 so handshake continues after recording flags.
 	 * Surface a warning when we're about to silently let an invalid
-	 * chain through — applications that set OPTIONAL but never read
+	 * chain through - applications that set OPTIONAL but never read
 	 * TLS_CERT_VERIFY_RESULT will otherwise accept bad certs with no
 	 * trace. mbedTLS prints similar info at debug verbosity.
 	 */
@@ -3442,7 +3442,7 @@ static int tls_wolfssl_set_dtls_timeouts(struct tls_context *context,
  * Always returns 0: the authoritative effect of the setsockopt is the
  * stored option (which every future session applies); pushing it into
  * already-live sessions is best effort. Failing the call midway would
- * leave the stored option and the session states inconsistent — e.g. a
+ * leave the stored option and the session states inconsistent - e.g. a
  * session whose handshake already completed may legitimately refuse a
  * late SNI/ciphersuite update. Argument validation must therefore happen
  * in the option handler before the option is stored, not in the setter.
@@ -3472,7 +3472,7 @@ static int tls_wolfssl_apply_all_sessions(
 }
 
 /* Apply all per-SSL-object settings. Runs both on first session init and
- * again after wolfSSL_clear() in tls_wolfssl_reset_session — wolfSSL_clear
+ * again after wolfSSL_clear() in tls_wolfssl_reset_session - wolfSSL_clear
  * drops per-SSL state configured after wolfSSL_new().
  */
 static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
@@ -3599,7 +3599,7 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 		}
 
 		/* wolfSSL_clear drops per-SSL settings configured after
-		 * wolfSSL_new — re-apply them.
+		 * wolfSSL_new - re-apply them.
 		 */
 		ret = tls_wolfssl_session_setup(session_ctx, context, is_server);
 		if (ret != 0) {
@@ -3702,7 +3702,7 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 			/* wait_for_reason() returns 0 both when the socket
 			 * became ready and when the poll timed out. Only
 			 * report a timeout to wolfSSL when the DTLS
-			 * retransmission timer elapsed — calling
+			 * retransmission timer elapsed - calling
 			 * wolfSSL_dtls_got_timeout() on an early data-ready
 			 * wakeup would needlessly retransmit the flight and
 			 * double wolfSSL's internal timer. Residual: if data
@@ -3923,7 +3923,7 @@ static int tls_check_cert(struct tls_credential *cert)
 	/* Parse the cert here so setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
 	 * on malformed credentials (mbedTLS-parity contract exercised by
 	 * test_tls_bad_cred). The X509 is freed immediately so no peer-cert
-	 * retention is needed — OPENSSL_EXTRA_X509_SMALL (upstream in wolfSSL
+	 * retention is needed - OPENSSL_EXTRA_X509_SMALL (upstream in wolfSSL
 	 * 5.9.2, force-selected by the sockets backend and already required by
 	 * the hostname/verify path) satisfies the gate, so KEEP_PEER_CERT is
 	 * not forced just for validation.
@@ -4233,7 +4233,7 @@ static int tls_opt_hostname_set(struct tls_context *context,
 		return -EINVAL;
 	}
 
-	/* +1 for NUL — wolfSSL APIs require C strings. */
+	/* +1 for NUL - wolfSSL APIs require C strings. */
 	context->host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (context->host_name == NULL) {
 		context->options.is_hostname_set = false;
@@ -4285,7 +4285,7 @@ static int tls_opt_ciphersuite_list_set(struct tls_context *context,
 	}
 
 #if defined(CONFIG_WOLFSSL)
-	/* Validate before storing — tls_wolfssl_apply_all_sessions is
+	/* Validate before storing - tls_wolfssl_apply_all_sessions is
 	 * best-effort and must not be relied on for argument validation.
 	 */
 	for (int i = 0; i < cipher_cnt; i++) {
@@ -4866,7 +4866,7 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	 * flushing it requires a live CTX handle and the socket this option
 	 * is invoked on may never have been connected. Find any in-use
 	 * context that owns a CTX so the purge works regardless of which
-	 * socket it is called on — parity with the mbedTLS backend, which
+	 * socket it is called on - parity with the mbedTLS backend, which
 	 * purges its global server_cache.
 	 */
 	k_mutex_lock(&context_lock, K_FOREVER);
@@ -5913,7 +5913,7 @@ static ssize_t recv_tls_wolfssl(struct tls_context *ctx, void *buf,
 			 * below would land us in the EIO arm.
 			 *
 			 * Return what's been drained across earlier iterations
-			 * (recv_len) — POSIX semantics: a partial recv followed
+			 * (recv_len) - POSIX semantics: a partial recv followed
 			 * by EOF reports the partial. recv_len may be 0 on the
 			 * first iteration, in which case the caller sees clean
 			 * EOF immediately. The DTLS sibling
@@ -6116,7 +6116,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 
 		retry = false;
 		ret = wolfSSL_read(ctx->active_session->wssl, buf, max_len);
-		/* Note: <= 0, not < 0 — wolfSSL_read returns 0 for a clean
+		/* Note: <= 0, not < 0 - wolfSSL_read returns 0 for a clean
 		 * TLS-level closure (peer close-notify), with the actual
 		 * cause reported via wolfSSL_get_error (ZERO_RETURN).
 		 */
@@ -6125,7 +6125,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 
 			/* Local shutdown(SHUT_RD/RDWR) racing with a blocked
 			 * recv(): same hazard as the TCP/TLS path, just
-			 * surfaced differently — the DTLS BIO callbacks map a
+			 * surfaced differently - the DTLS BIO callbacks map a
 			 * 0-byte recvfrom to CBIO_ERR_CONN_CLOSE (symmetry
 			 * with tls_wolf_rx); without this shortcut the next
 			 * iteration would still re-block.
@@ -6133,7 +6133,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 			 * Return 0 unconditionally here (unlike the TCP/TLS
 			 * sibling recv_tls_wolfssl which returns its
 			 * accumulated recv_len). That's not a wolfSSL quirk
-			 * — DTLS recv reads at most one datagram per call,
+			 * - DTLS recv reads at most one datagram per call,
 			 * with no cross-iteration accumulation, exactly
 			 * matching the mbedTLS DTLS path (recvfrom_dtls_common).
 			 * The asymmetry between TCP and DTLS is intrinsic to
@@ -7756,7 +7756,7 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 	case ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL:
 		err = tls_opt_cert_verify_callback_wolfssl_set(ctx, optval, optlen);
 		break;
-	/* Under mbedTLS the option number 21 is reserved but unhandled — it
+	/* Under mbedTLS the option number 21 is reserved but unhandled - it
 	 * falls through to the default case and surfaces as -ENOPROTOOPT,
 	 * which matches the upstream "unknown sockopt" contract.
 	 */
@@ -7942,7 +7942,7 @@ static int tls_sock_shutdown_vmeth(void *obj, int how)
 	ret = zsock_shutdown(ctx->sock, how);
 #if defined(CONFIG_WOLFSSL)
 	/* Mark the TLS layer's read side closed only after the underlying
-	 * socket accepted the shutdown — setting recv_eof before forwarding
+	 * socket accepted the shutdown - setting recv_eof before forwarding
 	 * would poison the recv path for an unsuccessful shutdown. mbedTLS
 	 * does not consult recv_eof, so the write is gated to the wolfSSL
 	 * backend to keep the mbedTLS contract byte-identical with upstream.

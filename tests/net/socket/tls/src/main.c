@@ -13,7 +13,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr/net/tls_credentials.h>
 /* IANA TLS ciphersuite IDs used by this file's set_ciphersuites tests.
  * Names match RFC 5487. Don't introduce a public Zephyr-wide header just
- * for these two — both backends accept IANA IDs verbatim via the byte-
+ * for these two - both backends accept IANA IDs verbatim via the byte-
  * list cipher API. (The RFC 4279 SHA-1 CBC suites used previously are no
  * longer selectable in the Zephyr 4.4 mbedTLS ciphersuite Kconfig.)
  */
@@ -43,7 +43,7 @@ mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
 uint32_t ztls_get_session_count(void);
 
 /* Server-side allow-list. Only TLS_PSK_WITH_AES_256_CBC_SHA384 is enabled
- * in prj.conf for the mbedTLS scenarios — the GCM suite entry is never
+ * in prj.conf for the mbedTLS scenarios - the GCM suite entry is never
  * negotiated, it only exercises list handling and the mismatch case. Keep
  * it that way: enabling extra suites globally in prj.conf would change the
  * default cipher negotiated by the other tests in this file, which size
@@ -80,7 +80,7 @@ static const int cipher_list_psk3[] = {
 #define CLIENT_3_PORT 4245
 /* Dedicated port for test_session_cache_client_resume: the client-side
  * session cache is keyed by peer address, so the test needs a fixed
- * port — but it must not collide with SERVER_PORT used by the DTLS
+ * port - but it must not collide with SERVER_PORT used by the DTLS
  * multi-client tests, to stay independent of suite ordering and
  * TIME_WAIT teardown.
  */
@@ -1397,7 +1397,7 @@ ZTEST(net_socket_tls, test_recv_eof_on_close)
  * GCM), measured by running the suite with an oversized buffer and printing
  * the inbound record length. Different values per backend reflect different
  * implementation choices for the record-layer framing (header layout, IV
- * placement, padding) — they are not part of any wire-format ABI. If a
+ * placement, padding) - they are not part of any wire-format ABI. If a
  * test starts failing here after a backend or ciphersuite change, re-measure
  * with an oversized buffer and update.
  */
@@ -1796,11 +1796,11 @@ ZTEST(net_socket_tls, test_dtls_shutdown_rd_while_recv)
 	test_prepare_dtls_connection(NET_AF_INET6);
 
 	/* Schedule reception shutdown from workqueue while recv() is blocked
-	 * — exercises the recv_eof check inside the wolfSSL DTLS recv loop
+	 * - exercises the recv_eof check inside the wolfSSL DTLS recv loop
 	 * (recvfrom_dtls_common_wolfssl). The TCP/TLS variant lives in
 	 * test_shutdown_rd_while_recv. 50ms margin guards against slow CI
 	 * runners where recv() hasn't reached its blocking point yet at the
-	 * 10ms mark — short enough to keep the test fast.
+	 * 10ms mark - short enough to keep the test fast.
 	 */
 	k_work_init_delayable(&test_data.work, shutdown_work);
 	test_data.sock = c_sock;
@@ -2218,7 +2218,7 @@ static void tls_set_session_cache_client_cb(void)
 
 /* Sets up a TLS client/server connection on a FIXED server port so two
  * consecutive connections present the same peer address (which is the key
- * into client_cache). Used by test_session_cache_client_resume — the
+ * into client_cache). Used by test_session_cache_client_resume - the
  * main test_prepare_* helpers use ANY_PORT, which prevents resumption
  * lookup from matching across connections.
  */
@@ -2288,7 +2288,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 		zsock_close(dummy);
 	}
 
-	/* First connection — should perform full handshake, then store. */
+	/* First connection - should perform full handshake, then store. */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
 
 #if defined(CONFIG_WOLFSSL)
@@ -2313,7 +2313,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 
-	/* Second connection to the SAME server port — should restore the
+	/* Second connection to the SAME server port - should restore the
 	 * stored session and resume.
 	 */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
