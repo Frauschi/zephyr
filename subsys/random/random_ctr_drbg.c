@@ -32,7 +32,9 @@
  * of the ctr_drbg engine.
  */
 static const struct device *entropy_dev;
+#if defined(CONFIG_MBEDTLS)
 static const unsigned char drbg_seed[] = CONFIG_CS_CTR_DRBG_PERSONALIZATION;
+#endif
 static bool ctr_initialised;
 static K_MUTEX_DEFINE(ctr_lock);
 
@@ -86,7 +88,13 @@ static int ctr_drbg_initialize(void)
 		return -EIO;
 	}
 
-	ret = wc_InitRngNonce_ex(&ctr_ctx, (byte *)drbg_seed, sizeof(drbg_seed), NULL, 0);
+	/* No nonce: _InitRng() then requests MAX_SEED_SZ from the entropy
+	 * source and derives the SP 800-90A nonce from it, instead of
+	 * shortening the seed by SEED_SZ/2 to make room for a caller-provided
+	 * one. CONFIG_CS_CTR_DRBG_PERSONALIZATION never reached the DRBG's
+	 * personalization input in any case; that slot is hardwired to NULL.
+	 */
+	ret = wc_InitRng_ex(&ctr_ctx, NULL, 0);
 	if (ret != 0) {
 		(void)wc_FreeRng(&ctr_ctx);
 		return -EIO;
