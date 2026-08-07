@@ -297,17 +297,7 @@ __net_socket struct tls_context {
 	bool is_listening : 1;
 
 #if defined(CONFIG_WOLFSSL)
-	/** Local read side was shut down via shutdown(SHUT_RD/SHUT_RDWR).
-	 *  Distinct from session_closed: send() must keep working.
-	 *
-	 *  One-way flag: once set, it's cleared only when the slot is
-	 *  recycled by tls_alloc() (which memsets the struct). There is no
-	 *  "un-shutdown" path because POSIX shutdown() is one-way too.
-	 *
-	 *  The mbedTLS backend does not consult this bit; field is gated to
-	 *  the wolfSSL backend to keep struct layout under MBEDTLS identical
-	 *  to upstream.
-	 */
+	/** The read side was shut down; unlike session_closed, send() still works. */
 	bool recv_eof : 1;
 
 	/* Set once the "TLS_HOSTNAME ignored on a server socket" warning has
@@ -5742,6 +5732,11 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 
 		err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
+		/* A zero-length write is a no-op, as on mbedTLS */
+		if (ret == 0 && err == WOLFSSL_ERROR_NONE) {
+			return 0;
+		}
+
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			int timeout_ms;
@@ -5767,9 +5762,14 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 			}
 		} else {
 			NET_ERR("TLS send error: %x", err);
-			tls_wolfssl_reset_session(ctx);
-			ctx->error = ECONNABORTED;
-			errno = ECONNABORTED;
+			/* As on mbedTLS, a failed reset leaves the session unusable */
+			if (tls_wolfssl_reset_session(ctx) != 0) {
+				ctx->error = ENOMEM;
+				errno = ENOMEM;
+			} else {
+				ctx->error = ECONNABORTED;
+				errno = ECONNABORTED;
+			}
 			break;
 		}
 	} while (true);
@@ -6289,6 +6289,12 @@ err:
 		}
 
 		if (ret == 0) {
+			/* A clean closure reads as 0; send() then fails as on mbedTLS */
+			err = wolfSSL_get_error(ctx->active_session->wssl, ret);
+			if (err == WOLFSSL_ERROR_ZERO_RETURN ||
+			    err == SOCKET_PEER_CLOSED_E) {
+				ctx->active_session->session_closed = true;
+			}
 			break;
 		}
 
@@ -7225,8 +7231,10 @@ static int tls_data_check(struct tls_context *ctx)
 	{
 		byte dummy[1];
 
+		/* wolfSSL_peek() returns 0 for a clean close and keeps the reason in ssl->error */
 		ret = wolfSSL_peek(ctx->active_session->wssl, dummy, sizeof(dummy));
-		if (ret < 0) {
+		wc_ForceZero(dummy, sizeof(dummy));
+		if (ret <= 0) {
 			int err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
 			if (err == SOCKET_PEER_CLOSED_E ||
@@ -7422,8 +7430,10 @@ again:
 		byte dummy[1];
 
 		ret = wolfSSL_peek(ctx->active_session->wssl, dummy, sizeof(dummy));
+		wc_ForceZero(dummy, sizeof(dummy));
 	}
-	if (ret < 0) {
+	/* UDP has no FIN, so a close_notify that wolfSSL_peek() misses would leak the session */
+	if (ret <= 0) {
 		int err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
 		if (err == SOCKET_PEER_CLOSED_E ||
