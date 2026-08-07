@@ -307,8 +307,12 @@ __net_socket struct tls_context {
 	bool is_listening : 1;
 
 #if defined(CONFIG_WOLFSSL)
-	/** Local read side was shut down via shutdown(SHUT_RD/SHUT_RDWR).
-	 *  Distinct from session_closed: send() must keep working.
+	/** Local read side was shut down via shutdown(). Distinct from
+	 *  session_closed: send() must keep working.
+	 *
+	 *  Latched only when the underlying shutdown() succeeds, which on the
+	 *  native inet backend means SHUT_RD alone: SHUT_WR and SHUT_RDWR
+	 *  return -ENOTSUP there and leave this clear.
 	 *
 	 *  One-way flag: once set, it's cleared only when the slot is
 	 *  recycled by tls_alloc() (which memsets the struct). There is no
@@ -5432,6 +5436,14 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 
 		err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
+		/* A zero-length write is legal and wolfSSL reports it as 0 with
+		 * no error latched. Treat it as the no-op the mbedTLS backend
+		 * does, otherwise the catch-all below tears down the session.
+		 */
+		if (ret == 0 && err == WOLFSSL_ERROR_NONE) {
+			return 0;
+		}
+
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			int timeout_ms;
@@ -5457,9 +5469,17 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 			}
 		} else {
 			NET_ERR("TLS send error: %x", err);
-			tls_wolfssl_reset_session(ctx);
-			ctx->error = ECONNABORTED;
-			errno = ECONNABORTED;
+			/* Distinguish a failed session reset from a plain abort,
+			 * as the mbedTLS arm does: the SSL object is unusable in
+			 * that case, not merely disconnected.
+			 */
+			if (tls_wolfssl_reset_session(ctx) != 0) {
+				ctx->error = ENOMEM;
+				errno = ENOMEM;
+			} else {
+				ctx->error = ECONNABORTED;
+				errno = ECONNABORTED;
+			}
 			break;
 		}
 	} while (true);
@@ -5992,6 +6012,16 @@ err:
 		}
 
 		if (ret == 0) {
+			/* wolfSSL reports a clean TLS-level closure as 0 with the
+			 * reason latched in ssl->error. Mark the session closed so
+			 * a later send() fails like the mbedTLS backend instead of
+			 * writing to a shut-down session.
+			 */
+			err = wolfSSL_get_error(ctx->active_session->wssl, ret);
+			if (err == WOLFSSL_ERROR_ZERO_RETURN ||
+			    err == SOCKET_PEER_CLOSED_E) {
+				ctx->active_session->session_closed = true;
+			}
 			break;
 		}
 
@@ -6930,8 +6960,12 @@ static int tls_data_check(struct tls_context *ctx)
 	{
 		byte dummy[1];
 
+		/* <= 0, not < 0 - wolfSSL_peek returns 0 for a clean TLS-level
+		 * closure and latches the reason in ssl->error.
+		 */
 		ret = wolfSSL_peek(ctx->active_session->wssl, dummy, sizeof(dummy));
-		if (ret < 0) {
+		wc_ForceZero(dummy, sizeof(dummy));
+		if (ret <= 0) {
 			int err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
 			if (err == SOCKET_PEER_CLOSED_E ||
@@ -7111,8 +7145,13 @@ again:
 		byte dummy[1];
 
 		ret = wolfSSL_peek(ctx->active_session->wssl, dummy, sizeof(dummy));
+		wc_ForceZero(dummy, sizeof(dummy));
 	}
-	if (ret < 0) {
+	/* <= 0, not < 0 - wolfSSL_peek returns 0 for a clean TLS-level closure.
+	 * UDP has no FIN to drive a later retry, so a missed close_notify leaks
+	 * the session until the DTLS timeout, or forever when it is disabled.
+	 */
+	if (ret <= 0) {
 		int err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
 		if (err == SOCKET_PEER_CLOSED_E ||
