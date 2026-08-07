@@ -3085,12 +3085,23 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 	if (context->options.role != ZTLS_IS_CLIENT) {
 		return;
 	}
-	/* mbedTLS parity: when no TLS_HOSTNAME is configured the CN/SAN check
-	 * is skipped and chain validity alone governs (mirrors not calling
-	 * mbedtls_ssl_set_hostname()). Only enforce a match when a hostname
-	 * was actually set.
+	/* TLS_PEER_VERIFY_NONE means the application opted out of peer
+	 * verification entirely, so no name check applies. Without this the
+	 * name mismatch below would fail a handshake that OPTIONAL lets
+	 * through, making NONE stricter than OPTIONAL.
+	 */
+	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_NONE) {
+		return;
+	}
+	/* mbedTLS parity: a client that never set TLS_HOSTNAME gets
+	 * mbedtls_ssl_set_hostname(ssl, "") in tls_mbedtls_session_init(),
+	 * which no certificate can match, so the peer identity is rejected
+	 * rather than unchecked. Fail the same way here instead of accepting
+	 * a certificate issued for any name.
 	 */
 	if (!context->options.is_hostname_set || context->host_len == 0) {
+		session_ctx->verify_result_flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
+		*effective_ok = 0;
 		return;
 	}
 	if (tls_wolfssl_leaf_hostname_matches(context, store->current_cert)) {
@@ -4200,24 +4211,31 @@ static int tls_opt_hostname_set(struct tls_context *context,
 				const void *optval, net_socklen_t optlen)
 {
 #if defined(CONFIG_WOLFSSL)
-	if (NULL != context->host_name) {
-		XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		context->host_name = NULL;
-		context->host_len = 0;
-	}
+	char *host_name;
 
 	if (optval == NULL) {
+		if (context->host_name != NULL) {
+			XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			context->host_name = NULL;
+			context->host_len = 0;
+		}
 		context->options.is_hostname_set = false;
 		return 0;
 	}
 
-	/* The mbedTLS backend treats optval as a C string and ignores
-	 * optlen entirely. Tolerate a NUL-terminated optval here too so
-	 * an application passing strlen() + 1 doesn't end up with a NUL
-	 * byte embedded in the SNI / hostname match on this backend only.
+	/* The mbedTLS backend treats optval as a C string and ignores optlen
+	 * entirely, so trim any trailing NUL padding rather than carrying it
+	 * into the SNI extension and the certificate name match.
 	 */
-	if (optlen > 0 && ((const char *)optval)[optlen - 1] == '\0') {
+	while (optlen > 0 && ((const char *)optval)[optlen - 1] == '\0') {
 		optlen--;
+	}
+
+	/* An empty hostname cannot match any certificate and would silently
+	 * disable the name check, so reject it instead.
+	 */
+	if (optlen == 0) {
+		return -EINVAL;
 	}
 
 	/* RFC 6066 SNI HostName is at most 2^16 - 1; reject anything larger
@@ -4225,23 +4243,29 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	 * unsigned, so the lower bound is implicit.
 	 */
 	if (optlen > UINT16_MAX) {
-		/* Mirror the NULL / ENOMEM paths: host_name was already freed to
-		 * NULL above, so leaving is_hostname_set true would drive a later
-		 * connect() into wolfSSL_UseSNI(..., NULL, 0) and break the socket.
-		 */
-		context->options.is_hostname_set = false;
 		return -EINVAL;
 	}
 
+	/* mbedTLS validates before touching the configured hostname ("Check if
+	 * new hostname is valid before making any change to current one"). Keep
+	 * the old one until the new one is committed, otherwise a rejected
+	 * setsockopt leaves the socket with no name check at all.
+	 */
+
 	/* +1 for NUL - wolfSSL APIs require C strings. */
-	context->host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-	if (context->host_name == NULL) {
-		context->options.is_hostname_set = false;
+	host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	if (host_name == NULL) {
 		return -ENOMEM;
 	}
 
-	XMEMCPY(context->host_name, optval, optlen);
-	context->host_name[optlen] = '\0';
+	XMEMCPY(host_name, optval, optlen);
+	host_name[optlen] = '\0';
+
+	if (context->host_name != NULL) {
+		XFREE(context->host_name, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	}
+
+	context->host_name = host_name;
 	context->host_len = optlen;
 	context->options.is_hostname_set = true;
 
