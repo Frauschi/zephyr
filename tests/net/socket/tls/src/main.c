@@ -11,12 +11,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr/net/loopback.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/tls_credentials.h>
-/* IANA TLS ciphersuite IDs used by this file's set_ciphersuites tests.
- * Names match RFC 5487. Don't introduce a public Zephyr-wide header just
- * for these two — both backends accept IANA IDs verbatim via the byte-
- * list cipher API. (The RFC 4279 SHA-1 CBC suites used previously are no
- * longer selectable in the Zephyr 4.4 mbedTLS ciphersuite Kconfig.)
- */
+/* IANA IDs (RFC 5487), which both backends accept */
 #define TEST_TLS_PSK_WITH_AES_128_GCM_SHA256  0x00A8
 #define TEST_TLS_PSK_WITH_AES_256_CBC_SHA384  0x00AF
 
@@ -45,12 +40,8 @@ mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
 
 uint32_t ztls_get_session_count(void);
 
-/* Server-side allow-list. Only TLS_PSK_WITH_AES_256_CBC_SHA384 is enabled
- * in prj.conf for the mbedTLS scenarios — the GCM suite entry is never
- * negotiated, it only exercises list handling and the mismatch case. Keep
- * it that way: enabling extra suites globally in prj.conf would change the
- * default cipher negotiated by the other tests in this file, which size
- * SO_RCVBUF based on the default suite's record overhead.
+/* Only the CBC suite is enabled for mbedTLS; more suites would change the default cipher,
+ * whose record overhead the SO_RCVBUF tests depend on.
  */
 static const int cipher_list_psk[] = {
 	TEST_TLS_PSK_WITH_AES_256_CBC_SHA384,
@@ -81,12 +72,7 @@ static const int cipher_list_psk3[] = {
 #define CLIENT_1_PORT 4243
 #define CLIENT_2_PORT 4244
 #define CLIENT_3_PORT 4245
-/* Dedicated port for test_session_cache_client_resume: the client-side
- * session cache is keyed by peer address, so the test needs a fixed
- * port — but it must not collide with SERVER_PORT used by the DTLS
- * multi-client tests, to stay independent of suite ordering and
- * TIME_WAIT teardown.
- */
+/* The client cache is keyed by peer address, so resumption needs a fixed port of its own */
 #define RESUME_SERVER_PORT 4246
 
 #define PSK_TAG 1
@@ -1906,13 +1892,7 @@ ZTEST(net_socket_tls, test_dtls_shutdown_rd_while_recv)
 
 	test_prepare_dtls_connection(NET_AF_INET6);
 
-	/* Schedule reception shutdown from workqueue while recv() is blocked
-	 * — exercises the recv_eof check inside the wolfSSL DTLS recv loop
-	 * (recvfrom_dtls_common_wolfssl). The TCP/TLS variant lives in
-	 * test_shutdown_rd_while_recv. 50ms margin guards against slow CI
-	 * runners where recv() hasn't reached its blocking point yet at the
-	 * 10ms mark — short enough to keep the test fast.
-	 */
+	/* Shut down reception from the workqueue once recv() blocks, even on slow runners */
 	k_work_init_delayable(&test_data.work, shutdown_work);
 	test_data.sock = c_sock;
 	test_work_reschedule(&test_data.work, K_MSEC(50));
@@ -2320,12 +2300,7 @@ static void tls_set_session_cache_client_cb(void)
 	zassert_equal(ret, 0, "Unable to set session cache on client");
 }
 
-/* Sets up a TLS client/server connection on a FIXED server port so two
- * consecutive connections present the same peer address (which is the key
- * into client_cache). Used by test_session_cache_client_resume — the
- * main test_prepare_* helpers use ANY_PORT, which prevents resumption
- * lookup from matching across connections.
- */
+/* A fixed server port gives both connections the same peer address, the cache key */
 static void prepare_tls_session_resume_connection(uint16_t server_port)
 {
 	struct net_sockaddr_in c_saddr;
@@ -2386,7 +2361,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 		zsock_close(dummy);
 	}
 
-	/* First connection — should perform full handshake, then store. */
+	/* First connection - should perform full handshake, then store. */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
 
 #if defined(CONFIG_WOLFSSL)
@@ -2412,7 +2387,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 
-	/* Second connection to the SAME server port — should restore the
+	/* Second connection to the SAME server port - should restore the
 	 * stored session and resume.
 	 */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
