@@ -161,7 +161,7 @@ static void test_tls(void)
 		size_t sec_tag_list_size;
 
 		/* sizeof(sec_tag_list_verify_none), not sizeof(sec_tag_list)
-		 * — the latter is sizeof(pointer), which on 64-bit hosts
+		 * - the latter is sizeof(pointer), which on 64-bit hosts
 		 * (e.g. native_sim/native/64) feeds an extra garbage sec_tag
 		 * into setsockopt and breaks credential lookup.
 		 */

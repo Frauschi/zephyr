@@ -82,11 +82,11 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
  * Suppress with a hard #undef right before each wolfSSL header include
  * rather than save-and-restore via #pragma push_macro/pop_macro: the
  * push form would silently capture (and later reinstall) whatever
- * upstream header had previously defined these names as macros — a
+ * upstream header had previously defined these names as macros - a
  * future addition would be invisible at review time and break the
  * vtable. The #undef form makes it a build error instead.
  *
- * List mirrors the WOLFSSL_ZEPHYR remappings as of wolfSSL master —
+ * List mirrors the WOLFSSL_ZEPHYR remappings as of wolfSSL master -
  * revisit on uprev.
  */
 #undef socket
@@ -409,7 +409,7 @@ static struct tls_context tls_contexts[CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS];
 /* Client-side session cache. mbedTLS uses it unconditionally. wolfSSL only
  * uses it when HAVE_EXT_CACHE is defined (CONFIG_WOLFSSL_SESSION_EXPORT)
  * because session import/export requires the wolfSSL_d2i/i2d APIs gated
- * on that macro — without it tls_session_store/restore are no-ops and
+ * on that macro - without it tls_session_store/restore are no-ops and
  * the cache stays empty, so leave it (and its mutex / reset helper) out
  * of .bss entirely.
  */
@@ -1458,7 +1458,7 @@ static int dtls_wolf_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	if (received == 0) {
 		/* The underlying datagram socket reports EOF (typically
 		 * because the local read side was shut down). Signal it as
-		 * CBIO_ERR_CONN_CLOSE — symmetry with the TCP tls_wolf_rx
+		 * CBIO_ERR_CONN_CLOSE - symmetry with the TCP tls_wolf_rx
 		 * callback. Without this wolfSSL treats the 0-byte read as
 		 * an incomplete record and loops back via WANT_READ.
 		 */
@@ -2284,7 +2284,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
  *   KEEP_PEER_CERT || SESSION_CERTS
  * (the OPENSSL_EXTRA_X509_SMALL arm is our downstream patch). The Zephyr
  * TLS sockets backend force-selects WOLFSSL_OPENSSL_EXTRA_X509_SMALL, so
- * the function is normally available — but if a wolfSSL uprev drops the
+ * the function is normally available - but if a wolfSSL uprev drops the
  * downstream patch and no user-supplied flag fills the gap, the build
  * would fail with an obscure linker error. Fail loudly here instead.
  */
@@ -2304,7 +2304,7 @@ static int tls_check_cert(struct tls_credential *cert)
 	/* Parse the cert here so setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
 	 * on malformed credentials (mbedTLS-parity contract exercised by
 	 * test_tls_bad_cred). The X509 is freed immediately so no peer-cert
-	 * retention is needed — the OPENSSL_EXTRA_X509_SMALL arm of the gate
+	 * retention is needed - the OPENSSL_EXTRA_X509_SMALL arm of the gate
 	 * (see modules/crypto/wolfssl/src/x509.c:6055) is our downstream
 	 * relaxation so KEEP_PEER_CERT isn't forced just for validation.
 	 */
@@ -2659,7 +2659,7 @@ static ssize_t recv_tls_wolfssl(struct tls_context *ctx, void *buf,
 			 * below would land us in the EIO arm.
 			 *
 			 * Return what's been drained across earlier iterations
-			 * (recv_len) — POSIX semantics: a partial recv followed
+			 * (recv_len) - POSIX semantics: a partial recv followed
 			 * by EOF reports the partial. recv_len may be 0 on the
 			 * first iteration, in which case the caller sees clean
 			 * EOF immediately. The DTLS sibling
@@ -3080,7 +3080,7 @@ static int tls_wolfssl_set_hostname(struct tls_context *context)
 
 /* Returns true only when a leaf cert is present and its CN/SAN matches
  * the hostname configured on this client context. NULL cert and "no
- * hostname configured" both report mismatch — the latter is the MITM
+ * hostname configured" both report mismatch - the latter is the MITM
  * protection path (parity with mbedtls_ssl_set_hostname(ssl, "")).
  */
 static bool tls_wolfssl_leaf_hostname_matches(struct tls_context *context,
@@ -3190,7 +3190,7 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 
 	/* OPTIONAL: return 1 so handshake continues after recording flags.
 	 * Surface a warning when we're about to silently let an invalid
-	 * chain through — applications that set OPTIONAL but never read
+	 * chain through - applications that set OPTIONAL but never read
 	 * TLS_CERT_VERIFY_RESULT will otherwise accept bad certs with no
 	 * trace. mbedTLS prints similar info at debug verbosity.
 	 */
@@ -3747,7 +3747,7 @@ static int tls_opt_hostname_set(struct tls_context *context,
 		return -EINVAL;
 	}
 
-	/* +1 for NUL — wolfSSL APIs require C strings. */
+	/* +1 for NUL - wolfSSL APIs require C strings. */
 	context->host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (context->host_name == NULL) {
 		context->options.is_hostname_set = false;
@@ -5353,7 +5353,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 
 			/* Local shutdown(SHUT_RD/RDWR) racing with a blocked
 			 * recv(): same hazard as the TCP/TLS path, just
-			 * surfaced differently — dtls_wolf_rx now maps a
+			 * surfaced differently - dtls_wolf_rx now maps a
 			 * 0-byte recvfrom to CBIO_ERR_CONN_CLOSE (added
 			 * symmetry with tls_wolf_rx); without this shortcut
 			 * the next iteration would still re-block.
@@ -5361,7 +5361,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 			 * Return 0 unconditionally here (unlike the TCP/TLS
 			 * sibling recv_tls_wolfssl which returns its
 			 * accumulated recv_len). That's not a wolfSSL quirk
-			 * — DTLS recv reads at most one datagram per call,
+			 * - DTLS recv reads at most one datagram per call,
 			 * with no cross-iteration accumulation, exactly
 			 * matching the mbedTLS DTLS path (recvfrom_dtls_common
 			 * above). The asymmetry between TCP and DTLS is
@@ -6007,7 +6007,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 			ret = tls_wolfssl_init(ctx, is_server);
 			if (ret < 0) {
-				/* Match mbedTLS arm — collapse to -ENOMEM. */
+				/* Match mbedTLS arm - collapse to -ENOMEM. */
 				return -ENOMEM;
 			}
 		}
@@ -6640,7 +6640,7 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 	case TLS_CERT_VERIFY_CALLBACK_WOLFSSL:
 		err = tls_opt_cert_verify_callback_wolfssl_set(ctx, optval, optlen);
 		break;
-	/* Under mbedTLS the option number 21 is reserved but unhandled — it
+	/* Under mbedTLS the option number 21 is reserved but unhandled - it
 	 * falls through to the default case and surfaces as -ENOPROTOOPT,
 	 * which matches the upstream "unknown sockopt" contract.
 	 */
@@ -6821,7 +6821,7 @@ static int tls_sock_shutdown_vmeth(void *obj, int how)
 	ret = zsock_shutdown(ctx->sock, how);
 #if defined(CONFIG_WOLFSSL)
 	/* Mark the TLS layer's read side closed only after the underlying
-	 * socket accepted the shutdown — setting recv_eof before forwarding
+	 * socket accepted the shutdown - setting recv_eof before forwarding
 	 * would poison the recv path for an unsuccessful shutdown. mbedTLS
 	 * does not consult recv_eof, so the write is gated to the wolfSSL
 	 * backend to keep the mbedTLS contract byte-identical with upstream.
