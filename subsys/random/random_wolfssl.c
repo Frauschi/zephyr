@@ -7,6 +7,7 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
+#include <stdint.h>
 #include <string.h>
 
 #ifndef WOLFSSL_USER_SETTINGS
@@ -15,7 +16,6 @@
 #include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/random.h>
 
-static const unsigned char drbg_seed[] = CONFIG_WOLFSSL_CSPRNG_PERSONALIZATION;
 static bool rng_initialised;
 static K_MUTEX_DEFINE(rng_lock);
 
@@ -25,16 +25,17 @@ static int wolfssl_rng_initialize(void)
 {
 	int ret;
 
-	/* wc_InitRngNonce_ex() seeds the DRBG through wc_GenerateSeed(), which on
+	/* wc_InitRng_ex() seeds the DRBG through wc_GenerateSeed(), which on
 	 * Zephyr draws from the hardware entropy driver (see
 	 * wolfcrypt/src/random.c). A dead entropy source therefore surfaces here as
 	 * a wolfCrypt failure.
 	 *
-	 * sizeof() - 1 drops the string's NUL terminator so it is not fed into the
-	 * DRBG as personalization data (and an empty string means none).
+	 * Supplying no nonce is deliberate: _InitRng() then requests MAX_SEED_SZ
+	 * from the entropy source and derives the SP 800-90A nonce from it,
+	 * instead of shortening the seed by SEED_SZ/2 to make room for a
+	 * caller-provided one.
 	 */
-	ret = wc_InitRngNonce_ex(&rng_ctx, (byte *)drbg_seed, sizeof(drbg_seed) - 1,
-				 NULL, 0);
+	ret = wc_InitRng_ex(&rng_ctx, NULL, 0);
 	if (ret != 0) {
 		(void)wc_FreeRng(&rng_ctx);
 		return -EIO;
@@ -56,6 +57,14 @@ int z_impl_sys_csrand_get(void *dst, size_t outlen)
 			/* Already a negative errno; preserve it. */
 			goto end;
 		}
+	}
+
+	/* wc_RNG_GenerateBlock() takes a word32. Truncating here would fill
+	 * only part of the buffer and still report success.
+	 */
+	if (outlen > UINT32_MAX) {
+		ret = -EINVAL;
+		goto end;
 	}
 
 	ret = wc_RNG_GenerateBlock(&rng_ctx, (byte *)dst, (word32)outlen);
