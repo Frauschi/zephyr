@@ -345,6 +345,11 @@ __net_socket struct tls_context {
 	 * (not once per session, nor once globally). Cleared on tls_alloc().
 	 */
 	bool server_hostname_warned : 1;
+
+	/* Set once the application configured TLS_DTLS_ROLE explicitly, so
+	 * tls_wolfssl_init() derives the role only when it was left to us.
+	 */
+	bool role_set : 1;
 #endif /* CONFIG_WOLFSSL */
 
 	/* TLS sessions associated with this socket. In most cases there will
@@ -3325,8 +3330,6 @@ static int tls_wolfssl_set_verify(struct tls_context *context,
 		}
 	}
 
-	session_ctx->verify_result_flags = 0;
-
 	/* SetCertCbCtx plants the session so the chosen callback records flags
 	 * on exactly the session being verified and reaches the context via
 	 * session_ctx->tls_ctx.
@@ -3574,6 +3577,8 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 		wolfSSL_set_psk_callback_ctx(session_ctx->wssl, (void *)tls_ctx);
 	}
 #endif /* !NO_PSK */
+
+	session_ctx->verify_result_flags = 0;
 
 	ret = tls_wolfssl_set_verify(tls_ctx, session_ctx);
 	if (ret != 0) {
@@ -3873,7 +3878,14 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	WOLFSSL_METHOD *method;
 	int ret;
 
-	context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
+	/* Do not clobber an explicitly configured TLS_DTLS_ROLE: connect() on a
+	 * DTLS socket would otherwise demote a socket the application set up as
+	 * a server, and options.role drives verify level, BIO callbacks and the
+	 * session-reset path.
+	 */
+	if (!context->role_set) {
+		context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
+	}
 
 #if defined(CONFIG_WOLFSSL_DEBUG)
 	wolfSSL_Debugging_ON();
@@ -3883,6 +3895,15 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 
 	if (method == NULL) {
 		return -ENOTSUP;
+	}
+
+	/* wolfSSL_CTX_new() takes ownership of the method, so an already
+	 * initialized context (a DTLS client re-connecting) must release it
+	 * rather than allocate one per call.
+	 */
+	if (context->ctx != NULL) {
+		XFREE(method, NULL, DYNAMIC_TYPE_METHOD);
+		method = NULL;
 	}
 
 	if (context->ctx == NULL) {
@@ -3945,10 +3966,24 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	return 0;
 
 err_cleanup:
-	if (context->ctx != NULL) {
-		wolfSSL_CTX_free(context->ctx);
+	{
+		WOLFSSL_CTX *wolf_ctx;
+
+		k_mutex_lock(&context_lock, K_FOREVER);
+		wolf_ctx = context->ctx;
 		context->ctx = NULL;
+		k_mutex_unlock(&context_lock);
+
+		if (wolf_ctx != NULL) {
+			wolfSSL_CTX_free(wolf_ctx);
+		}
 	}
+
+	/* The context owns no CTX and no WOLFSSL object now, so a later
+	 * connect()/accept() must run the whole setup again rather than take
+	 * the is_initialized shortcut.
+	 */
+	context->is_initialized = false;
 
 	return ret;
 }
@@ -5028,6 +5063,9 @@ static int tls_opt_dtls_role_set(struct tls_context *context,
 	}
 
 	context->options.role = *role;
+#if defined(CONFIG_WOLFSSL)
+	context->role_set = true;
+#endif
 
 	return 0;
 }
@@ -5122,7 +5160,11 @@ static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
 
 	context->options.cert_verify_wolfssl = *wolfssl_cb;
 
-	return 0;
+	/* Every other per-SSL option propagates to sessions already set up.
+	 * Without this the callback only takes effect after a session reset,
+	 * which the application cannot observe.
+	 */
+	return tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_verify);
 }
 #else
 static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
