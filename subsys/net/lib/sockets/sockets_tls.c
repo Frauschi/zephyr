@@ -2300,8 +2300,15 @@ static int tls_add_own_cert(struct tls_context *tls,
 	if (crt_is_pem(own_cert->buf, own_cert->len)) {
 		format = WOLFSSL_FILETYPE_PEM;
 	}
-	ret = wolfSSL_CTX_use_certificate_buffer(tls->ctx, own_cert->buf,
-						 own_cert->len, format);
+	/* Chain variant, not the single-certificate one: applications ship the
+	 * leaf and its intermediates as one concatenated credential, and
+	 * mbedtls_x509_crt_parse() on the other backend loads all of them.
+	 * Loading only the leaf sends an incomplete chain to the peer.
+	 */
+	ret = wolfSSL_CTX_use_certificate_chain_buffer_format(tls->ctx,
+							      own_cert->buf,
+							      own_cert->len,
+							      format);
 	if (ret != WOLFSSL_SUCCESS) {
 		NET_ERR("Failed to parse certificate");
 		return -EINVAL;
