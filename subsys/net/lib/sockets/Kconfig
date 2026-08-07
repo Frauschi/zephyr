@@ -132,7 +132,6 @@ config NET_SOCKETS_SOCKOPT_TLS
 	# wolfSSL backend requirements. The integration calls a narrow set of
 	# non-base wolfSSL APIs; only the strict minimum is force-selected
 	# here to keep flash/RAM cost on constrained targets low:
-	#   SET_CIPHER_BYTES - wolfSSL_set_cipher_list_bytes (small)
 	#   OPENSSL_EXTRA_X509_SMALL - exposes WOLFSSL_X509_STORE_CTX::current_cert
 	#                      which the verify callback reads to perform the
 	#                      leaf CN/SAN match. wolfSSL gates the whole
@@ -147,11 +146,12 @@ config NET_SOCKETS_SOCKOPT_TLS
 	# HAVE_EXT_CACHE is undefined, so enabling it is an explicit opt-in.
 	# (wolfSSL_clear, wolfSSL_X509_check_host and wolfSSL_set_verify are
 	# always available in src/ssl.c / src/x509.c / src/ssl_api_cert.c.)
+	# WOLFSSL_SET_CIPHER_BYTES (wolfSSL_set_cipher_list_bytes) needs no
+	# select: the module's user_settings.h defines it from this symbol.
 	# Gated on `WOLFSSL && !MBEDTLS` because the backends are mutually
 	# exclusive: pulling these wolfSSL knobs in on an mbedTLS build (e.g.
 	# when CONFIG_WOLFSSL=y is enabled for the random subsystem only) is
 	# pure bloat and risks user confusion.
-	select WOLFSSL_SET_CIPHER_BYTES if WOLFSSL && !MBEDTLS
 	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS
 	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS
 	imply MBEDTLS_SSL_PROTO_TLS1_2 if !NET_L2_OPENTHREAD
