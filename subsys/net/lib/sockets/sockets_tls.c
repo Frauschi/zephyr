@@ -972,18 +972,26 @@ static int tls_release(struct tls_context *tls)
 		struct tls_session_context *session_ctx =
 			SYS_SLIST_CONTAINER(node, session_ctx, node);
 
+		/* tls_session_free() sends the close-notify, and on DTLS that
+		 * reaches dtls_wolf_tx(), which dereferences active_session.
+		 * Keep it pointing at the session being torn down so it never
+		 * follows a block already returned to the slab.
+		 */
+		tls->active_session = session_ctx;
+
 		tls_session_free(session_ctx);
 	}
+
+	tls->active_session = NULL;
 
 #if defined(CONFIG_WOLFSSL)
 	/* Free the CTX only after all sessions referencing it are gone.
 	 *
-	 * Detach the pointer under context_lock: the global session-cache
-	 * purge (tls_opt_session_cache_purge_set) walks tls_contexts under
-	 * that lock and may call into another socket's CTX. Detaching under
-	 * the same lock guarantees the purge either sees a valid CTX (and
-	 * finishes with it before this release proceeds) or sees NULL. The
-	 * free itself happens outside the lock.
+	 * Detach the pointer under context_lock so that tls->ctx is only ever
+	 * mutated under that lock: any cross-context reader then sees either a
+	 * valid CTX or NULL, never a pointer being freed. tls_wolfssl_init()'s
+	 * error path follows the same rule. The free itself happens outside
+	 * the lock.
 	 */
 	{
 		WOLFSSL_CTX *wolf_ctx;
@@ -4889,22 +4897,15 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	ARG_UNUSED(optval);
 	ARG_UNUSED(optlen);
 
-#if defined(CONFIG_WOLFSSL) && defined(HAVE_EXT_CACHE)
-	/* wolfSSL's internal (server-side) session cache is global, but
-	 * flushing it requires a live CTX handle and the socket this option
-	 * is invoked on may never have been connected. Find any in-use
-	 * context that owns a CTX so the purge works regardless of which
-	 * socket it is called on - parity with the mbedTLS backend, which
-	 * purges its global server_cache.
+#if defined(CONFIG_WOLFSSL)
+	/* wolfSSL's server-side session cache is global and lives whenever
+	 * NO_SESSION_CACHE is undefined, independently of the external cache
+	 * that HAVE_EXT_CACHE gates. Flush it unconditionally, otherwise this
+	 * option reports success while leaving resumable sessions in place.
+	 * wolfSSL_CTX_flush_sessions() ignores its ctx argument and walks the
+	 * global cache, so no context handle is needed.
 	 */
-	k_mutex_lock(&context_lock, K_FOREVER);
-	for (int i = 0; i < ARRAY_SIZE(tls_contexts); i++) {
-		if (tls_contexts[i].is_used && tls_contexts[i].ctx != NULL) {
-			wolfSSL_CTX_flush_sessions(tls_contexts[i].ctx, -1);
-			break;
-		}
-	}
-	k_mutex_unlock(&context_lock);
+	wolfSSL_CTX_flush_sessions(NULL, -1);
 #endif
 	tls_session_purge();
 
