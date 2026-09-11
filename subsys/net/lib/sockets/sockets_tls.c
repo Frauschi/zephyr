@@ -147,6 +147,13 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
        "(disable CONFIG_WOLFSSL_CRYPTO_ONLY)"
 #endif /* WOLFCRYPT_ONLY */
 
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING) && \
+    (!defined(HAVE_OCSP) || !defined(HAVE_CERTIFICATE_STATUS_REQUEST))
+#error "OCSP stapling on TLS sockets needs HAVE_OCSP and " \
+       "HAVE_CERTIFICATE_STATUS_REQUEST (enable CONFIG_WOLFSSL_OCSP and " \
+       "CONFIG_WOLFSSL_OCSP_STAPLING)"
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
+
 /* wolfSSL puts its whole session API behind NO_SESSION_CACHE, the session
  * serialisation half of it behind HAVE_EXT_CACHE as well.
  */
@@ -3975,6 +3982,21 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 		goto err_cleanup;
 	}
 #endif /* WOLFSSL_MAX_FRAGMENT_LEN && NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH */
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+	/* Client-only: the extension asks the peer for a status response, and
+	 * wolfSSL gates the request API on !NO_WOLFSSL_CLIENT.
+	 */
+	if (!is_server) {
+		if (wolfSSL_CTX_EnableOCSPStapling(context->ctx) != WOLFSSL_SUCCESS ||
+		    wolfSSL_CTX_UseOCSPStapling(context->ctx, WOLFSSL_CSR_OCSP,
+						0) != WOLFSSL_SUCCESS) {
+			NET_ERR("Failed to enable OCSP stapling");
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
+	}
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 
 	ret = tls_wolfssl_set_session_cache_mode(context);
 	if (ret != 0) {

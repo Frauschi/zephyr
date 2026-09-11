@@ -368,6 +368,26 @@ config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
 	  -ENOTSUP. wolfSSL users should use TLS_CERT_VERIFY_CALLBACK_WOLFSSL
 	  (CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK) instead.
 
+config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
+	bool "Request a stapled OCSP response (wolfSSL)"
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && !MBEDTLS
+	select WOLFSSL_OCSP
+	select WOLFSSL_OCSP_STAPLING
+	help
+	  Make TLS client sockets send the certificate status request
+	  extension, so the server staples an OCSP response for its own
+	  certificate to the handshake and revocation is checked without the
+	  client reaching an OCSP responder itself. A revoked certificate
+	  surfaces as MBEDTLS_X509_BADCERT_REVOKED in TLS_CERT_VERIFY_RESULT.
+
+	  Server sockets are unaffected: they staple a response only if the
+	  application supplies one, which this option does not arrange.
+
+	  Note that an OCSP response carries its own validity dates, so a
+	  target without a trusted clock needs
+	  CONFIG_WOLFSSL_NO_ASN_TIME_CHECK - which also stops those dates
+	  being checked.
+
 config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
 	depends on WOLFSSL
