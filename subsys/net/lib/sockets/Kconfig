@@ -137,7 +137,13 @@ config NET_SOCKETS_SOCKOPT_TLS
 	#   OPENSSL_EXTRA_X509_SMALL - exposes WOLFSSL_X509_STORE_CTX::current_cert
 	#                      which the verify callback reads to perform the
 	#                      leaf CN/SAN match. wolfSSL gates the whole
-	#                      X509_STORE_CTX struct member on this flag.
+	#                      X509_STORE_CTX struct member on this flag. Not
+	#                      strictly required - a settings-file build
+	#                      without it falls back to
+	#                      wolfSSL_check_domain_name() - but that path
+	#                      demands a syntactically valid FQDN, so it is
+	#                      selected here to keep short names and IP
+	#                      literals working.
 	#   ALWAYS_VERIFY_CB - fires verify cb on chain success too. Load-
 	#                      bearing: without it the leaf CN/SAN match in
 	#                      tls_wolfssl_verify_accumulate_cb is silently

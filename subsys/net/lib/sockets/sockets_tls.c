@@ -3064,7 +3064,9 @@ static int tls_wolfssl_set_session_cache_mode(struct tls_context *context)
  * For clients, SNI is registered here; the CN/SAN match itself is
  * performed inside the verify callback against the leaf certificate
  * via wolfSSL_X509_check_host(), which avoids wolfSSL_check_domain_name()'s
- * strict FQDN syntax requirement.
+ * strict FQDN syntax requirement. Builds without the OpenSSL compatibility
+ * layer have no leaf certificate to check and fall back to
+ * wolfSSL_check_domain_name() here.
  */
 static int tls_wolfssl_set_hostname(struct tls_context *context,
 				    struct tls_session_context *session_ctx)
@@ -3098,13 +3100,27 @@ static int tls_wolfssl_set_hostname(struct tls_context *context,
 #endif /* HAVE_SNI */
 
 	/* Without HAVE_SNI the extension is simply not sent. The hostname is
-	 * still recorded and still drives the CN/SAN match in the verify
-	 * callback, which is what TLS_PEER_VERIFY depends on.
+	 * still recorded and still drives the CN/SAN match, which is what
+	 * TLS_PEER_VERIFY depends on.
 	 */
+
+#if !defined(OPENSSL_EXTRA) && !defined(OPENSSL_EXTRA_X509_SMALL)
+	/* WOLFSSL_X509_STORE_CTX::current_cert is not populated here, so the
+	 * leaf check in the verify callback cannot run - hand the name to
+	 * wolfSSL, which reports a mismatch as DOMAIN_NAME_MISMATCH.
+	 */
+	if (context->options.is_hostname_set &&
+	    wolfSSL_check_domain_name(session_ctx->wssl,
+				      (const char *)context->host_name) !=
+	    WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+#endif /* !OPENSSL_EXTRA && !OPENSSL_EXTRA_X509_SMALL */
 
 	return 0;
 }
 
+#if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 /* Returns true when the leaf cert's CN/SAN matches the hostname configured
  * on this client context. Only called once a hostname is known to be set.
  */
@@ -3122,6 +3138,7 @@ static bool tls_wolfssl_leaf_hostname_matches(struct tls_context *context,
 				      context->host_len, 0, NULL);
 	return ret == WOLFSSL_SUCCESS;
 }
+#endif /* OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL */
 
 /* If the leaf cert (depth 0) is being verified on a client context and
  * its CN/SAN doesn't match the configured TLS_HOSTNAME, record the
@@ -3158,12 +3175,18 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 		*effective_ok = 0;
 		return;
 	}
+#if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 	if (tls_wolfssl_leaf_hostname_matches(context, store->current_cert)) {
 		return;
 	}
 
 	session_ctx->verify_result_flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
 	*effective_ok = 0;
+#else
+	/* tls_wolfssl_set_hostname() armed wolfSSL's own CN/SAN match, which
+	 * surfaces a mismatch as DOMAIN_NAME_MISMATCH through store->error.
+	 */
+#endif /* OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL */
 }
 
 /* Map wolfSSL verify error to mbedTLS flag bits. */
@@ -3989,55 +4012,65 @@ err_cleanup:
 }
 #endif /* CONFIG_WOLFSSL */
 
-#if defined(CONFIG_WOLFSSL)
-/* wolfSSL_X509_load_certificate_buffer is gated in
- * modules/crypto/wolfssl/src/x509.c on
- *   OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL || WOLFSSL_WPAS_SMALL ||
- *   KEEP_PEER_CERT || SESSION_CERTS
- * The OPENSSL_EXTRA_X509_SMALL arm is upstream as of wolfSSL 5.9.2, and the
- * Zephyr TLS sockets backend force-selects WOLFSSL_OPENSSL_EXTRA_X509_SMALL
- * (subsys/net/lib/sockets/Kconfig). The same flag is required regardless for
- * the client hostname/verify path (wolfSSL_X509_check_host,
- * WOLFSSL_X509_STORE_CTX), so the X509 layer is always compiled in and this
- * function is normally available. If a minimal or future config leaves all
- * of these gate flags undefined, the build would fail with an obscure linker
- * error; fail loudly here instead.
- */
-#if !defined(OPENSSL_EXTRA) && !defined(OPENSSL_EXTRA_X509_SMALL) && \
-    !defined(WOLFSSL_WPAS_SMALL) && !defined(KEEP_PEER_CERT) && \
-    !defined(SESSION_CERTS)
-#error "tls_check_cert needs wolfSSL_X509_load_certificate_buffer. Enable one "\
-       "of OPENSSL_EXTRA_X509_SMALL (CONFIG_WOLFSSL_OPENSSL_EXTRA_X509_SMALL), "\
-       "OPENSSL_EXTRA, WOLFSSL_WPAS_SMALL, KEEP_PEER_CERT, or SESSION_CERTS."
-#endif /* X509 gate flags */
-#endif /* CONFIG_WOLFSSL */
-
 static int tls_check_cert(struct tls_credential *cert)
 {
 #if defined(CONFIG_WOLFSSL)
 	/* Parse the cert here so setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
 	 * on malformed credentials (mbedTLS-parity contract exercised by
-	 * test_tls_bad_cred). The X509 is freed immediately so no peer-cert
-	 * retention is needed - OPENSSL_EXTRA_X509_SMALL (upstream in wolfSSL
-	 * 5.9.2, force-selected by the sockets backend and already required by
-	 * the hostname/verify path) satisfies the gate, so KEEP_PEER_CERT is
-	 * not forced just for validation.
+	 * test_tls_bad_cred). DecodedCert keeps this off the OpenSSL
+	 * compatibility layer, which a wolfSSL build need not include.
 	 */
-	WOLFSSL_X509 *x509;
-	int fmt;
+	DecodedCert *dcert;
+	const byte *der = cert->buf;
+	word32 der_len = cert->len;
+	byte *pem_der = NULL;
+	int ret;
 
-	fmt = crt_is_pem(cert->buf, cert->len) ?
-	      WOLFSSL_FILETYPE_PEM : WOLFSSL_FILETYPE_ASN1;
+	if (crt_is_pem(cert->buf, cert->len)) {
+#if defined(WOLFSSL_PEM_TO_DER)
+		/* DER of a PEM body is always shorter than the PEM itself. */
+		pem_der = XMALLOC(cert->len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		if (pem_der == NULL) {
+			return -ENOMEM;
+		}
 
-	x509 = wolfSSL_X509_load_certificate_buffer(cert->buf,
-						     (int)cert->len, fmt);
-	if (x509 == NULL) {
+		ret = wc_CertPemToDer(cert->buf, (int)cert->len, pem_der,
+				      (int)cert->len, CERT_TYPE);
+		if (ret <= 0) {
+			XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			NET_ERR("Failed to parse %s on tag %d",
+				"certificate", cert->tag);
+			return -EINVAL;
+		}
+
+		der = pem_der;
+		der_len = (word32)ret;
+#else
+		NET_ERR("PEM %s on tag %d needs WOLFSSL_PEM_TO_DER",
+			"certificate", cert->tag);
+		return -EINVAL;
+#endif /* WOLFSSL_PEM_TO_DER */
+	}
+
+	/* Several KB, more than a socket thread's stack wants to carry. */
+	dcert = XMALLOC(sizeof(*dcert), NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	if (dcert == NULL) {
+		XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		return -ENOMEM;
+	}
+
+	wc_InitDecodedCert(dcert, der, der_len, NULL);
+	ret = wc_ParseCert(dcert, CERT_TYPE, NO_VERIFY, NULL);
+	wc_FreeDecodedCert(dcert);
+
+	XFREE(dcert, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+
+	if (ret != 0) {
 		NET_ERR("Failed to parse %s on tag %d",
 			"certificate", cert->tag);
 		return -EINVAL;
 	}
-
-	wolfSSL_X509_free(x509);
 
 	return 0;
 #else
