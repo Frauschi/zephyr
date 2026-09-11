@@ -2348,6 +2348,11 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	};
 	int ret;
 
+#if defined(CONFIG_WOLFSSL) && (!defined(HAVE_EXT_CACHE) || defined(NO_SESSION_CACHE))
+	/* Same gate as ZTLS_WOLFSSL_EXT_CACHE: without it there is nothing to resume from. */
+	ztest_test_skip();
+#endif
+
 	/* Purge any sessions left by earlier tests so we can observe the
 	 * transition from "no cached session" to "cached session".
 	 */

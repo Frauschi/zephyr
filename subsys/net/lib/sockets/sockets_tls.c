@@ -140,13 +140,12 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
        "(disable CONFIG_WOLFSSL_CRYPTO_ONLY)"
 #endif /* WOLFCRYPT_ONLY */
 
-/* The session-cache paths below call wolfSSL_CTX_set_session_cache_mode(),
- * wolfSSL_get1_session() and friends, all compiled out by NO_SESSION_CACHE.
+/* wolfSSL puts its whole session API behind NO_SESSION_CACHE, the session
+ * serialisation half of it behind HAVE_EXT_CACHE as well.
  */
-#if defined(NO_SESSION_CACHE)
-#error "Zephyr TLS sockets with wolfSSL require the session cache " \
-       "(enable CONFIG_WOLFSSL_SESSION_CACHE)"
-#endif /* NO_SESSION_CACHE */
+#if defined(HAVE_EXT_CACHE) && !defined(NO_SESSION_CACHE)
+#define ZTLS_WOLFSSL_EXT_CACHE
+#endif
 
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
@@ -483,15 +482,9 @@ BUILD_ASSERT(CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS >= CONFIG_NET_SOCKETS_T
 	     "CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS cannot be smaller than "
 	     "CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS");
 
-/* Client-side session cache. mbedTLS uses it unconditionally. wolfSSL only
- * uses it when HAVE_EXT_CACHE is defined (CONFIG_WOLFSSL_SESSION_EXPORT)
- * because session import/export requires the wolfSSL_d2i/i2d APIs gated
- * on that macro - without it tls_session_store/restore are no-ops and
- * the cache stays empty, so leave it (and its mutex / reset helper) out
- * of .bss entirely.
- */
+/* wolfSSL can fill the client cache only through session export. */
 #if defined(CONFIG_MBEDTLS) || \
-    (defined(CONFIG_WOLFSSL) && defined(HAVE_EXT_CACHE))
+    (defined(CONFIG_WOLFSSL) && defined(ZTLS_WOLFSSL_EXT_CACHE))
 #define TLS_SESSION_CACHE_PRESENT 1
 #else
 #define TLS_SESSION_CACHE_PRESENT 0
@@ -658,7 +651,7 @@ static void tls_session_cache_reset(void)
 
 	k_mutex_unlock(&session_cache_lock);
 }
-#elif defined(CONFIG_WOLFSSL) && defined(HAVE_EXT_CACHE)
+#elif defined(CONFIG_WOLFSSL) && defined(ZTLS_WOLFSSL_EXT_CACHE)
 static void tls_session_cache_reset(void)
 {
 	k_mutex_lock(&session_cache_lock, K_FOREVER);
@@ -1379,11 +1372,8 @@ static void tls_session_purge(void)
 #endif /* CONFIG_MBEDTLS */
 
 #if defined(CONFIG_WOLFSSL)
-#if defined(HAVE_EXT_CACHE)
-/* Caller must hold session_cache_lock. Only referenced by tls_session_store,
- * which is itself gated on HAVE_EXT_CACHE (wolfSSL_i2d_SSL_SESSION isn't
- * available without it).
- */
+#if defined(ZTLS_WOLFSSL_EXT_CACHE)
+/* Caller holds session_cache_lock. */
 static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 	const struct net_sockaddr *peer_addr)
 {
@@ -1423,18 +1413,13 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 
 	return entry;
 }
-#endif /* HAVE_EXT_CACHE */
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
 static void tls_session_store(struct tls_context *context,
 			      const struct net_sockaddr *addr,
 			      net_socklen_t addrlen)
 {
-#if !defined(HAVE_EXT_CACHE)
-	/* wolfSSL_i2d_SSL_SESSION() is gated on HAVE_EXT_CACHE. Without it,
-	 * session resumption (CONFIG_WOLFSSL_SESSION_EXPORT) is unavailable
-	 * and this becomes a no-op. The cache_enabled setsockopt still
-	 * compiles but has no effect on this build.
-	 */
+#if !defined(ZTLS_WOLFSSL_EXT_CACHE)
 	ARG_UNUSED(context);
 	ARG_UNUSED(addr);
 	ARG_UNUSED(addrlen);
@@ -1510,14 +1495,14 @@ exit:
 		XFREE(serialized, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	}
 	wolfSSL_SESSION_free(session);
-#endif /* HAVE_EXT_CACHE */
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 }
 
 static void tls_session_restore(struct tls_context *context,
 				const struct net_sockaddr *addr,
 				net_socklen_t addrlen)
 {
-#if !defined(HAVE_EXT_CACHE)
+#if !defined(ZTLS_WOLFSSL_EXT_CACHE)
 	ARG_UNUSED(context);
 	ARG_UNUSED(addr);
 	ARG_UNUSED(addrlen);
@@ -1605,7 +1590,7 @@ static void tls_session_restore(struct tls_context *context,
 	wolfSSL_SESSION_free(session);
 	wc_ForceZero(serialized_copy, serialized_len);
 	XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-#endif /* HAVE_EXT_CACHE */
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 }
 
 static void tls_session_purge(void)
@@ -3311,6 +3296,7 @@ exit:
 
 static int tls_wolfssl_set_session_cache_mode(struct tls_context *context)
 {
+#if !defined(NO_SESSION_CACHE)
 	if ((context->options.role == ZTLS_IS_SERVER) &&
 	    (0 == context->options.cache_enabled)) {
 		if (wolfSSL_CTX_set_session_cache_mode(context->ctx,
@@ -3318,6 +3304,10 @@ static int tls_wolfssl_set_session_cache_mode(struct tls_context *context)
 			return -EINVAL;
 		}
 	}
+#else
+	/* Nothing caches a session, so TLS_SESSION_CACHE is already off. */
+	ARG_UNUSED(context);
+#endif /* !NO_SESSION_CACHE */
 
 	return 0;
 }
@@ -5222,14 +5212,8 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	ARG_UNUSED(optval);
 	ARG_UNUSED(optlen);
 
-#if defined(CONFIG_WOLFSSL)
-	/* wolfSSL's server-side session cache is global and lives whenever
-	 * NO_SESSION_CACHE is undefined, independently of the external cache
-	 * that HAVE_EXT_CACHE gates. Flush it unconditionally, otherwise this
-	 * option reports success while leaving resumable sessions in place.
-	 * wolfSSL_CTX_flush_sessions() ignores its ctx argument and walks the
-	 * global cache, so no context handle is needed.
-	 */
+#if defined(CONFIG_WOLFSSL) && !defined(NO_SESSION_CACHE)
+	/* The server-side session cache is global, so flush it too; the ctx argument is unused. */
 	wolfSSL_CTX_flush_sessions(NULL, -1);
 #endif
 	tls_session_purge();
