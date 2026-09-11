@@ -156,8 +156,10 @@ config NET_SOCKETS_SOCKOPT_TLS
 	# always available in src/ssl.c / src/x509.c / src/ssl_api_cert.c.)
 	#   SESSION_CACHE - wolfSSL compiles wolfSSL_CTX_set_session_cache_mode,
 	#                      wolfSSL_get1_session and the session
-	#                      serialization API out under NO_SESSION_CACHE,
-	#                      so the TLS layer would not link without it.
+	#                      serialization API out under NO_SESSION_CACHE.
+	#                      The TLS layer copes without them, but then
+	#                      TLS_SESSION_CACHE has nothing to switch off and
+	#                      no session can ever be resumed.
 	# WOLFSSL_SET_CIPHER_BYTES (wolfSSL_set_cipher_list_bytes) needs no
 	# select: the module's user_settings.h defines it from this symbol.
 	# The `!MBEDTLS` qualifier is belt and braces: sockets_tls.c refuses to

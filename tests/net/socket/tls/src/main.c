@@ -2275,6 +2275,11 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	};
 	int ret;
 
+	if (IS_ENABLED(CONFIG_WOLFSSL) && !IS_ENABLED(CONFIG_WOLFSSL_SESSION_CACHE)) {
+		/* NO_SESSION_CACHE leaves wolfSSL nothing to resume from. */
+		ztest_test_skip();
+	}
+
 	/* Purge any sessions left by earlier tests so we can observe the
 	 * transition from "no cached session" to "cached session".
 	 */
