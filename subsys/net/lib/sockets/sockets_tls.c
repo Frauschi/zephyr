@@ -105,6 +105,7 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <wolfssl/ssl.h>
 #include <wolfssl/error-ssl.h>
 #include <wolfssl/wolfcrypt/asn.h>
+#include <wolfssl/wolfcrypt/cryptocb.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/memory.h>
 #include <zephyr/net/tls_verify.h>
@@ -2441,6 +2442,30 @@ static int tls_set_private_key(struct tls_context *tls,
 	return -ENOTSUP;
 }
 
+#if defined(CONFIG_WOLFSSL)
+static int tls_set_private_key_id(struct tls_context *tls,
+				  struct tls_credential *key_id)
+{
+#if defined(WOLF_PRIVATE_KEY_ID)
+	/* INVALID_DEVID here means "the one the context already has", which
+	 * tls_wolfssl_init() set from the build's default. */
+	if (wolfSSL_CTX_use_PrivateKey_Id(tls->ctx, key_id->buf, (long)key_id->len,
+					  INVALID_DEVID) != WOLFSSL_SUCCESS) {
+		NET_ERR("Failed to install private key reference on tag %d",
+			key_id->tag);
+		return -EINVAL;
+	}
+
+	return 0;
+#else
+	ARG_UNUSED(tls);
+	ARG_UNUSED(key_id);
+
+	return -ENOTSUP;
+#endif /* WOLF_PRIVATE_KEY_ID */
+}
+#endif /* CONFIG_WOLFSSL */
+
 static int tls_set_psk(struct tls_context *tls,
 		       struct tls_credential *psk,
 		       struct tls_credential *psk_id)
@@ -2532,6 +2557,13 @@ static int tls_set_credential(struct tls_context *tls,
 		 * with PSK
 		 */
 		break;
+
+	case TLS_CREDENTIAL_PRIVATE_KEY_ID:
+#if defined(CONFIG_WOLFSSL)
+		return tls_set_private_key_id(tls, cred);
+#else
+		return -ENOTSUP;
+#endif /* CONFIG_WOLFSSL */
 
 	default:
 		return -EINVAL;
@@ -3980,6 +4012,9 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 #if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
 	int mfl;
 #endif
+#if defined(WOLF_CRYPTO_CB)
+	int devId;
+#endif
 
 	/* Do not clobber an explicitly configured TLS_DTLS_ROLE: connect() on a
 	 * DTLS socket would otherwise demote a socket the application set up as
@@ -4015,6 +4050,19 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 			return -ENOMEM;
 		}
 	}
+
+#if defined(WOLF_CRYPTO_CB)
+	/* Set before the credentials: a private key reference is resolved
+	 * against this device, and the rest of the handshake reaches it the
+	 * same way. WC_NO_DEFAULT_DEVID keeps everything in software.
+	 */
+	devId = wc_CryptoCb_DefaultDevID();
+	if (devId != INVALID_DEVID &&
+	    wolfSSL_CTX_SetDevId(context->ctx, devId) != WOLFSSL_SUCCESS) {
+		ret = -ENODEV;
+		goto err_cleanup;
+	}
+#endif /* WOLF_CRYPTO_CB */
 
 	ret = tls_wolfssl_set_credentials(context);
 	if (ret != 0) {
@@ -4414,6 +4462,16 @@ static int tls_check_credentials(const sec_tag_t *sec_tags, int sec_tag_count)
 				 * with PSK.
 				 */
 				break;
+			case TLS_CREDENTIAL_PRIVATE_KEY_ID:
+#if defined(CONFIG_WOLFSSL) && defined(WOLF_PRIVATE_KEY_ID)
+				/* Opaque to this layer; only the device that
+				 * holds the key can judge the reference.
+				 */
+				break;
+#else
+				err = -ENOTSUP;
+				goto exit;
+#endif /* CONFIG_WOLFSSL && WOLF_PRIVATE_KEY_ID */
 			default:
 				return -EINVAL;
 			}
