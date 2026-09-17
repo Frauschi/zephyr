@@ -438,6 +438,27 @@ ZTEST(net_socket_tls_api_extension, test_tls_peer_verify_none)
 	test_common(ZSOCK_TLS_PEER_VERIFY_NONE);
 }
 
+ZTEST(net_socket_tls_api_extension, test_tls_own_cert_padded_der)
+{
+	static uint8_t padded[sizeof(server) + 4];
+	int r;
+
+	memcpy(padded, server, sizeof(server));
+	memset(padded + sizeof(server), 0xff, 4);
+
+	(void)tls_credential_delete(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	r = tls_credential_add(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+			       padded, sizeof(padded));
+	zassert_ok(r, "failed to add padded server certificate (%d)", r);
+
+	test_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL);
+
+	(void)tls_credential_delete(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	r = tls_credential_add(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+			       server, sizeof(server));
+	zassert_ok(r, "failed to restore server certificate (%d)", r);
+}
+
 ZTEST(net_socket_tls_api_extension, test_tls_peer_verify_optional)
 {
 	test_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL);
