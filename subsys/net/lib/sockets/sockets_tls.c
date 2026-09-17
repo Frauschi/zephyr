@@ -646,6 +646,7 @@ static int tls_mbedtls_reset_session(struct tls_context *context);
 #endif
 #if defined(CONFIG_WOLFSSL)
 static int tls_wolfssl_reset_session(struct tls_context *context);
+static word32 tls_der_chain_len(const byte *der, word32 der_len);
 #endif
 
 #if defined(CONFIG_MBEDTLS)
@@ -2548,17 +2549,17 @@ static int tls_add_own_cert(struct tls_context *tls,
 	int ret = 0;
 	int format = WOLFSSL_FILETYPE_ASN1;
 
+	word32 len = own_cert->len;
+
 	if (crt_is_pem(own_cert->buf, own_cert->len)) {
 		format = WOLFSSL_FILETYPE_PEM;
+	} else {
+		len = tls_der_chain_len(own_cert->buf, own_cert->len);
 	}
-	/* Chain variant, not the single-certificate one: applications ship the
-	 * leaf and its intermediates as one concatenated credential, and
-	 * mbedtls_x509_crt_parse() on the other backend loads all of them.
-	 * Loading only the leaf sends an incomplete chain to the peer.
-	 */
+	/* Loads the intermediates too, as mbedtls_x509_crt_parse() does */
 	ret = wolfSSL_CTX_use_certificate_chain_buffer_format(tls->ctx,
 							      own_cert->buf,
-							      own_cert->len,
+							      len,
 							      format);
 	if (ret != WOLFSSL_SUCCESS) {
 		NET_ERR("Failed to parse certificate");
@@ -4246,56 +4247,132 @@ err_cleanup:
 }
 #endif /* CONFIG_WOLFSSL */
 
-static int tls_check_cert(struct tls_credential *cert)
-{
 #if defined(CONFIG_WOLFSSL)
-	/* Parse the cert here so setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
-	 * on malformed credentials (mbedTLS-parity contract exercised by
-	 * test_tls_bad_cred). DecodedCert keeps this off the OpenSSL
-	 * compatibility layer, which a wolfSSL build need not include.
-	 */
-	DecodedCert *dcert;
-	const byte *der = cert->buf;
-	word32 der_len = cert->len;
-	byte *pem_der = NULL;
-	int ret;
+/* Size of the DER object at buf including its header, or -EINVAL if it is not
+ * a definite-length SEQUENCE fitting within len. */
+static int tls_der_object_len(const byte *buf, word32 len, word32 *out)
+{
+	word32 hdr, body, n, i;
 
-	if (crt_is_pem(cert->buf, cert->len)) {
-#if defined(WOLFSSL_PEM_TO_DER)
-		/* DER of a PEM body is always shorter than the PEM itself. */
-		pem_der = XMALLOC(cert->len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		if (pem_der == NULL) {
-			return -ENOMEM;
-		}
+	if (len < 2 || buf[0] != (ASN_SEQUENCE | ASN_CONSTRUCTED)) {
+		return -EINVAL;
+	}
 
-		ret = wc_CertPemToDer(cert->buf, (int)cert->len, pem_der,
-				      (int)cert->len, CERT_TYPE);
-		if (ret <= 0) {
-			XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-			NET_ERR("Failed to parse %s on tag %d",
-				"certificate", cert->tag);
+	if (buf[1] < 0x80) {
+		body = buf[1];
+		hdr = 2;
+	} else {
+		n = buf[1] & 0x7f;
+		if (n == 0 || n > 4 || len < 2 + n) {
 			return -EINVAL;
 		}
 
-		der = pem_der;
-		der_len = (word32)ret;
-#else
-		NET_ERR("PEM %s on tag %d needs WOLFSSL_PEM_TO_DER",
-			"certificate", cert->tag);
-		return -EINVAL;
-#endif /* WOLFSSL_PEM_TO_DER */
+		body = 0;
+		for (i = 0; i < n; i++) {
+			body = (body << 8) | buf[2 + i];
+		}
+
+		hdr = 2 + n;
 	}
+
+	if (body > len - hdr) {
+		return -EINVAL;
+	}
+
+	*out = hdr + body;
+
+	return 0;
+}
+
+/* Validate every certificate concatenated in a DER buffer. */
+static int tls_check_der_chain(DecodedCert *dcert, const byte *der, word32 der_len)
+{
+	int ret;
+
+	do {
+		word32 one;
+
+		ret = tls_der_object_len(der, der_len, &one);
+		if (ret != 0) {
+			return ret;
+		}
+
+		wc_InitDecodedCert(dcert, der, one, NULL);
+		ret = wc_ParseCert(dcert, CERT_TYPE, NO_VERIFY, NULL);
+		wc_FreeDecodedCert(dcert);
+
+		der += one;
+		der_len -= one;
+	} while (ret == 0 && der_len > 0 && der[0] == (ASN_SEQUENCE | ASN_CONSTRUCTED));
+
+	return ret;
+}
+
+/* Bytes taken by the certificates at der, without trailing padding. */
+static word32 tls_der_chain_len(const byte *der, word32 der_len)
+{
+	word32 used = 0;
+	word32 one;
+
+	while (used < der_len && der[used] == (ASN_SEQUENCE | ASN_CONSTRUCTED) &&
+	       tls_der_object_len(der + used, der_len - used, &one) == 0) {
+		used += one;
+	}
+
+	return used;
+}
+#endif /* CONFIG_WOLFSSL */
+
+static int tls_check_cert(struct tls_credential *cert)
+{
+#if defined(CONFIG_WOLFSSL)
+	/* A malformed credential fails setsockopt() with EINVAL here, as on mbedTLS. */
+	DecodedCert *dcert;
+	byte *pem_der = NULL;
+	int ret;
 
 	/* Several KB, more than a socket thread's stack wants to carry. */
 	dcert = XMALLOC(sizeof(*dcert), NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (dcert == NULL) {
-		XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		return -ENOMEM;
 	}
 
-	wc_InitDecodedCert(dcert, der, der_len, NULL);
-	ret = wc_ParseCert(dcert, CERT_TYPE, NO_VERIFY, NULL);
-	wc_FreeDecodedCert(dcert);
+	if (crt_is_pem(cert->buf, cert->len)) {
+#if defined(WOLFSSL_PEM_TO_DER)
+		const char *base = (const char *)cert->buf;
+		const char *pem = strstr(base, "-----BEGIN CERTIFICATE-----");
+
+		/* DER of a PEM body is always shorter than the PEM itself. */
+		pem_der = XMALLOC(cert->len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		if (pem_der == NULL) {
+			XFREE(dcert, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			return -ENOMEM;
+		}
+
+		/* wc_CertPemToDer() decodes one block, so step through the chain a
+		 * BEGIN marker at a time. */
+		do {
+			size_t left = cert->len - (size_t)(pem - base);
+
+			ret = wc_CertPemToDer((const byte *)pem, (int)left, pem_der,
+					      (int)cert->len, CERT_TYPE);
+			if (ret <= 0) {
+				ret = -EINVAL;
+				break;
+			}
+
+			ret = tls_check_der_chain(dcert, pem_der, (word32)ret);
+			pem = strstr(pem + 1, "-----BEGIN CERTIFICATE-----");
+		} while (ret == 0 && pem != NULL);
+#else
+		NET_ERR("PEM %s on tag %d needs WOLFSSL_PEM_TO_DER",
+			"certificate", cert->tag);
+		XFREE(dcert, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		return -EINVAL;
+#endif /* WOLFSSL_PEM_TO_DER */
+	} else {
+		ret = tls_check_der_chain(dcert, cert->buf, (word32)cert->len);
+	}
 
 	XFREE(dcert, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
