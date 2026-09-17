@@ -173,6 +173,11 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #define ZTLS_WOLFSSL_EXT_CACHE
 #endif
 
+#if defined(HAVE_MAX_FRAGMENT) && !defined(NO_WOLFSSL_CLIENT) && \
+	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+#define ZTLS_WOLFSSL_MAX_FRAGMENT
+#endif
+
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
@@ -3875,6 +3880,38 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	return ret;
 }
 
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+/* RFC 6066 encodes only 512/1024/2048/4096; wolfSSL's 8192 and 256 codes are
+ * non-standard, so round down into the interoperable set. A full record needs
+ * no extension at all, which WOLFSSL_MFL_DISABLED reports to the caller.
+ */
+static inline int tls_wolfssl_mfl_code_from_content_len(enum net_sock_type type)
+{
+	size_t len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	if (type == NET_SOCK_DGRAM &&
+	    len > CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH) {
+		len = CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH;
+	}
+#else
+	ARG_UNUSED(type);
+#endif
+
+	if (len >= 16384) {
+		return WOLFSSL_MFL_DISABLED;
+	} else if (len >= 4096) {
+		return WOLFSSL_MFL_2_12;
+	} else if (len >= 2048) {
+		return WOLFSSL_MFL_2_11;
+	} else if (len >= 1024) {
+		return WOLFSSL_MFL_2_10;
+	}
+
+	return WOLFSSL_MFL_2_9;
+}
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
+
 static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 					      bool is_server)
 {
@@ -3922,6 +3959,9 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 {
 	WOLFSSL_METHOD *method;
 	int ret;
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+	int mfl;
+#endif
 
 	/* Do not clobber an explicitly configured TLS_DTLS_ROLE: connect() on a
 	 * DTLS socket would otherwise demote a socket the application set up as
@@ -3983,17 +4023,20 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	}
 #endif /* !NO_PSK */
 
-#if defined(CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) && \
-	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
-	/* Gate on the socket-layer MFL toggle too, so setting it n disables
-	 * max_fragment_length negotiation on wolfSSL as the option advertises.
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+	/* Client-only: RFC 6066 has the client offer the length and the server
+	 * only echo it, and wolfSSL gates the request API on !NO_WOLFSSL_CLIENT.
 	 */
-	if (wolfSSL_CTX_UseMaxFragment(context->ctx,
-				       CONFIG_WOLFSSL_MAX_FRAGMENT_LEN) != WOLFSSL_SUCCESS) {
-		ret = -EINVAL;
-		goto err_cleanup;
+	if (!is_server) {
+		mfl = tls_wolfssl_mfl_code_from_content_len(context->type);
+
+		if (mfl != WOLFSSL_MFL_DISABLED &&
+		    wolfSSL_CTX_UseMaxFragment(context->ctx, mfl) != WOLFSSL_SUCCESS) {
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
 	}
-#endif /* WOLFSSL_MAX_FRAGMENT_LEN && NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH */
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
 
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
 	/* Client-only: the extension asks the peer for a status response, and
