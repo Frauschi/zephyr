@@ -104,39 +104,39 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #undef getpeername
 #undef getsockname
 
-/* The leaf CN/SAN match in tls_wolfssl_verify_accumulate_cb only runs
- * when wolfSSL invokes the verify callback. Without WOLFSSL_ALWAYS_VERIFY_CB
- * wolfSSL only invokes it on chain errors, so a chain that validates
- * cleanly would skip hostname verification entirely. CONFIG_WOLFSSL_ALWAYS_VERIFY_CB
- * is selected by NET_SOCKETS_SOCKOPT_TLS in the same Kconfig stanza.
- */
+/* Without it a valid chain never reaches the verify callback and skips the CN/SAN match. */
 #if !defined(WOLFSSL_ALWAYS_VERIFY_CB)
-#error "Zephyr TLS sockets with wolfSSL require WOLFSSL_ALWAYS_VERIFY_CB " \
-       "(enable CONFIG_WOLFSSL_ALWAYS_VERIFY_CB)"
+#error "Zephyr TLS sockets with wolfSSL require WOLFSSL_ALWAYS_VERIFY_CB: " \
+       "define it in CONFIG_WOLFSSL_SETTINGS_FILE, or leave that unset and " \
+       "enable CONFIG_WOLFSSL_ALWAYS_VERIFY_CB"
 #endif /* !WOLFSSL_ALWAYS_VERIFY_CB */
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && !defined(WOLFSSL_DTLS)
-#error "DTLS sockets enabled but wolfssl DTLS not enabled"
+#error "DTLS sockets need wolfSSL WOLFSSL_DTLS: define it in " \
+       "CONFIG_WOLFSSL_SETTINGS_FILE, or leave that unset and enable " \
+       "CONFIG_WOLFSSL_DTLS"
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && !WOLFSSL_DTLS */
 
-/* WOLFCRYPT_ONLY compiles the whole wolfSSL TLS layer out, so every
- * wolfSSL_* call below would fail to link.
- */
+/* WOLFCRYPT_ONLY compiles the wolfSSL TLS layer out, so nothing below would link */
 #if defined(WOLFCRYPT_ONLY)
-#error "Zephyr TLS sockets need the wolfSSL TLS layer " \
-       "(disable CONFIG_WOLFSSL_CRYPTO_ONLY)"
+#error "Zephyr TLS sockets need the wolfSSL TLS layer: drop WOLFCRYPT_ONLY " \
+       "from CONFIG_WOLFSSL_SETTINGS_FILE, or leave that unset and disable " \
+       "CONFIG_WOLFSSL_CRYPTO_ONLY"
 #endif /* WOLFCRYPT_ONLY */
 
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING) && \
     (!defined(HAVE_OCSP) || !defined(HAVE_CERTIFICATE_STATUS_REQUEST))
 #error "OCSP stapling on TLS sockets needs HAVE_OCSP and " \
-       "HAVE_CERTIFICATE_STATUS_REQUEST (enable CONFIG_WOLFSSL_OCSP and " \
-       "CONFIG_WOLFSSL_OCSP_STAPLING)"
+       "HAVE_CERTIFICATE_STATUS_REQUEST: define them in " \
+       "CONFIG_WOLFSSL_SETTINGS_FILE, or leave that unset and enable " \
+       "CONFIG_WOLFSSL_OCSP and CONFIG_WOLFSSL_OCSP_STAPLING"
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 
-/* wolfSSL puts its whole session API behind NO_SESSION_CACHE, the session
- * serialisation half of it behind HAVE_EXT_CACHE as well.
- */
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING) && defined(NO_WOLFSSL_CLIENT)
+#error "OCSP stapling on TLS sockets is client-only, but wolfSSL defines NO_WOLFSSL_CLIENT"
+#endif
+
+/* wolfSSL drops its session API under NO_SESSION_CACHE, and serialisation without EXT_CACHE. */
 #if defined(HAVE_EXT_CACHE) && !defined(NO_SESSION_CACHE)
 #define ZTLS_WOLFSSL_EXT_CACHE
 #endif
@@ -4831,12 +4831,7 @@ static int tls_opt_cert_verify_result_get(struct tls_context *context,
 		return -ENOTCONN;
 	}
 
-	/* With CONFIG_WOLFSSL_ALWAYS_VERIFY_CB selected by
-	 * NET_SOCKETS_SOCKOPT_TLS, the verify callback runs at every chain
-	 * position (including success), so verify_result_flags reflects
-	 * everything wolfSSL detected. No need to call
-	 * wolfSSL_get_verify_result() as a fallback.
-	 */
+	/* WOLFSSL_ALWAYS_VERIFY_CB runs the callback at every depth, so the flags are complete. */
 	*(uint32_t *)optval = session_ctx->verify_result_flags;
 #else
 	*(uint32_t *)optval = mbedtls_ssl_get_verify_result(&session_ctx->ssl);
