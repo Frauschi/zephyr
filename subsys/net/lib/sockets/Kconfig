@@ -165,9 +165,14 @@ config NET_SOCKETS_SOCKOPT_TLS
 	# The `!MBEDTLS` qualifier is belt and braces: sockets_tls.c refuses to
 	# build with both backends, so it only keeps the knobs out of a tree
 	# that was never going to compile.
-	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS
-	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS
-	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS
+	# A settings file bypasses the module's user_settings.h, so these
+	# symbols cannot reach the build; sockets_tls.c checks the macros instead.
+	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable TLS socket option support which automatically establishes
 	  a TLS connection to the remote host.
@@ -371,8 +376,8 @@ config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
 config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	bool "Request a stapled OCSP response (wolfSSL)"
 	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && !MBEDTLS
-	select WOLFSSL_OCSP
-	select WOLFSSL_OCSP_STAPLING
+	select WOLFSSL_OCSP if !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_OCSP_STAPLING if !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Make TLS client sockets send the certificate status request
 	  extension, so the server staples an OCSP response for its own
@@ -392,7 +397,7 @@ config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
 	depends on WOLFSSL
 	depends on NET_SOCKETS_SOCKOPT_TLS
-	select WOLFSSL_ALWAYS_VERIFY_CB
+	select WOLFSSL_ALWAYS_VERIFY_CB if !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable registration of wolfSSL-style VerifyCallback functions
 	  via the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.
