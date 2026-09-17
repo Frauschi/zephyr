@@ -134,43 +134,13 @@ config NET_SOCKETS_SOCKOPT_TLS
 	imply TLS_CREDENTIALS
 	select MBEDTLS if NET_NATIVE && !WOLFSSL
 	select PSA_CRYPTO if NET_NATIVE && !WOLFSSL
-	# wolfSSL backend requirements. The integration calls a narrow set of
-	# non-base wolfSSL APIs; only the strict minimum is force-selected
-	# here to keep flash/RAM cost on constrained targets low:
-	#   OPENSSL_EXTRA_X509_SMALL - exposes WOLFSSL_X509_STORE_CTX::current_cert
-	#                      which the verify callback reads to perform the
-	#                      leaf CN/SAN match. wolfSSL gates the whole
-	#                      X509_STORE_CTX struct member on this flag. Not
-	#                      strictly required - a settings-file build
-	#                      without it falls back to
-	#                      wolfSSL_check_domain_name() - but that path
-	#                      demands a syntactically valid FQDN, so it is
-	#                      selected here to keep short names and IP
-	#                      literals working.
-	#   ALWAYS_VERIFY_CB - fires verify cb on chain success too. Load-
-	#                      bearing: without it the leaf CN/SAN match in
-	#                      tls_wolfssl_verify_accumulate_cb is silently
-	#                      bypassed and a cert with mismatched CN/SAN
-	#                      would be accepted by TLS_PEER_VERIFY_REQUIRED.
-	# Session resumption (CONFIG_WOLFSSL_SESSION_EXPORT) is NOT forced:
-	# the integration's tls_session_store/restore become no-ops when
-	# HAVE_EXT_CACHE is undefined, so enabling it is an explicit opt-in.
-	# (wolfSSL_clear, wolfSSL_X509_check_host and wolfSSL_set_verify are
-	# always available in src/ssl.c / src/x509.c / src/ssl_api_cert.c.)
-	#   SESSION_CACHE - wolfSSL compiles wolfSSL_CTX_set_session_cache_mode,
-	#                      wolfSSL_get1_session and the session
-	#                      serialization API out under NO_SESSION_CACHE.
-	#                      The TLS layer copes without them, but then
-	#                      TLS_SESSION_CACHE has nothing to switch off and
-	#                      no session can ever be resumed.
-	# WOLFSSL_SET_CIPHER_BYTES (wolfSSL_set_cipher_list_bytes) needs no
-	# select: the module's user_settings.h defines it from this symbol.
-	# The `!MBEDTLS` qualifier is belt and braces: sockets_tls.c refuses to
-	# build with both backends, so it only keeps the knobs out of a tree
-	# that was never going to compile.
-	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS
-	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS
-	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS
+	# wolfSSL options the TLS layer needs; a settings file defines them itself
+	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable TLS socket option support which automatically establishes
 	  a TLS connection to the remote host.
@@ -406,8 +376,8 @@ config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
 config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	bool "Request a stapled OCSP response (wolfSSL)"
 	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && !MBEDTLS
-	select WOLFSSL_OCSP
-	select WOLFSSL_OCSP_STAPLING
+	select WOLFSSL_OCSP if !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_OCSP_STAPLING if !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Make TLS client sockets send the certificate status request
 	  extension, so the server staples an OCSP response for its own
@@ -427,7 +397,7 @@ config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
 	depends on WOLFSSL
 	depends on NET_SOCKETS_SOCKOPT_TLS
-	select WOLFSSL_ALWAYS_VERIFY_CB
+	select WOLFSSL_ALWAYS_VERIFY_CB if !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable registration of wolfSSL-style VerifyCallback functions
 	  via the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.
