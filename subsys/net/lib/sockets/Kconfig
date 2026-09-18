@@ -265,7 +265,8 @@ config NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH
 	  2048 or 4096. At the default a whole record fits, so no
 	  max_fragment_length extension is sent; lower it to make the peer
 	  shrink its records. With DTLS the value may be further limited by
-	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH.
+	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH. A single socket can override
+	  all of this with the TLS_MAX_FRAGMENT_LENGTH socket option.
 
 config NET_SOCKETS_ENABLE_DTLS
 	bool "DTLS socket support"

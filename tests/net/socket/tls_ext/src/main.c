@@ -694,6 +694,108 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_cb_opt20_enotsup_on_wol
 }
 #endif /* CONFIG_WOLFSSL */
 
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_WOLFSSL_MAX_FRAGMENT) && \
+	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+/* One socket for every case: net_context is a fixed pool (CONFIG_NET_MAX_CONTEXTS)
+ * that the stack reclaims lazily, so a socket per value runs it dry.
+ */
+ZTEST(net_socket_tls_api_extension, test_tls_mfl_opt_values)
+{
+	static const int accept[] = {
+		ZSOCK_TLS_MFL_DEFAULT, ZSOCK_TLS_MFL_DISABLED, ZSOCK_TLS_MFL_512,
+		ZSOCK_TLS_MFL_1024, ZSOCK_TLS_MFL_2048, ZSOCK_TLS_MFL_4096,
+	};
+	/* 5 and 6 are wolfSSL's non-RFC-6066 8192 and 256 codes. */
+	static const int reject[] = { -2, 5, 6, 255 };
+	int accept_r[ARRAY_SIZE(accept)];
+	int reject_r[ARRAY_SIZE(reject)];
+	int reject_e[ARRAY_SIZE(reject)];
+	int short_r, short_e, null_r, null_e;
+	int fd, val;
+
+	fd = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+	zassert_true(fd >= 0, "socket() failed (%d)", errno);
+
+	/* Collect every result first, so the socket is released even when an
+	 * assertion below aborts the test.
+	 */
+	for (int i = 0; i < ARRAY_SIZE(accept); i++) {
+		val = accept[i];
+		accept_r[i] = zsock_setsockopt(fd, ZSOCK_SOL_TLS,
+					       ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+					       &val, sizeof(val));
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(reject); i++) {
+		val = reject[i];
+		reject_r[i] = zsock_setsockopt(fd, ZSOCK_SOL_TLS,
+					       ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+					       &val, sizeof(val));
+		reject_e[i] = errno;
+	}
+
+	val = ZSOCK_TLS_MFL_512;
+	short_r = zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+				   &val, sizeof(val) - 1);
+	short_e = errno;
+
+	null_r = zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+				  NULL, sizeof(val));
+	null_e = errno;
+
+	(void)zsock_close(fd);
+
+	for (int i = 0; i < ARRAY_SIZE(accept); i++) {
+		zassert_ok(accept_r[i], "MFL %d rejected", accept[i]);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(reject); i++) {
+		zassert_equal(reject_r[i], -1, "MFL %d accepted", reject[i]);
+		zassert_equal(reject_e[i], EINVAL, "MFL %d: errno %d, want EINVAL",
+			      reject[i], reject_e[i]);
+	}
+
+	zassert_equal(short_r, -1, "short optlen accepted");
+	zassert_equal(short_e, EINVAL, "short optlen: errno %d, want EINVAL", short_e);
+	zassert_equal(null_r, -1, "NULL optval accepted");
+	zassert_equal(null_e, EINVAL, "NULL optval: errno %d, want EINVAL", null_e);
+}
+
+ZTEST(net_socket_tls_api_extension, test_tls_mfl_handshake)
+{
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int mfl = ZSOCK_TLS_MFL_512;
+	int server_fd;
+	int client_fd;
+	int r;
+
+	server_fd = test_configure_server(&server_thread_id,
+					  ZSOCK_TLS_PEER_VERIFY_NONE, true, false);
+	client_fd = test_configure_client(&sa, false, "localhost");
+
+	r = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+			     &mfl, sizeof(mfl));
+	zassert_ok(r, "failed to set ZSOCK_TLS_MAX_FRAGMENT_LENGTH (%d)", errno);
+
+	r = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(SECRET_SIZE, r, "send() failed (%d)", errno);
+
+	memset(rx_buf, 0, sizeof(rx_buf));
+	r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(SECRET_SIZE, r, "recv() failed (%d)", errno);
+	zassert_mem_equal(SECRET, rx_buf, SECRET_SIZE, "payload mismatch");
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_WOLFSSL_MAX_FRAGMENT &&
+	* CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
+	*/
+
 static void *setup(void)
 {
 	int r;

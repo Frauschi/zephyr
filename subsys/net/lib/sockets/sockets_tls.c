@@ -424,6 +424,11 @@ __net_socket struct tls_context {
 		/** DTLS role, client by default. */
 		int8_t role;
 
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+		/** Per-socket MFL, ZSOCK_TLS_MFL_DEFAULT to derive it. */
+		int8_t mfl_code;
+#endif
+
 		/** NULL-terminated list of allowed application layer
 		 * protocols.
 		 */
@@ -876,6 +881,9 @@ static struct tls_context *tls_alloc(void)
 
 			tls->is_used = true;
 			tls->options.verify_level = -1;
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+			tls->options.mfl_code = ZSOCK_TLS_MFL_DEFAULT;
+#endif
 			tls->options.timeout_tx = K_FOREVER;
 			tls->options.timeout_rx = K_FOREVER;
 			tls->sock = -1;
@@ -3885,9 +3893,19 @@ static int tls_wolfssl_handshake(struct tls_context *context,
  * non-standard, so round down into the interoperable set. A full record needs
  * no extension at all, which WOLFSSL_MFL_DISABLED reports to the caller.
  */
-static inline int tls_wolfssl_mfl_code_from_content_len(enum net_sock_type type)
+static inline int tls_wolfssl_mfl_code(struct tls_context *context)
 {
-	size_t len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
+	enum net_sock_type type = context->type;
+	size_t len;
+
+	/* ZSOCK_TLS_MFL_* are the RFC 6066 codes, which is what wolfSSL's
+	 * WOLFSSL_MFL_* enum holds too, so an override needs no translation.
+	 */
+	if (context->options.mfl_code != ZSOCK_TLS_MFL_DEFAULT) {
+		return context->options.mfl_code;
+	}
+
+	len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (type == NET_SOCK_DGRAM &&
@@ -4028,7 +4046,7 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	 * only echo it, and wolfSSL gates the request API on !NO_WOLFSSL_CLIENT.
 	 */
 	if (!is_server) {
-		mfl = tls_wolfssl_mfl_code_from_content_len(context->type);
+		mfl = tls_wolfssl_mfl_code(context);
 
 		if (mfl != WOLFSSL_MFL_DISABLED &&
 		    wolfSSL_CTX_UseMaxFragment(context->ctx, mfl) != WOLFSSL_SUCCESS) {
@@ -5151,6 +5169,32 @@ static int tls_opt_cert_nocopy_set(struct tls_context *context,
 
 	return 0;
 }
+
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+static int tls_opt_mfl_set(struct tls_context *context,
+			   const void *optval, net_socklen_t optlen)
+{
+	const int *mfl;
+
+	if (!optval) {
+		return -EINVAL;
+	}
+
+	if (optlen != sizeof(int)) {
+		return -EINVAL;
+	}
+
+	mfl = (const int *)optval;
+
+	if (*mfl < ZSOCK_TLS_MFL_DEFAULT || *mfl > ZSOCK_TLS_MFL_4096) {
+		return -EINVAL;
+	}
+
+	context->options.mfl_code = (int8_t)*mfl;
+
+	return 0;
+}
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
 
 static int tls_opt_dtls_role_set(struct tls_context *context,
 				 const void *optval, net_socklen_t optlen)
@@ -8012,11 +8056,17 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 		err = tls_opt_cert_verify_callback_set(ctx, optval, optlen);
 		break;
 
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+	case ZSOCK_TLS_MAX_FRAGMENT_LENGTH:
+		err = tls_opt_mfl_set(ctx, optval, optlen);
+		break;
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
+
 #if defined(CONFIG_WOLFSSL)
 	case ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL:
 		err = tls_opt_cert_verify_callback_wolfssl_set(ctx, optval, optlen);
 		break;
-	/* Under mbedTLS the option number 21 is reserved but unhandled - it
+	/* Under mbedTLS the option number 22 is reserved but unhandled - it
 	 * falls through to the default case and surfaces as -ENOPROTOOPT,
 	 * which matches the upstream "unknown sockopt" contract.
 	 */
