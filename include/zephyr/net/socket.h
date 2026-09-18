@@ -277,7 +277,8 @@ extern "C" {
  *  of the ZSOCK_TLS_MFL_* values.
  *
  *  By default (option not set) the socket advertises an MFL derived from
- *  CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN / CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN.
+ *  CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN / CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, or
+ *  from CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH under wolfSSL.
  *  Pass ZSOCK_TLS_MFL_DEFAULT to revert a socket back to this default after
  *  a previous call has overridden it.
  *
