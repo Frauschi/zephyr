@@ -399,8 +399,11 @@ config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	  Make TLS client sockets send the certificate status request
 	  extension, so the server staples an OCSP response for its own
 	  certificate to the handshake and revocation is checked without the
-	  client reaching an OCSP responder itself. A revoked certificate
-	  surfaces as MBEDTLS_X509_BADCERT_REVOKED in TLS_CERT_VERIFY_RESULT.
+	  client reaching an OCSP responder itself. Under
+	  TLS_PEER_VERIFY_REQUIRED a revoked or invalid response fails the
+	  handshake; under OPTIONAL and NONE the handshake goes on and
+	  TLS_CERT_VERIFY_RESULT reports it, as MBEDTLS_X509_BADCERT_REVOKED
+	  for a revoked certificate.
 
 	  Server sockets are unaffected: they staple a response only if the
 	  application supplies one, which this option does not arrange.
@@ -409,6 +412,21 @@ config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	  target without a trusted clock needs
 	  CONFIG_WOLFSSL_NO_ASN_TIME_CHECK - which also stops those dates
 	  being checked.
+
+config NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE
+	bool "Require the peer to staple an OCSP response (wolfSSL)"
+	depends on NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
+	help
+	  Fail the handshake when a server does not staple an OCSP response,
+	  instead of accepting the certificate unchecked. Without this option
+	  a server may acknowledge the certificate status request and staple
+	  nothing, which leaves revocation unverified.
+
+	  This needs no OCSP responder reachability: the client only insists
+	  on what the server was already asked for. A server that staples
+	  nothing fails the handshake with -ECONNABORTED. Only
+	  TLS_PEER_VERIFY_REQUIRED enforces it; OPTIONAL and NONE accept a
+	  server that staples nothing.
 
 config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"

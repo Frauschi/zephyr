@@ -4122,6 +4122,37 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 	return NULL;
 }
 
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+static int tls_wolfssl_ocsp_status_cb(WOLFSSL *ssl, int err, byte *resp, word32 resp_len,
+				      word32 idx, void *arg)
+{
+	struct tls_context *context = arg;
+	struct tls_session_context *session_ctx = context->active_session;
+
+	ARG_UNUSED(resp);
+	ARG_UNUSED(resp_len);
+	ARG_UNUSED(idx);
+
+	if (err == 0 || session_ctx == NULL || session_ctx->wssl != ssl) {
+		return err;
+	}
+
+	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_OPTIONAL) {
+		NET_WARN("TLS_PEER_VERIFY_OPTIONAL: accepting a failed OCSP check (%d); "
+			 "application should read TLS_CERT_VERIFY_RESULT", err);
+	}
+
+	session_ctx->verify_result_flags |= tls_wolfssl_error_to_mbedtls_flags(err);
+
+	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_OPTIONAL ||
+	    context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_NONE) {
+		return 0;
+	}
+
+	return err;
+}
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
+
 static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 {
 	WOLFSSL_METHOD *method;
@@ -4197,14 +4228,26 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 #endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
 
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
-	/* Client-only: the extension asks the peer for a status response, and
-	 * wolfSSL gates the request API on !NO_WOLFSSL_CLIENT.
-	 */
 	if (!is_server) {
+		bool must_staple = IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE) &&
+			context->options.verify_level != ZSOCK_TLS_PEER_VERIFY_OPTIONAL &&
+			context->options.verify_level != ZSOCK_TLS_PEER_VERIFY_NONE;
+
 		if (wolfSSL_CTX_EnableOCSPStapling(context->ctx) != WOLFSSL_SUCCESS ||
 		    wolfSSL_CTX_UseOCSPStapling(context->ctx, WOLFSSL_CSR_OCSP,
 						0) != WOLFSSL_SUCCESS) {
 			NET_ERR("Failed to enable OCSP stapling");
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
+
+		wolfSSL_CTX_set_ocsp_status_verify_cb(context->ctx, tls_wolfssl_ocsp_status_cb,
+						      context);
+
+		if ((must_staple ? wolfSSL_CTX_EnableOCSPMustStaple(context->ctx) :
+				   wolfSSL_CTX_DisableOCSPMustStaple(context->ctx)) !=
+		    WOLFSSL_SUCCESS) {
+			NET_ERR("Failed to set the OCSP must-staple policy");
 			ret = -EINVAL;
 			goto err_cleanup;
 		}
