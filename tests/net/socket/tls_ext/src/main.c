@@ -72,6 +72,8 @@ enum tls_tag {
 	SERVER_CERTIFICATE_TAG,
 	/** Used for both the public and private client keys */
 	CLIENT_CERTIFICATE_TAG,
+	/** The CA of the OCSP stapling tests */
+	OCSP_CA_TAG,
 };
 
 /** @brief synchronization object for server & client threads */
@@ -133,6 +135,24 @@ static const unsigned char client[] = {
 static const unsigned char client_privkey[] = {
 #include "client_privkey.inc"
 };
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+static const unsigned char ocsp_ca[] = {
+#include "ocsp_ca.inc"
+};
+
+static const unsigned char ocsp_server[] = {
+#include "ocsp_server.inc"
+};
+
+static const unsigned char ocsp_server_key[] = {
+#include "ocsp_server_key.inc"
+};
+
+static const unsigned char ocsp_good[] = {
+#include "ocsp_good.inc"
+};
+#endif
 #else /* CONFIG_TLS_CREDENTIALS */
 #define ca NULL
 #define server NULL
@@ -1185,4 +1205,191 @@ static void set_cert_validity_clock(void *fixture)
 #define TLS_EXT_BEFORE NULL
 #endif /* CONFIG_WOLFSSL */
 
-ZTEST_SUITE(net_socket_tls_api_extension, NULL, setup, TLS_EXT_BEFORE, NULL, NULL);
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+#define OCSP_PORT 4243
+#define OCSP_STACK_SIZE 16384
+
+static K_THREAD_STACK_DEFINE(ocsp_server_stack, OCSP_STACK_SIZE);
+
+static int ocsp_io_cb(void *ctx, const char *url, int url_len, unsigned char *req,
+		      int req_len, unsigned char **resp)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(url);
+	ARG_UNUSED(url_len);
+	ARG_UNUSED(req);
+	ARG_UNUSED(req_len);
+
+	*resp = (unsigned char *)ocsp_good;
+	return sizeof(ocsp_good);
+}
+
+static void ocsp_resp_free_cb(void *ctx, unsigned char *resp)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(resp);
+}
+
+/* A Zephyr TLS server socket cannot staple, so the peer is plain wolfSSL. */
+static void ocsp_server_fn(void *p1, void *p2, void *p3)
+{
+	int listen_fd = POINTER_TO_INT(p1);
+	bool staple = POINTER_TO_INT(p2);
+	WOLFSSL_CTX *ctx;
+	WOLFSSL *ssl = NULL;
+	int fd = -1;
+
+	ARG_UNUSED(p3);
+
+	ctx = wolfSSL_CTX_new(wolfTLSv1_2_server_method());
+	if (ctx == NULL ||
+	    wolfSSL_CTX_use_certificate_buffer(ctx, ocsp_server, sizeof(ocsp_server),
+					       WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+	    wolfSSL_CTX_use_PrivateKey_buffer(ctx, ocsp_server_key, sizeof(ocsp_server_key),
+					      WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+		goto out;
+	}
+
+	if (staple &&
+	    (wolfSSL_CTX_load_verify_buffer(ctx, ocsp_ca, sizeof(ocsp_ca),
+					    WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_EnableOCSP(ctx, WOLFSSL_OCSP_URL_OVERRIDE | WOLFSSL_OCSP_NO_NONCE) !=
+	     WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_SetOCSP_OverrideURL(ctx, "http://127.0.0.1/") != WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_EnableOCSPStapling(ctx) != WOLFSSL_SUCCESS ||
+	     /* After EnableOCSPStapling(), which installs the default lookup. */
+	     wolfSSL_CTX_SetOCSP_Cb(ctx, ocsp_io_cb, ocsp_resp_free_cb, NULL) !=
+	     WOLFSSL_SUCCESS)) {
+		goto out;
+	}
+
+	fd = zsock_accept(listen_fd, NULL, NULL);
+	if (fd < 0) {
+		goto out;
+	}
+
+	ssl = wolfSSL_new(ctx);
+	if (ssl != NULL && wolfSSL_set_fd(ssl, fd) == WOLFSSL_SUCCESS &&
+	    wolfSSL_accept(ssl) == WOLFSSL_SUCCESS) {
+		(void)wolfSSL_shutdown(ssl);
+	}
+
+out:
+	wolfSSL_free(ssl);
+	if (fd >= 0) {
+		zsock_close(fd);
+	}
+	wolfSSL_CTX_free(ctx);
+}
+
+/* Returns 0 or the errno of a failed connect(), and the verify result. */
+static int ocsp_connect(int peer_verify, bool staple, uint32_t *verify_result)
+{
+	static const sec_tag_t tags[] = { OCSP_CA_TAG };
+	struct net_sockaddr_in sa = { .sin_family = NET_AF_INET, .sin_port = net_htons(OCSP_PORT) };
+	net_socklen_t optlen = sizeof(*verify_result);
+	int listen_fd, client_fd, yes = 1, ret, err = 0;
+
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+
+	listen_fd = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TCP);
+	zassert_true(listen_fd >= 0, "socket() failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(listen_fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_REUSEADDR, &yes,
+				    sizeof(yes)));
+	zassert_ok(zsock_bind(listen_fd, (struct net_sockaddr *)&sa, sizeof(sa)));
+	zassert_ok(zsock_listen(listen_fd, 1));
+
+	(void)k_thread_create(&server_thread, ocsp_server_stack, OCSP_STACK_SIZE, ocsp_server_fn,
+			      INT_TO_POINTER(listen_fd), INT_TO_POINTER(staple), NULL,
+			      K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+
+	client_fd = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+	zassert_true(client_fd >= 0, "TLS socket() failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, tags,
+				    sizeof(tags)));
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, "localhost",
+				    sizeof("localhost")));
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY, &peer_verify,
+				    sizeof(peer_verify)));
+
+	ret = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	if (ret != 0) {
+		err = errno;
+	} else {
+		*verify_result = UINT32_MAX;
+		zassert_ok(zsock_getsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT,
+					    verify_result, &optlen));
+	}
+
+	zsock_close(client_fd);
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zsock_close(listen_fd);
+
+	return err;
+}
+
+static void ocsp_expect(int peer_verify, bool staple, int want_err)
+{
+	uint32_t result = 0;
+	int err = ocsp_connect(peer_verify, staple, &result);
+
+	zassert_equal(err, want_err, "verify %d, staple %d: errno %d, want %d", peer_verify,
+		      staple, err, want_err);
+	if (err == 0) {
+		zassert_equal(result, 0, "verify %d, staple %d: verify result 0x%x", peer_verify,
+			      staple, result);
+	}
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_required)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_REQUIRED, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_optional)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_none)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_NONE, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_required)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_REQUIRED, false,
+		    IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE) ? ECONNABORTED : 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_optional)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, false, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_none)
+{
+	ocsp_expect(ZSOCK_TLS_PEER_VERIFY_NONE, false, 0);
+}
+
+static void *ocsp_setup(void)
+{
+	zassert_ok(tls_credential_add(OCSP_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE, ocsp_ca,
+				      sizeof(ocsp_ca)));
+	return NULL;
+}
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
+
+/* The suite's own TLS server cannot staple, so must-staple fails its handshakes. */
+static bool tls_ext_predicate(const void *state)
+{
+	ARG_UNUSED(state);
+
+	return !IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE);
+}
+
+ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE, NULL, NULL);
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+ZTEST_SUITE(net_socket_tls_ocsp, NULL, ocsp_setup, TLS_EXT_BEFORE, NULL, NULL);
+#endif

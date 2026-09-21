@@ -38,6 +38,13 @@ if(${CONFIG_TLS_CREDENTIALS})
     ${ZEPHYR_BASE}/samples/net/sockets/echo_server/src/server_privkey.der
     ${gen_dir}/client_privkey.inc
   )
+
+  if(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+    foreach(f ocsp_ca ocsp_server ocsp_server_key ocsp_good)
+      generate_inc_file_for_target(app ${CMAKE_CURRENT_SOURCE_DIR}/src/ocsp/${f}.der
+        ${gen_dir}/${f}.inc)
+    endforeach()
+  endif()
 endif()
 
 FILE(GLOB app_sources src/*.c)
