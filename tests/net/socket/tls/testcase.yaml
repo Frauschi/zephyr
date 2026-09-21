@@ -55,3 +55,19 @@ tests:
       - CONF_FILE=prj_wolfssl.conf
     extra_configs:
       - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
+  # Build-only: must-staple fails every handshake here, because the test's
+  # own TLS server has no OCSP response to staple.
+  net.socket.tls.wolfssl_ocsp_must_staple:
+    build_only: true
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - CONF_FILE=prj_wolfssl.conf
+    extra_configs:
+      - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
+      - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE=y
+      - CONFIG_WOLFSSL_OCSP_SCREEN_RESPONDER=y

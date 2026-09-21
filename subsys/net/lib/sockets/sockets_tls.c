@@ -4116,6 +4116,13 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 			ret = -EINVAL;
 			goto err_cleanup;
 		}
+
+		if (IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE) &&
+		    wolfSSL_CTX_EnableOCSPMustStaple(context->ctx) != WOLFSSL_SUCCESS) {
+			NET_ERR("Failed to require an OCSP staple");
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
 	}
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 

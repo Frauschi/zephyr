@@ -410,6 +410,19 @@ config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	  CONFIG_WOLFSSL_NO_ASN_TIME_CHECK - which also stops those dates
 	  being checked.
 
+config NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE
+	bool "Require the peer to staple an OCSP response (wolfSSL)"
+	depends on NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
+	help
+	  Fail the handshake when a server does not staple an OCSP response,
+	  instead of accepting the certificate unchecked. Without this option
+	  a server may acknowledge the certificate status request and staple
+	  nothing, which leaves revocation unverified.
+
+	  This needs no OCSP responder reachability: the client only insists
+	  on what the server was already asked for. A server that staples
+	  nothing fails the handshake with -ECONNABORTED.
+
 config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
 	depends on WOLFSSL
