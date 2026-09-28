@@ -306,6 +306,8 @@ __weak __ramfunc void clock_init(void)
 #endif
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(enet)) && CONFIG_NET_L2_ETHERNET && CONFIG_ETH_DRIVER
+	/* The PHY needs its 50 MHz reference clock running before it is reset. */
+	CLOCK_EnableClock(kCLOCK_TddrMciEnetClk);
 	RESET_PeripheralReset(kENET_IPG_RST_SHIFT_RSTn);
 	RESET_PeripheralReset(kENET_IPG_S_RST_SHIFT_RSTn);
 #else
