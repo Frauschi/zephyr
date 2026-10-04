@@ -168,6 +168,26 @@ config NET_TCP_CONGESTION_AVOIDANCE
 	  To avoid overstressing a link reduce the transmission rate as soon as
 	  packets are starting to drop.
 
+config NET_TCP_CONGESTION_INITIAL_WIN
+	int "Initial congestion window in segments"
+	default 1
+	range 1 44
+	depends on NET_TCP_CONGESTION_AVOIDANCE
+	help
+	  Initial congestion window in MSS-sized segments. RFC 3390 allows
+	  up to 3 segments for an MSS of 1460 bytes, RFC 6928 allows 10.
+	  The window is held in 16 bits, which limits it to 44 segments.
+
+config NET_TCP_CONGESTION_INITIAL_SSTHRESH
+	int "Initial slow start threshold in segments"
+	default 3
+	range 0 44
+	depends on NET_TCP_CONGESTION_AVOIDANCE
+	help
+	  Initial slow start threshold in MSS-sized segments. 0 sets it to
+	  the largest window, as RFC 5681 recommends, so slow start runs
+	  until the first loss.
+
 config NET_TCP_KEEPALIVE
 	bool "TCP keep-alive support"
 	help

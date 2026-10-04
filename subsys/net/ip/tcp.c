@@ -66,9 +66,11 @@ static int tcp_tx_window =
 #define TCP_RTO_MS (tcp_rto)
 #endif
 
+#ifdef CONFIG_NET_TCP_CONGESTION_AVOIDANCE
 /* Define the number of MSS sections the congestion window is initialized at */
-#define TCP_CONGESTION_INITIAL_WIN 1
-#define TCP_CONGESTION_INITIAL_SSTHRESH 3
+#define TCP_CONGESTION_INITIAL_WIN CONFIG_NET_TCP_CONGESTION_INITIAL_WIN
+#define TCP_CONGESTION_INITIAL_SSTHRESH CONFIG_NET_TCP_CONGESTION_INITIAL_SSTHRESH
+#endif
 
 static sys_slist_t tcp_conns = SYS_SLIST_STATIC_INIT(&tcp_conns);
 
@@ -507,8 +509,13 @@ static void tcp_new_reno_log(struct tcp *conn, char *step)
 
 static void tcp_new_reno_init(struct tcp *conn)
 {
-	conn->ca.cwnd = conn_mss(conn) * TCP_CONGESTION_INITIAL_WIN;
-	conn->ca.ssthresh = conn_mss(conn) * TCP_CONGESTION_INITIAL_SSTHRESH;
+	conn->ca.cwnd = MIN(conn_mss(conn) * TCP_CONGESTION_INITIAL_WIN, UINT16_MAX);
+	if (TCP_CONGESTION_INITIAL_SSTHRESH == 0) {
+		conn->ca.ssthresh = UINT16_MAX;
+	} else {
+		conn->ca.ssthresh = MIN(conn_mss(conn) * TCP_CONGESTION_INITIAL_SSTHRESH,
+					UINT16_MAX);
+	}
 	conn->ca.pending_fast_retransmit_bytes = 0;
 	tcp_new_reno_log(conn, "init");
 }
