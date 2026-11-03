@@ -276,9 +276,7 @@ extern "C" {
  *  By default (option not set) the socket advertises an MFL derived from
  *  CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH. Pass
  *  ZSOCK_TLS_MFL_DEFAULT to revert a socket back to this default after a
- *  previous call has overridden it. A DTLS socket that has already advertised
- *  a length keeps sending one on reconnect, so a change to no extension at all
- *  takes effect on a new socket.
+ *  previous call has overridden it.
  *
  *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH and CONFIG_WOLFSSL;
  *  under the mbedTLS backend setsockopt returns -ENOPROTOOPT.

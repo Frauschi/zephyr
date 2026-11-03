@@ -3884,4 +3884,53 @@ ZTEST(net_socket_tls, test_tls_1_0_socket_runs_tls_1_2)
 	test_work_wait(&test_data.work);
 }
 
+/* wolfSSL-only: a second connect() handshakes with the new peer, where mbedTLS refuses it. */
+ZTEST(net_socket_tls, test_dtls_client_reconnect_new_peer)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct net_sockaddr c_saddr, s_saddr, s2_saddr;
+	struct connect_data test_data;
+	int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	struct zsock_pollfd fds[1];
+	uint8_t rx_buf;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct net_sockaddr_in *)&c_saddr, NET_IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct net_sockaddr_in *)&s_saddr, NET_IPPROTO_DTLS_1_2);
+	/* c_sock_2 serves as the second server */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			     (struct net_sockaddr_in *)&s2_saddr, NET_IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	test_config_psk(c_sock_2, -1);
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	zassert_ok(zsock_setsockopt(c_sock_2, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	test_bind(c_sock, &c_saddr, sizeof(struct net_sockaddr_in));
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+	test_bind(c_sock_2, &s2_saddr, sizeof(struct net_sockaddr_in));
+
+	for (int i = 0; i < 2; i++) {
+		int srv = i == 0 ? s_sock : c_sock_2;
+
+		test_data.sock = c_sock;
+		test_data.addr = i == 0 ? &s_saddr : &s2_saddr;
+		k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+		test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+		fds[0].fd = srv;
+		fds[0].events = ZSOCK_POLLIN;
+		ret = zsock_poll(fds, 1, 2000);
+		zassert_equal(ret, 1, "server %d got no data after connect()", i + 1);
+		ret = zsock_recv(srv, &rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(ret, sizeof(rx_buf), "server %d recv() failed", i + 1);
+		test_work_wait(&test_data.work);
+	}
+#endif
+}
+
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);
