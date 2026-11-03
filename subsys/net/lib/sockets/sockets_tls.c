@@ -5945,7 +5945,7 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 	end = sys_timepoint_calc(timeout);
 
 	do {
-		ret = wolfSSL_write(ctx->active_session->wssl, buf, len);
+		ret = wolfSSL_write(ctx->active_session->wssl, buf, (int)MIN(len, (size_t)INT_MAX));
 		if (ret > 0) {
 			return ret;
 		}
@@ -6456,12 +6456,10 @@ static ssize_t recv_tls_wolfssl(struct tls_context *ctx, void *buf,
 	do {
 		size_t read_len = max_len - recv_len;
 
-		ret = wolfSSL_read(ctx->active_session->wssl,
-				   (uint8_t *)buf + recv_len, read_len);
+		ret = wolfSSL_read(ctx->active_session->wssl, (uint8_t *)buf + recv_len,
+				   (int)MIN(read_len, (size_t)INT_MAX));
 		if (ret < 0) {
-			/* A local read shutdown racing this recv() is no ZERO_RETURN to wolfSSL;
-			 * return what was read so far.
-			 */
+			/* A racing read shutdown is no ZERO_RETURN, so return what was read */
 			if (ctx->recv_eof) {
 				return recv_len;
 			}
@@ -6666,7 +6664,8 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 		int timeout_ms;
 
 		retry = false;
-		ret = wolfSSL_read(ctx->active_session->wssl, buf, max_len);
+		ret = wolfSSL_read(ctx->active_session->wssl, buf,
+				   (int)MIN(max_len, (size_t)INT_MAX));
 		/* wolfSSL_read() returns 0 for a close_notify */
 		if (ret <= 0) {
 			int err;
