@@ -3608,7 +3608,7 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 {
 	struct tls_session_context *session_ctx = context->active_session;
 
-	if (session_ctx->wssl != NULL) {
+	if (context->ctx != NULL) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 
