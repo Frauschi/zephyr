@@ -100,6 +100,8 @@ config CSPRNG_ENABLED
 
 choice CSPRNG_GENERATOR_CHOICE
 	prompt "Cryptographically secure random generator"
+	# A wolfSSL image draws randomness from the wolfCrypt Hash-DRBG
+	default WOLFSSL_CSPRNG_GENERATOR if WOLFSSL
 	default HARDWARE_DEVICE_CS_GENERATOR
 	default TEST_CSPRNG_GENERATOR
 	help
@@ -119,14 +121,25 @@ config HARDWARE_DEVICE_CS_GENERATOR
 
 config CTR_DRBG_CSPRNG_GENERATOR
 	bool "Use CTR-DRBG CSPRNG"
-	depends on WOLFSSL || MBEDTLS
+	depends on MBEDTLS
 	depends on ENTROPY_HAS_DRIVER
-	select MBEDTLS_CIPHER_AES_ENABLED if MBEDTLS
+	select MBEDTLS_CIPHER_AES_ENABLED
 	help
 	  Enables the CTR-DRBG pseudo-random number generator. This CSPRNG
 	  shall use the entropy API for an initialization seed. The CTR-DRBG
 	  is a FIPS140-2 recommended cryptographically secure random number
 	  generator.
+
+config WOLFSSL_CSPRNG_GENERATOR
+	bool "Use wolfSSL Hash-DRBG CSPRNG"
+	depends on WOLFSSL
+	depends on ENTROPY_HAS_DRIVER
+	help
+	  Enables the wolfSSL DRBG cryptographically secure pseudo-random
+	  number generator (wc_RNG). The DRBG uses the entropy API for
+	  its initialization seed and reseeding. The wolfSSL Hash-DRBG is
+	  a NIST SP 800-90A compliant cryptographically secure random
+	  number generator.
 
 config TEST_CSPRNG_GENERATOR
 	bool "Use insecure CSPRNG for testing purposes"
