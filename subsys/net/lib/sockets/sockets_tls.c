@@ -2629,7 +2629,7 @@ exit:
 
 static int tls_wolfssl_reset(struct tls_context *context)
 {
-	if (context->wssl != NULL) {
+	if (context->ctx != NULL) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 

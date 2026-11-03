@@ -3129,6 +3129,71 @@ ZTEST(net_socket_tls, test_dtls_client_reconnect_new_peer)
 #endif
 }
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+static void *test_wolfssl_null_malloc(size_t size)
+{
+	ARG_UNUSED(size);
+
+	return NULL;
+}
+#endif
+
+/* wolfSSL-only: a DTLS server that cannot rebuild its session reports ENOMEM, then recovers. */
+ZTEST(net_socket_tls, test_dtls_server_reset_out_of_memory)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr c_saddr, s_saddr;
+	struct connect_data test_data;
+	struct timeval timeo_optval = { .tv_sec = 1 };
+	int role = TLS_DTLS_ROLE_SERVER;
+	uint8_t junk[64] = { 0 };
+	uint8_t rx_buf;
+	int helper_sock;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_true(ret == -1 && errno == EAGAIN, "first recv() returned %d (%d)", ret, errno);
+
+	/* A datagram the server must buffer while every wolfSSL allocation fails */
+	helper_sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	zassert_true(helper_sock >= 0, "helper socket failed (%d)", errno);
+	ret = zsock_sendto(helper_sock, junk, sizeof(junk), 0, &s_saddr,
+			   sizeof(struct sockaddr_in));
+	zassert_equal(ret, sizeof(junk), "helper sendto() failed (%d)", errno);
+	(void)zsock_close(helper_sock);
+	k_msleep(10);
+
+	zassert_ok(wolfSSL_SetAllocators(test_wolfssl_null_malloc, NULL, NULL));
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_ok(wolfSSL_SetAllocators(NULL, NULL, NULL));
+	zassert_equal(ret, -1, "recv() without memory returned %d", ret);
+	zassert_equal(errno, ENOMEM, "unexpected errno %d", errno);
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "recv() after recovery failed (%d)", errno);
+	test_work_wait(&test_data.work);
+
+	test_sockets_close();
+#endif
+}
+
 /* wolfSSL-only: a DTLS handshake that runs out of retransmissions latches ETIMEDOUT. */
 ZTEST(net_socket_tls, test_dtls_client_handshake_timeout_latches)
 {
