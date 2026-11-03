@@ -29,10 +29,7 @@ extern "C" {
 
 #if defined(CONFIG_WOLFSSL)
 
-/* Hex values match mbedtls/x509.h. Guards let an application include both
- * this header and mbedtls/x509.h (e.g., for mbedTLS in another TU) without
- * redefinition warnings.
- */
+/* Values match mbedtls/x509.h, which may be included as well */
 #ifndef MBEDTLS_X509_BADCERT_EXPIRED
 #define MBEDTLS_X509_BADCERT_EXPIRED          0x01
 #endif
@@ -99,13 +96,7 @@ extern "C" {
 #define MBEDTLS_ERR_X509_CERT_VERIFY_FAILED   -0x2700
 #endif
 
-/* Compile-time consistency check: if a translation unit happens to pull in
- * both this header and mbedtls/x509.h (e.g., an application that uses
- * mbedTLS for some other purpose while linking the wolfSSL socket backend),
- * the BUILD_ASSERTs below catch a value drift instead of letting the two
- * sources of truth silently diverge. Guarded by __MBEDTLS_X509_H so we
- * only fire when both headers have been included.
- */
+/* Catches drift when mbedtls/x509.h is included too */
 #if defined(__MBEDTLS_X509_H) || defined(MBEDTLS_X509_H)
 #include <zephyr/sys/util.h>
 BUILD_ASSERT(MBEDTLS_X509_BADCERT_EXPIRED       == 0x01,     "ABI drift vs mbedtls/x509.h");

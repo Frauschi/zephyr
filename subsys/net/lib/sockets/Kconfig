@@ -129,32 +129,13 @@ config NET_SOCKETS_SOCKOPT_TLS
 	bool "TCP TLS socket option support"
 	imply TLS_CREDENTIALS
 	select MBEDTLS if NET_NATIVE && !WOLFSSL
-	# wolfSSL backend requirements. The integration calls a narrow set of
-	# non-base wolfSSL APIs; only the strict minimum is force-selected
-	# here to keep flash/RAM cost on constrained targets low:
-	#   OPENSSL_EXTRA_X509_SMALL - exposes WOLFSSL_X509_STORE_CTX::current_cert
-	#                      which the verify callback reads to perform the
-	#                      leaf CN/SAN match. wolfSSL gates the whole
-	#                      X509_STORE_CTX struct member on this flag.
-	#   ALWAYS_VERIFY_CB - fires verify cb on chain success too. Load-
-	#                      bearing: without it the leaf CN/SAN match in
-	#                      tls_wolfssl_verify_accumulate_cb is silently
-	#                      bypassed and a cert with mismatched CN/SAN
-	#                      would be accepted by TLS_PEER_VERIFY_REQUIRED.
-	# Session resumption (CONFIG_WOLFSSL_SESSION_EXPORT) is NOT forced:
-	# the integration's tls_session_store/restore become no-ops when
-	# HAVE_EXT_CACHE is undefined, so enabling it is an explicit opt-in.
-	# (wolfSSL_clear, wolfSSL_X509_check_host and wolfSSL_set_verify are
-	# always available in src/ssl.c / src/x509.c / src/ssl_api_cert.c.)
-	# WOLFSSL_SET_CIPHER_BYTES (wolfSSL_set_cipher_list_bytes) needs no
-	# select: the module's user_settings.h defines it from this symbol.
-	# Gated on `WOLFSSL && !MBEDTLS` because the backends are mutually
-	# exclusive: pulling these wolfSSL knobs in on an mbedTLS build (e.g.
-	# when CONFIG_WOLFSSL=y is enabled for the random subsystem only) is
-	# pure bloat and risks user confusion.
-	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS
-	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS
-	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS
+	# wolfSSL options the TLS layer needs; a settings file defines them itself
+	select WOLFSSL_OPENSSL_EXTRA_X509_SMALL if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_ALWAYS_VERIFY_CB if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
 	imply MBEDTLS_SSL_PROTO_TLS1_2 if !NET_L2_OPENTHREAD
 	imply MBEDTLS_MD_C if !NET_L2_OPENTHREAD
 	imply MBEDTLS_RSA_C if !NET_L2_OPENTHREAD
@@ -170,8 +151,7 @@ config NET_SOCKETS_SOCKOPT_TLS
 
 choice NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE_CHOICE
 	prompt "wolfSSL TLS 1.3 PSK default ciphersuite"
-	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && WOLFSSL_TLS_VERSION_1_3 \
-		&& WOLFSSL_PSK
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL
 	default NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
 	help
 	  TLS 1.3 PSK exchange binds a PSK to a single hash algorithm, but
@@ -199,13 +179,13 @@ endchoice
 
 config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE
 	string
-	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && WOLFSSL_TLS_VERSION_1_3 \
-		&& WOLFSSL_PSK
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL
 	default "TLS13-AES128-GCM-SHA256"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
 	default "TLS13-AES256-GCM-SHA384"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES256_GCM_SHA384
 	default "TLS13-CHACHA20-POLY1305-SHA256" if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CHACHA20_POLY1305_SHA256
 	default "TLS13-AES128-CCM-SHA256"        if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_SHA256
 	default "TLS13-AES128-CCM-8-SHA256"      if NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_CCM_8_SHA256
+	default "TLS13-AES128-GCM-SHA256"
 
 config NET_SOCKETS_TLS_PRIORITY
 	int "Default processing priority for TLS sockets"
@@ -228,11 +208,28 @@ config NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 	  With DTLS, MFL value may be further limited with
 	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH.
 
-	  For WolfSSL, Maximum Fragment Length (MFL) value is set by the
-	  configuration option WOLFSSL_MAX_FRAGMENT_LEN.
+	  For WolfSSL, the value is set by
+	  NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH and the extension itself
+	  must be compiled in (HAVE_MAX_FRAGMENT).
 
 	  This is mostly useful for TLS client side to tell TLS server what is
 	  the maximum supported receive record length.
+
+config NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH
+	int "Maximum Fragment Length in bytes (wolfSSL)"
+	depends on NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH && WOLFSSL && !MBEDTLS
+	default 16384
+	range 512 16384
+	help
+	  Largest TLS record this device can receive, advertised to the peer.
+	  Client sockets only: RFC 6066 has the client offer the length and the
+	  server only echo it.
+	  Rounded down to the nearest length RFC 6066 can encode: 512, 1024,
+	  2048 or 4096. At the default a whole record fits, so no
+	  max_fragment_length extension is sent; lower it to make the peer
+	  shrink its records. With DTLS the value may be further limited by
+	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH. A single socket can override
+	  all of this with the TLS_MAX_FRAGMENT_LENGTH socket option.
 
 config NET_SOCKETS_ENABLE_DTLS
 	bool "DTLS socket support"
@@ -262,8 +259,9 @@ config NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH
 	depends on NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 	help
 	  This variable specifies the Maximum Fragment Length (MFL) value to
-	  be used with DTLS connection when MBEDTLS_SSL_OUT_CONTENT_LEN and
-	  MBEDTLS_SSL_IN_CONTENT_LEN are set to larger values (for TLS).
+	  be used with DTLS connection when the length configured for TLS is
+	  larger: MBEDTLS_SSL_OUT_CONTENT_LEN and MBEDTLS_SSL_IN_CONTENT_LEN
+	  for mbedTLS, NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH for wolfSSL.
 
 	  With DTLS the MFL should be kept under the network MTU, to avoid
 	  IP fragmentation.
@@ -345,11 +343,49 @@ config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
 	  -ENOTSUP. wolfSSL users should use TLS_CERT_VERIFY_CALLBACK_WOLFSSL
 	  (CONFIG_WOLFSSL_VERIFY_CALLBACK) instead.
 
+config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
+	bool "Request a stapled OCSP response (wolfSSL)"
+	depends on NET_SOCKETS_SOCKOPT_TLS && WOLFSSL && !MBEDTLS
+	select WOLFSSL_OCSP if !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_OCSP_STAPLING if !WOLFSSL_HAS_SETTINGS_FILE
+	help
+	  Make TLS client sockets send the certificate status request
+	  extension, so the server staples an OCSP response for its own
+	  certificate to the handshake and revocation is checked without the
+	  client reaching an OCSP responder itself. Under
+	  TLS_PEER_VERIFY_REQUIRED a revoked or invalid response fails the
+	  handshake; under OPTIONAL and NONE the handshake goes on and
+	  TLS_CERT_VERIFY_RESULT reports it, as MBEDTLS_X509_BADCERT_REVOKED
+	  for a revoked certificate.
+
+	  Server sockets are unaffected: they staple a response only if the
+	  application supplies one, which this option does not arrange.
+
+	  Note that an OCSP response carries its own validity dates, so a
+	  target without a trusted clock needs
+	  CONFIG_WOLFSSL_NO_ASN_TIME_CHECK - which also stops those dates
+	  being checked.
+
+config NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE
+	bool "Require the peer to staple an OCSP response (wolfSSL)"
+	depends on NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
+	help
+	  Fail the handshake when a server does not staple an OCSP response,
+	  instead of accepting the certificate unchecked. Without this option
+	  a server may acknowledge the certificate status request and staple
+	  nothing, which leaves revocation unverified.
+
+	  This needs no OCSP responder reachability: the client only insists
+	  on what the server was already asked for. A server that staples
+	  nothing fails the handshake with -ECONNABORTED. Only
+	  TLS_PEER_VERIFY_REQUIRED enforces it; OPTIONAL and NONE accept a
+	  server that staples nothing.
+
 config WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
 	depends on WOLFSSL
 	depends on NET_SOCKETS_SOCKOPT_TLS
-	select WOLFSSL_ALWAYS_VERIFY_CB
+	select WOLFSSL_ALWAYS_VERIFY_CB if !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable registration of wolfSSL-style VerifyCallback functions
 	  via the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.

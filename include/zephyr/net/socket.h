@@ -265,15 +265,40 @@ extern "C" {
  *  use TLS_CERT_VERIFY_CALLBACK_WOLFSSL instead.
  */
 #define TLS_CERT_VERIFY_CALLBACK 20
+/** Write-only socket option to configure per-socket Max Fragment Length (MFL).
+ *  When set, overrides the global MFL derived from compile-time buffer sizes
+ *  for this socket only. Accepts a pointer to an int holding one of the
+ *  TLS_MFL_* values.
+ *
+ *  Client sockets only: RFC 6066 has the client offer the length and the
+ *  server only echo it.
+ *
+ *  By default (option not set) the socket advertises an MFL derived from
+ *  CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH. Pass
+ *  TLS_MFL_DEFAULT to revert a socket back to this default after a
+ *  previous call has overridden it.
+ *
+ *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH and CONFIG_WOLFSSL;
+ *  under the mbedTLS backend setsockopt returns -ENOPROTOOPT.
+ */
+#define TLS_MAX_FRAGMENT_LENGTH 21
 /** Write-only socket option to register a wolfSSL-style cert-verify callback.
  *  The option accepts a pointer to a @ref tls_cert_verify_cb_wolfssl structure.
  *
  *  Only honored when CONFIG_WOLFSSL_VERIFY_CALLBACK is enabled and CONFIG_WOLFSSL
  *  is the active TLS backend; under the mbedTLS backend setsockopt returns
- *  -ENOPROTOOPT. The numeric value (21) is reserved unconditionally so the
+ *  -ENOPROTOOPT. The numeric value (22) is reserved unconditionally so the
  *  socket option-number space stays stable across backends.
  */
-#define TLS_CERT_VERIFY_CALLBACK_WOLFSSL 21
+#define TLS_CERT_VERIFY_CALLBACK_WOLFSSL 22
+
+/* Valid values for @ref TLS_MAX_FRAGMENT_LENGTH option */
+#define TLS_MFL_DEFAULT -1 /**< Use the global Kconfig-derived MFL. */
+#define TLS_MFL_DISABLED 0 /**< Do not send the MFL extension. */
+#define TLS_MFL_512 1      /**< Advertise 512-byte max fragment. */
+#define TLS_MFL_1024 2     /**< Advertise 1024-byte max fragment. */
+#define TLS_MFL_2048 3     /**< Advertise 2048-byte max fragment. */
+#define TLS_MFL_4096 4     /**< Advertise 4096-byte max fragment. */
 
 /* Valid values for @ref TLS_PEER_VERIFY option */
 #define TLS_PEER_VERIFY_NONE 0     /**< Peer verification disabled. */
