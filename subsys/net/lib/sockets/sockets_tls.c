@@ -4188,14 +4188,121 @@ static int tls_check_cert(struct tls_credential *cert)
 #endif /* CONFIG_WOLFSSL */
 }
 
+#if defined(CONFIG_WOLFSSL)
+/* Returns 1 if a wolfCrypt decoder accepts the key, 0 if none does */
+static int tls_wolfssl_key_decodes(byte *der, word32 der_len)
+{
+	word32 start = 0;
+	word32 idx;
+	int ret = 0;
+
+#if defined(HAVE_PKCS8)
+	if (wc_GetPkcs8TraditionalOffset(der, &start, der_len) < 0) {
+		start = 0;
+	}
+#endif /* HAVE_PKCS8 */
+
+#if defined(HAVE_ECC)
+	/* ECC first, since its key struct is the smaller allocation */
+	{
+		ecc_key *ecc = XMALLOC(sizeof(*ecc), NULL, DYNAMIC_TYPE_ECC);
+
+		if (ecc == NULL) {
+			return -ENOMEM;
+		}
+
+		if (wc_ecc_init(ecc) == 0) {
+			idx = start;
+			ret = wc_EccPrivateKeyDecode(der, &idx, ecc, der_len) == 0;
+			wc_ecc_free(ecc);
+		}
+
+		XFREE(ecc, NULL, DYNAMIC_TYPE_ECC);
+	}
+#endif /* HAVE_ECC */
+
+#if !defined(NO_RSA)
+	if (ret == 0) {
+		RsaKey *rsa = XMALLOC(sizeof(*rsa), NULL, DYNAMIC_TYPE_RSA);
+
+		if (rsa == NULL) {
+			return -ENOMEM;
+		}
+
+		if (wc_InitRsaKey(rsa, NULL) == 0) {
+			idx = start;
+			ret = wc_RsaPrivateKeyDecode(der, &idx, rsa, der_len) == 0;
+			wc_FreeRsaKey(rsa);
+		}
+
+		XFREE(rsa, NULL, DYNAMIC_TYPE_RSA);
+	}
+#endif /* !NO_RSA */
+
+#if defined(HAVE_ED25519) && defined(HAVE_ED25519_KEY_IMPORT)
+	if (ret == 0) {
+		ed25519_key *ed = XMALLOC(sizeof(*ed), NULL, DYNAMIC_TYPE_ED25519);
+
+		if (ed == NULL) {
+			return -ENOMEM;
+		}
+
+		if (wc_ed25519_init(ed) == 0) {
+			idx = 0;
+			ret = wc_Ed25519PrivateKeyDecode(der, &idx, ed, der_len) == 0;
+			wc_ed25519_free(ed);
+		}
+
+		XFREE(ed, NULL, DYNAMIC_TYPE_ED25519);
+	}
+#endif /* HAVE_ED25519 && HAVE_ED25519_KEY_IMPORT */
+
+	return ret;
+}
+#endif /* CONFIG_WOLFSSL */
+
 static int tls_check_priv_key(struct tls_credential *priv_key)
 {
 #if defined(CONFIG_WOLFSSL)
 	WOLFSSL_CTX *tmp_ctx;
+	byte *der = (byte *)priv_key->buf;
+	word32 der_len = (word32)priv_key->len;
+	byte *pem_der = NULL;
 	int fmt;
 	int ret;
 
-	/* Without OPENSSL_EXTRA, wolfSSL parses a key only through a CTX */
+	fmt = key_is_pem(priv_key->buf, priv_key->len) ?
+	      WOLFSSL_FILETYPE_PEM : WOLFSSL_FILETYPE_ASN1;
+
+	if (fmt == WOLFSSL_FILETYPE_PEM) {
+		der = NULL;
+#if defined(WOLFSSL_PEM_TO_DER)
+		pem_der = XMALLOC(priv_key->len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		if (pem_der == NULL) {
+			return -ENOMEM;
+		}
+
+		ret = wc_KeyPemToDer(priv_key->buf, (int)priv_key->len, pem_der,
+				     (int)priv_key->len, NULL);
+		if (ret > 0) {
+			der = pem_der;
+			der_len = (word32)ret;
+		}
+#endif /* WOLFSSL_PEM_TO_DER */
+	}
+
+	ret = der != NULL ? tls_wolfssl_key_decodes(der, der_len) : 0;
+
+	if (pem_der != NULL) {
+		wc_ForceZero(pem_der, priv_key->len);
+		XFREE(pem_der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+	}
+
+	if (ret != 0) {
+		return ret < 0 ? ret : 0;
+	}
+
+	/* Other key types, and the error report, come from a CTX */
 #ifndef NO_WOLFSSL_CLIENT
 	tmp_ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
 #else
@@ -4204,9 +4311,6 @@ static int tls_check_priv_key(struct tls_credential *priv_key)
 	if (tmp_ctx == NULL) {
 		return -ENOMEM;
 	}
-
-	fmt = key_is_pem(priv_key->buf, priv_key->len) ?
-	      WOLFSSL_FILETYPE_PEM : WOLFSSL_FILETYPE_ASN1;
 
 	ret = wolfSSL_CTX_use_PrivateKey_buffer(tmp_ctx, priv_key->buf,
 						(long)priv_key->len, fmt);
