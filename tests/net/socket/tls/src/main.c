@@ -3860,4 +3860,28 @@ static void tls_tests_after(void *arg)
 	test_sockets_close();
 }
 
+/* Neither backend builds TLS 1.0 or 1.1, so a TLS_1_0 socket runs TLS 1.2. */
+ZTEST(net_socket_tls, test_tls_1_0_socket_runs_tls_1_2)
+{
+	struct net_sockaddr c_saddr, s_saddr, addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, (struct net_sockaddr_in *)&c_saddr,
+			    NET_IPPROTO_TLS_1_0);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &s_sock, (struct net_sockaddr_in *)&s_saddr,
+			    NET_IPPROTO_TLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+}
+
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);
