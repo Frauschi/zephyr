@@ -384,6 +384,10 @@ __net_socket struct tls_context {
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Lets the handshake tell a sent flight from other wakeups */
 	uint32_t dtls_tx_count;
+	/* Retransmission deadline, kept across handshake calls */
+	k_timepoint_t dtls_rtx_end;
+	uint32_t dtls_rtx_tx_count;
+	bool dtls_rtx_armed;
 #endif
 
 #ifndef NO_PSK
@@ -2947,16 +2951,54 @@ err:
 	return recv_len;
 }
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Returns a negative errno once the handshake has run out of retransmissions */
+static int tls_wolfssl_dtls_rtx(struct tls_context *context)
+{
+	int ret;
+	int err;
+
+	/* Only a sent flight starts the retransmission timer */
+	if (context->dtls_rtx_tx_count != context->dtls_tx_count) {
+		context->dtls_rtx_tx_count = context->dtls_tx_count;
+		context->dtls_rtx_armed = true;
+		context->dtls_rtx_end = sys_timepoint_calc(
+			K_SECONDS(wolfSSL_dtls_get_current_timeout(context->wssl)));
+	}
+
+	if (!context->dtls_rtx_armed || !sys_timepoint_expired(context->dtls_rtx_end)) {
+		return 0;
+	}
+
+	ret = wolfSSL_dtls_got_timeout(context->wssl);
+	if (ret != WOLFSSL_SUCCESS) {
+		err = wolfSSL_get_error(context->wssl, ret);
+		if (err != WOLFSSL_ERROR_WANT_READ && err != WOLFSSL_ERROR_WANT_WRITE) {
+			NET_ERR("DTLS handshake timeout");
+			if (tls_wolfssl_reset(context) == 0) {
+				context->error = ETIMEDOUT;
+				return -ETIMEDOUT;
+			}
+
+			context->error = ECONNABORTED;
+			return -ECONNABORTED;
+		}
+	}
+
+	/* The backoff goes on even when there was nothing to resend */
+	context->dtls_rtx_tx_count = context->dtls_tx_count;
+	context->dtls_rtx_end = sys_timepoint_calc(
+		K_SECONDS(wolfSSL_dtls_get_current_timeout(context->wssl)));
+
+	return 0;
+}
+#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
 static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeout)
 {
 	k_timepoint_t end;
 	int ret;
 	int err;
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	k_timepoint_t rtx_end = sys_timepoint_calc(K_NO_WAIT);
-	uint32_t rtx_tx_count = 0U;
-	bool rtx_armed = false;
-#endif
 
 	context->handshake_in_progress = true;
 
@@ -2967,6 +3009,15 @@ static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeou
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			int timeout_ms;
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+			if (context->type == SOCK_DGRAM) {
+				ret = tls_wolfssl_dtls_rtx(context);
+				if (ret < 0) {
+					break;
+				}
+			}
+#endif
 
 			/* Blocking timeout. */
 			timeout = sys_timepoint_timeout(end);
@@ -2979,20 +3030,9 @@ static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeou
 			timeout_ms = timeout_to_ms(&timeout);
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-			if (context->type == SOCK_DGRAM) {
-				k_timeout_t rtx_left;
-				int timeout_dtls;
-
-				/* Only a sent flight restarts the retransmission timer. */
-				if (!rtx_armed || rtx_tx_count != context->dtls_tx_count) {
-					rtx_armed = true;
-					rtx_tx_count = context->dtls_tx_count;
-					rtx_end = sys_timepoint_calc(K_SECONDS(
-						wolfSSL_dtls_get_current_timeout(context->wssl)));
-				}
-
-				rtx_left = sys_timepoint_timeout(rtx_end);
-				timeout_dtls = timeout_to_ms(&rtx_left);
+			if (context->type == SOCK_DGRAM && context->dtls_rtx_armed) {
+				k_timeout_t rtx_left = sys_timepoint_timeout(context->dtls_rtx_end);
+				int timeout_dtls = timeout_to_ms(&rtx_left);
 
 				if (timeout_ms == SYS_FOREVER_MS) {
 					timeout_ms = timeout_dtls;
@@ -3006,29 +3046,6 @@ static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeou
 			if (ret < 0) {
 				break;
 			}
-
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-			if (context->type == SOCK_DGRAM && ret == 0 && rtx_armed &&
-			    sys_timepoint_expired(rtx_end)) {
-				rtx_armed = false;
-				ret = wolfSSL_dtls_got_timeout(context->wssl);
-				if (ret != WOLFSSL_SUCCESS) {
-					err = wolfSSL_get_error(context->wssl, ret);
-					if (err != WOLFSSL_ERROR_WANT_READ &&
-					    err != WOLFSSL_ERROR_WANT_WRITE) {
-						NET_ERR("DTLS handshake timeout");
-						if (tls_wolfssl_reset(context) == 0) {
-							context->error = ETIMEDOUT;
-							ret = -ETIMEDOUT;
-						} else {
-							context->error = ECONNABORTED;
-							ret = -ECONNABORTED;
-						}
-						break;
-					}
-				}
-			}
-#endif
 
 			continue;
 		} else {
@@ -3696,6 +3713,10 @@ static int tls_wolfssl_session_init(struct tls_context *context, bool is_server)
 
 	context->transport_closed = false;
 	context->verify_result_flags = 0;
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	context->dtls_rtx_armed = false;
+	context->dtls_rtx_tx_count = context->dtls_tx_count;
+#endif
 	context->wssl = wolfSSL_new(context->ctx);
 	if (context->wssl == NULL) {
 		return -ENOMEM;

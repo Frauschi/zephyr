@@ -3480,6 +3480,93 @@ ZTEST(net_socket_tls, test_dtls_server_survives_hello_storm)
 #endif
 }
 
+/* wolfSSL-only: a server driven without blocking gives up on a peer that vanished
+ * mid-handshake, once wolfSSL has committed to it.
+ */
+ZTEST(net_socket_tls, test_dtls_server_times_out_vanished_peer)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	static const unsigned char wrong_psk[sizeof(psk)] = { 0x5a };
+	sec_tag_t wrong_tag = 17;
+	struct sockaddr c_saddr, s_saddr, c2_saddr;
+	struct connect_data test_data, bad_data;
+	uint32_t timeout_min = 1000;
+	uint32_t timeout_max = 2000;
+	int role = TLS_DTLS_ROLE_SERVER;
+	int no = 0;
+	uint8_t rx_buf;
+	int ret = -1;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_TIMEOUT_MIN,
+				    &timeout_min, sizeof(timeout_min)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+
+	/* The right identity with the wrong key: the server commits, then never sees a
+	 * Finished it can decrypt
+	 */
+	(void)tls_credential_delete(wrong_tag, TLS_CREDENTIAL_PSK);
+	(void)tls_credential_delete(wrong_tag, TLS_CREDENTIAL_PSK_ID);
+	zassert_ok(tls_credential_add(wrong_tag, TLS_CREDENTIAL_PSK, wrong_psk,
+				      sizeof(wrong_psk)));
+	zassert_ok(tls_credential_add(wrong_tag, TLS_CREDENTIAL_PSK_ID, psk_id, strlen(psk_id)));
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			     (struct sockaddr_in *)&c2_saddr, IPPROTO_DTLS_1_2);
+	zassert_ok(zsock_setsockopt(c_sock_2, SOL_TLS, TLS_SEC_TAG_LIST, &wrong_tag,
+				    sizeof(wrong_tag)));
+	test_bind(c_sock_2, &c2_saddr, sizeof(struct sockaddr_in));
+	bad_data.sock = c_sock_2;
+	bad_data.addr = &s_saddr;
+	k_work_init_delayable(&bad_data.work, dtls_client_connect_send_no_assert_work_handler);
+	test_work_reschedule(&bad_data.work, K_NO_WAIT);
+
+	for (int i = 0; i < 10; i++) {
+		(void)zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		k_msleep(50);
+	}
+
+	test_work_wait(&bad_data.work);
+	test_close(c_sock_2);
+	c_sock_2 = -1;
+
+	/* A good client gets through once the server lets the vanished peer go */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_ON_CONNECT, &no,
+				    sizeof(no)));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_unpin_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	for (int i = 0; i < 150; i++) {
+		ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		if (ret == sizeof(rx_buf)) {
+			break;
+		}
+		k_msleep(100);
+	}
+	zassert_equal(ret, sizeof(rx_buf), "server never gave up on the vanished peer (%d %d)",
+		      unpin_connect_errno, unpin_send_errno);
+	test_work_wait(&test_data.work);
+	zassert_equal(unpin_connect_errno, 0, "connect() failed (%d)", unpin_connect_errno);
+	zassert_equal(unpin_send_errno, 0, "send() failed (%d)", unpin_send_errno);
+
+	(void)tls_credential_delete(wrong_tag, TLS_CREDENTIAL_PSK);
+	(void)tls_credential_delete(wrong_tag, TLS_CREDENTIAL_PSK_ID);
+	test_sockets_close();
+#endif
+}
+
 /* wolfSSL-only: a DTLS server whose read side is shut down reads EOF. */
 ZTEST(net_socket_tls, test_dtls_server_shut_rd_reads_eof)
 {
