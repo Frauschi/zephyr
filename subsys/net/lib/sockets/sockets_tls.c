@@ -4091,13 +4091,12 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 #endif /* WOLFSSL_TLS13 */
 #ifndef WOLFSSL_NO_TLS12
 		case NET_IPPROTO_TLS_1_2:
+		/* mbedTLS 4 has no TLS 1.0 or 1.1 either, so these sockets run TLS 1.2. */
+		case NET_IPPROTO_TLS_1_1:
+		case NET_IPPROTO_TLS_1_0:
 			return is_server ? wolfTLSv1_2_server_method()
 					 : wolfTLSv1_2_client_method();
 #endif /* !WOLFSSL_NO_TLS12 */
-		case NET_IPPROTO_TLS_1_1:
-		case NET_IPPROTO_TLS_1_0:
-			/* user_settings.h defines NO_OLD_TLS. */
-			return NULL;
 		default:
 			return NULL;
 		}
@@ -4107,14 +4106,11 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 		switch (context->tls_version) {
 #ifndef WOLFSSL_NO_TLS12
 		case NET_IPPROTO_DTLS_1_2:
+		case NET_IPPROTO_DTLS_1_0:
 			return is_server ? wolfDTLSv1_2_server_method()
 					 : wolfDTLSv1_2_client_method();
 #endif /* !WOLFSSL_NO_TLS12 */
 		default:
-			/* DTLS 1.0 and 1.3 are not currently wired up on the
-			 * wolfSSL backend; refuse rather than silently
-			 * substituting a different version.
-			 */
 			return NULL;
 		}
 	}
