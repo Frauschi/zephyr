@@ -18,4 +18,9 @@ void test_wolfssl_send_fatal_alert(WOLFSSL *ssl)
 	(void)SendAlert(ssl, alert_fatal, wolfssl_alert_protocol_version);
 }
 
+void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl)
+{
+	ssl->options.sentNotify = 1;
+}
+
 #endif /* CONFIG_WOLFSSL */
