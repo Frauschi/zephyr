@@ -3937,6 +3937,10 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 		goto err_cleanup;
 	}
 
+	/* connect() on a used DTLS socket must not inherit the last handshake */
+	k_sem_reset(&context->active_session->tls_established);
+	context->error = 0;
+
 	context->is_initialized = true;
 
 	return 0;
