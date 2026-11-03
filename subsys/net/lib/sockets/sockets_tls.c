@@ -5728,6 +5728,11 @@ static ssize_t recvfrom_dtls_server_wolfssl(struct tls_context *ctx, void *buf,
 	bool repeat;
 	k_timeout_t timeout;
 
+	/* A handshake would only read the same EOF again */
+	if (ctx->recv_eof) {
+		return 0;
+	}
+
 	if (!is_blocking(ctx->sock, flags)) {
 		timeout = K_NO_WAIT;
 	} else {

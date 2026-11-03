@@ -3236,6 +3236,35 @@ ZTEST(net_socket_tls, test_dtls_client_handshake_timeout_latches)
 #endif
 }
 
+/* wolfSSL-only: a DTLS server whose read side is shut down reads EOF. */
+ZTEST(net_socket_tls, test_dtls_server_shut_rd_reads_eof)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr s_saddr;
+	struct timeval timeo_optval = { .tv_sec = 1 };
+	int role = TLS_DTLS_ROLE_SERVER;
+	uint8_t rx_buf;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+
+	zassert_ok(zsock_shutdown(s_sock, ZSOCK_SHUT_RD), "shutdown() failed (%d)", errno);
+
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, 0, "recv() after SHUT_RD returned %d (%d)", ret, errno);
+
+	test_sockets_close();
+#endif
+}
+
 /* wolfSSL-only: datagrams that bring no handshake progress do not hold off a retransmission. */
 ZTEST(net_socket_tls, test_dtls_client_retransmit_under_traffic)
 {
