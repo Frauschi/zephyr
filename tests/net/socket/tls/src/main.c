@@ -4379,4 +4379,47 @@ ZTEST(net_socket_tls, test_dtls_client_reconnect_new_peer)
 #endif
 }
 
+/* wolfSSL-only: datagrams that bring no handshake progress do not hold off a retransmission. */
+ZTEST(net_socket_tls, test_dtls_client_retransmit_under_traffic)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct net_sockaddr c_saddr, s_saddr;
+	struct connect_data test_data;
+	int no_peer = -1;
+	uint8_t junk = 0, rx_buf[512];
+	int flights = 0;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct net_sockaddr_in *)&c_saddr, NET_IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	test_bind(c_sock, &c_saddr, sizeof(struct net_sockaddr_in));
+
+	/* A plain UDP peer that never answers the handshake */
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, (struct net_sockaddr_in *)&s_saddr);
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	test_data.peer_sock = &no_peer;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_no_assert_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	/* Junk every 200 ms, past the 1 s DTLS timer and within the connect timeout */
+	for (int i = 0; i < 9; i++) {
+		k_msleep(200);
+		while (zsock_recv(s_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT) > 0) {
+			flights++;
+		}
+		(void)zsock_sendto(s_sock, &junk, sizeof(junk), 0, &c_saddr,
+				   sizeof(struct net_sockaddr_in));
+	}
+
+	test_work_wait(&test_data.work);
+	zassert_true(flights >= 2, "client sent %d ClientHello flight(s), no retransmission",
+		     flights);
+#endif
+}
+
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);

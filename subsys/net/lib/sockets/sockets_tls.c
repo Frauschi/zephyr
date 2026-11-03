@@ -283,6 +283,11 @@ struct tls_session_context {
 	/* Lets a verify callback reach the context of the session it verifies */
 	struct tls_context *tls_ctx;
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	/* Lets the handshake tell a sent flight from other wakeups */
+	uint32_t dtls_tx_count;
+#endif
+
 	/* Accumulated mbedTLS-compatible verify result flags for the
 	 * handshake performed on this session.
 	 */
@@ -1752,6 +1757,8 @@ static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 
 		return WOLFSSL_CBIO_ERR_GENERAL;
 	}
+
+	tls_ctx->active_session->dtls_tx_count++;
 
 	return sent;
 }
@@ -3953,6 +3960,11 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	k_timepoint_t end;
 	int ret;
 	int err;
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	struct tls_session_context *rtx_session = NULL;
+	k_timepoint_t rtx_end = sys_timepoint_calc(K_NO_WAIT);
+	uint32_t rtx_tx_count = 0U;
+#endif
 
 	context->active_session->handshake_in_progress = true;
 
@@ -3964,10 +3976,6 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			int timeout_ms;
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-			int timeout_dtls = SYS_FOREVER_MS;
-			uint32_t wait_start = 0U;
-#endif
 
 			/* Blocking timeout. */
 			timeout = sys_timepoint_timeout(end);
@@ -3993,23 +4001,28 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 					}
 				}
 
-				/* wolfSSL reports the DTLS retransmission
-				 * timeout in seconds.
-				 */
-				timeout_dtls =
-					wolfSSL_dtls_get_current_timeout(
-						context->active_session->wssl) *
-					MSEC_PER_SEC;
+				struct tls_session_context *session = context->active_session;
+				k_timeout_t rtx_left;
+				int timeout_dtls;
+
+				/* Only a sent flight restarts the retransmission timer. */
+				if (rtx_session != session ||
+				    rtx_tx_count != session->dtls_tx_count) {
+					rtx_session = session;
+					rtx_tx_count = session->dtls_tx_count;
+					rtx_end = sys_timepoint_calc(K_SECONDS(
+						wolfSSL_dtls_get_current_timeout(session->wssl)));
+				}
+
+				rtx_left = sys_timepoint_timeout(rtx_end);
+				timeout_dtls = timeout_to_ms(&rtx_left);
 
 				if (timeout_ms == SYS_FOREVER_MS) {
 					timeout_ms = timeout_dtls;
 				} else {
-					timeout_ms = MIN(timeout_dtls,
-							 timeout_ms);
+					timeout_ms = MIN(timeout_dtls, timeout_ms);
 				}
 			}
-
-			wait_start = k_uptime_get_32();
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
 			ret = wait_for_reason(context->sock, timeout_ms, err);
@@ -4018,22 +4031,10 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 			}
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-			/* wait_for_reason() returns 0 both when the socket
-			 * became ready and when the poll timed out. Only
-			 * report a timeout to wolfSSL when the DTLS
-			 * retransmission timer elapsed - calling
-			 * wolfSSL_dtls_got_timeout() on an early data-ready
-			 * wakeup would needlessly retransmit the flight and
-			 * double wolfSSL's internal timer. Residual: if data
-			 * arrives at/after timer expiry, one retransmission
-			 * still precedes reading it; that is indistinguishable
-			 * here without an extra poll and is harmless (the
-			 * peer discards duplicate flights).
-			 */
 			if (context->type == NET_SOCK_DGRAM && ret == 0 &&
-			    timeout_dtls != SYS_FOREVER_MS &&
-			    (k_uptime_get_32() - wait_start) >=
-			    (uint32_t)timeout_dtls) {
+			    rtx_session == context->active_session &&
+			    sys_timepoint_expired(rtx_end)) {
+				rtx_session = NULL;
 				ret = wolfSSL_dtls_got_timeout(
 					context->active_session->wssl);
 				if (ret != WOLFSSL_SUCCESS) {
