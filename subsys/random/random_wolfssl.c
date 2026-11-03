@@ -25,17 +25,7 @@ static int wolfssl_rng_initialize(void)
 {
 	int ret;
 
-	/* wc_InitRng_ex() seeds the DRBG through wc_GenerateSeed(), which on
-	 * Zephyr draws from the hardware entropy driver (see
-	 * wolfcrypt/src/random.c). A dead entropy source therefore surfaces here as
-	 * a wolfCrypt failure.
-	 *
-	 * Supplying no nonce is deliberate: _InitRng() then requests MAX_SEED_SZ
-	 * from the entropy source and derives the SP 800-90A nonce from it,
-	 * instead of shortening the seed by SEED_SZ/2 to make room for a
-	 * caller-provided one.
-	 */
-	ret = wc_InitRng_ex(&rng_ctx, NULL, 0);
+	ret = wc_InitRng_ex(&rng_ctx, NULL, INVALID_DEVID);
 	if (ret != 0) {
 		(void)wc_FreeRng(&rng_ctx);
 		return -EIO;
@@ -47,32 +37,29 @@ static int wolfssl_rng_initialize(void)
 
 int z_impl_sys_csrand_get(void *dst, size_t outlen)
 {
-	int ret;
+	uint8_t *out = dst;
+	int ret = 0;
 
 	k_mutex_lock(&rng_lock, K_FOREVER);
 
 	if (unlikely(!rng_initialised)) {
 		ret = wolfssl_rng_initialize();
 		if (ret != 0) {
-			/* Already a negative errno; preserve it. */
 			goto end;
 		}
 	}
 
-	/* wc_RNG_GenerateBlock() takes a word32. Truncating here would fill
-	 * only part of the buffer and still report success.
-	 */
-	if (outlen > UINT32_MAX) {
-		ret = -EINVAL;
-		goto end;
-	}
+	/* The Hash-DRBG serves at most RNG_MAX_BLOCK_LEN bytes per request. */
+	while (outlen > 0) {
+		word32 len = (word32)MIN(outlen, (size_t)RNG_MAX_BLOCK_LEN);
 
-	ret = wc_RNG_GenerateBlock(&rng_ctx, (byte *)dst, (word32)outlen);
-	if (ret != 0) {
-		/* Do not leak wolfSSL error codes through the syscall
-		 * contract (0 or negative errno).
-		 */
-		ret = -EIO;
+		if (wc_RNG_GenerateBlock(&rng_ctx, out, len) != 0) {
+			ret = -EIO;
+			goto end;
+		}
+
+		out += len;
+		outlen -= len;
 	}
 
 end:

@@ -121,4 +121,19 @@ ZTEST(rng_common, test_rand32)
 #endif /* CONFIG_CSPRNG_ENABLED */
 }
 
+#if defined(CONFIG_WOLFSSL_CSPRNG_GENERATOR)
+/* Larger than one wolfCrypt Hash-DRBG request */
+static uint8_t large_buf[70000];
+
+ZTEST(rng_common, test_csrand_get_large)
+{
+	static const uint8_t zero[32];
+
+	memset(large_buf, 0, sizeof(large_buf));
+	zassert_ok(sys_csrand_get(large_buf, sizeof(large_buf)));
+	zassert_true(memcmp(&large_buf[sizeof(large_buf) - sizeof(zero)], zero,
+			    sizeof(zero)) != 0, "end of the buffer was not filled");
+}
+#endif /* CONFIG_WOLFSSL_CSPRNG_GENERATOR */
+
 ZTEST_SUITE(rng_common, NULL, NULL, NULL, NULL, NULL);
