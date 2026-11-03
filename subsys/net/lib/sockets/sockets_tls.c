@@ -3748,10 +3748,6 @@ static int tls_wolfssl_apply_all_sessions(
 	return 0;
 }
 
-/* Apply all per-SSL-object settings. Runs both on first session init and
- * again after wolfSSL_clear() in tls_wolfssl_reset_session - wolfSSL_clear
- * drops per-SSL state configured after wolfSSL_new().
- */
 static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 				     struct tls_context *tls_ctx, bool is_server)
 {
@@ -3826,16 +3822,59 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 	return 0;
 }
 
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+/* Round down to an RFC 6066 length; a full record needs no extension. */
+static inline int tls_wolfssl_mfl_code(struct tls_context *context)
+{
+	enum net_sock_type type = context->type;
+	size_t len;
+
+	/* ZSOCK_TLS_MFL_* and WOLFSSL_MFL_* both hold the RFC 6066 codes. */
+	if (context->options.mfl_code != ZSOCK_TLS_MFL_DEFAULT) {
+		return context->options.mfl_code;
+	}
+
+	len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	if (type == NET_SOCK_DGRAM &&
+	    len > CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH) {
+		len = CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH;
+	}
+#else
+	ARG_UNUSED(type);
+#endif
+
+	if (len >= 16384) {
+		return WOLFSSL_MFL_DISABLED;
+	} else if (len >= 4096) {
+		return WOLFSSL_MFL_2_12;
+	} else if (len >= 2048) {
+		return WOLFSSL_MFL_2_11;
+	} else if (len >= 1024) {
+		return WOLFSSL_MFL_2_10;
+	}
+
+	return WOLFSSL_MFL_2_9;
+}
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
+
+/* Gives the session a new WOLFSSL object, so no state of an earlier handshake survives. */
 static int tls_wolfssl_session_init(struct tls_session_context *session_ctx,
 				    struct tls_context *tls_ctx, bool is_server)
 {
 	int ret;
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+	int mfl;
+#endif
 
+	if (session_ctx->wssl != NULL) {
+		wolfSSL_free(session_ctx->wssl);
+	}
+
+	session_ctx->wssl = wolfSSL_new(tls_ctx->ctx);
 	if (session_ctx->wssl == NULL) {
-		session_ctx->wssl = wolfSSL_new(tls_ctx->ctx);
-		if (session_ctx->wssl == NULL) {
-			return -ENOMEM;
-		}
+		return -ENOMEM;
 	}
 
 #if defined(HAVE_SECURE_RENEGOTIATION)
@@ -3844,6 +3883,19 @@ static int tls_wolfssl_session_init(struct tls_session_context *session_ctx,
 		goto err_cleanup;
 	}
 #endif /* HAVE_SECURE_RENEGOTIATION */
+
+#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
+	/* Only a client offers a max fragment length (RFC 6066). */
+	if (!is_server) {
+		mfl = tls_wolfssl_mfl_code(tls_ctx);
+
+		if (mfl != WOLFSSL_MFL_DISABLED &&
+		    wolfSSL_UseMaxFragment(session_ctx->wssl, mfl) != WOLFSSL_SUCCESS) {
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
+	}
+#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
 
 	ret = tls_wolfssl_session_setup(session_ctx, tls_ctx, is_server);
 	if (ret != 0) {
@@ -3867,18 +3919,8 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 
-		/* Bring the SSL object back to a reusable post-init state so
-		 * the next handshake on this session starts a fresh handshake
-		 * (parity with mbedtls_ssl_session_reset).
-		 */
-		if (wolfSSL_clear(session_ctx->wssl) != WOLFSSL_SUCCESS) {
-			return -EIO;
-		}
-
-		/* wolfSSL_clear drops per-SSL settings configured after
-		 * wolfSSL_new - re-apply them.
-		 */
-		ret = tls_wolfssl_session_setup(session_ctx, context, is_server);
+		/* wolfSSL_clear() keeps extensions such as ALPN and MFL, so start a new object */
+		ret = tls_wolfssl_session_init(session_ctx, context, is_server);
 		if (ret != 0) {
 			return ret;
 		}
@@ -4042,43 +4084,6 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	return ret;
 }
 
-#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
-/* Round down to an RFC 6066 length; a full record needs no extension. */
-static inline int tls_wolfssl_mfl_code(struct tls_context *context)
-{
-	enum net_sock_type type = context->type;
-	size_t len;
-
-	/* ZSOCK_TLS_MFL_* and WOLFSSL_MFL_* both hold the RFC 6066 codes. */
-	if (context->options.mfl_code != ZSOCK_TLS_MFL_DEFAULT) {
-		return context->options.mfl_code;
-	}
-
-	len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
-
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	if (type == NET_SOCK_DGRAM &&
-	    len > CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH) {
-		len = CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH;
-	}
-#else
-	ARG_UNUSED(type);
-#endif
-
-	if (len >= 16384) {
-		return WOLFSSL_MFL_DISABLED;
-	} else if (len >= 4096) {
-		return WOLFSSL_MFL_2_12;
-	} else if (len >= 2048) {
-		return WOLFSSL_MFL_2_11;
-	} else if (len >= 1024) {
-		return WOLFSSL_MFL_2_10;
-	}
-
-	return WOLFSSL_MFL_2_9;
-}
-#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
-
 static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 					      bool is_server)
 {
@@ -4153,9 +4158,6 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 {
 	WOLFSSL_METHOD *method;
 	int ret;
-#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
-	int mfl;
-#endif
 
 	/* connect() must not demote a socket configured as a DTLS server */
 	if (!context->role_set) {
@@ -4210,19 +4212,6 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	}
 #endif /* !NO_PSK */
 
-#if defined(ZTLS_WOLFSSL_MAX_FRAGMENT)
-	/* Only a client offers a max fragment length (RFC 6066). */
-	if (!is_server) {
-		mfl = tls_wolfssl_mfl_code(context);
-
-		if (mfl != WOLFSSL_MFL_DISABLED &&
-		    wolfSSL_CTX_UseMaxFragment(context->ctx, mfl) != WOLFSSL_SUCCESS) {
-			ret = -EINVAL;
-			goto err_cleanup;
-		}
-	}
-#endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
-
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
 	if (!is_server) {
 		bool must_staple = IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE) &&
@@ -4267,7 +4256,13 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 
 err_cleanup:
 	{
+		struct tls_session_context *session_ctx;
 		WOLFSSL_CTX *wolf_ctx;
+
+		SYS_SLIST_FOR_EACH_CONTAINER(&context->sessions, session_ctx, node) {
+			wolfSSL_free(session_ctx->wssl);
+			session_ctx->wssl = NULL;
+		}
 
 		k_mutex_lock(&context_lock, K_FOREVER);
 		wolf_ctx = context->ctx;
@@ -5012,11 +5007,7 @@ static int tls_opt_alpn_list_set(struct tls_context *context,
 	memcpy(context->options.alpn_list, optval, optlen);
 	context->options.alpn_list[alpn_cnt] = NULL;
 
-#if defined(CONFIG_WOLFSSL) && defined(HAVE_ALPN)
-	return tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_alpn);
-#else
 	return 0;
-#endif /* CONFIG_WOLFSSL && HAVE_ALPN */
 }
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
