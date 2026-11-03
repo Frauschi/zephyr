@@ -1416,8 +1416,9 @@ static int tls_wolfssl_io_closed(struct tls_context *tls_ctx)
 /* With OPENSSL_EXTRA, wolfSSL_get_error() reports SOCKET_PEER_CLOSED_E as WOLFSSL_ERROR_SYSCALL. */
 static bool tls_wolfssl_peer_closed(struct tls_context *context, int err)
 {
-	return err == WOLFSSL_ERROR_ZERO_RETURN || err == SOCKET_PEER_CLOSED_E ||
-	       (err == WOLFSSL_ERROR_SYSCALL && context->transport_closed);
+	return err == WOLFSSL_ERROR_ZERO_RETURN ||
+	       ((err == SOCKET_PEER_CLOSED_E || err == WOLFSSL_ERROR_SYSCALL) &&
+		context->transport_closed);
 }
 #endif /* CONFIG_WOLFSSL */
 
@@ -2823,9 +2824,13 @@ err:
 		if (ret == 0) {
 			/* A clean closure reads as 0; send() then fails as on mbedTLS */
 			err = wolfSSL_get_error(ctx->wssl, ret);
-			if (tls_wolfssl_peer_closed(ctx, err)) {
-				ctx->session_closed = true;
+			if (!tls_wolfssl_peer_closed(ctx, err)) {
+				NET_ERR("TLS recv error: %x", err);
+				errno = EIO;
+				return -1;
 			}
+
+			ctx->session_closed = true;
 			break;
 		}
 

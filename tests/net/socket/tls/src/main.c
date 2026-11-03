@@ -21,6 +21,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <user_settings.h>
 #endif
 #include <wolfssl/ssl.h>
+#include "tcp_internal.h"
 WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
 void test_wolfssl_send_fatal_alert(WOLFSSL *ssl);
@@ -3376,6 +3377,46 @@ ZTEST(net_socket_tls, test_tls_peer_fin_reads_eof)
 	new_sock = -1;
 
 	test_eof(c_sock);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
+}
+
+/* wolfSSL-only: a TCP reset is a recv error, not a clean EOF. */
+ZTEST(net_socket_tls, test_tls_peer_rst_is_error)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct timeval rcv_timeo = { .tv_sec = 2 };
+	struct net_context *srv_ctx;
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL)];
+	int ret;
+
+	test_prepare_tls_connection(AF_INET);
+
+	/* Drop the server connection with neither close_notify nor FIN, so the next
+	 * client segment draws a RST from the listener.
+	 */
+	srv_ctx = zsock_get_context_object(wolfSSL_get_fd(ztls_get_wolfssl_context(new_sock)));
+	zassert_not_null(srv_ctx, "no server TCP context");
+	test_wolfssl_mark_close_notify_sent(ztls_get_wolfssl_context(new_sock));
+	zassert_ok(net_tcp_put(srv_ctx, true), "failed to drop the server connection");
+	test_close(new_sock);
+	new_sock = -1;
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+	/* Let the RST land first, so wolfSSL reads it rather than poll() */
+	k_sleep(K_MSEC(100));
+
+	ret = zsock_setsockopt(c_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeo, sizeof(rcv_timeo));
+	zassert_ok(ret, "failed to set SO_RCVTIMEO (%d)", errno);
+
+	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, -1, "a TCP reset read as %d", ret);
+	zassert_true(errno == EIO || errno == ECONNRESET, "unexpected errno %d", errno);
 
 	test_sockets_close();
 
