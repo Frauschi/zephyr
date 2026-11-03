@@ -1501,7 +1501,10 @@ static int dtls_wolf_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
 	}
 
-	if (tls_ctx->dtls_peer_addrlen == 0) {
+	/* A server still answering statelessly holds no peer to stay pinned to */
+	if (tls_ctx->dtls_peer_addrlen == 0 ||
+	    (tls_ctx->options.role == ZTLS_IS_SERVER && !wolfSSL_is_stateful(ssl) &&
+	     !dtls_is_peer_addr_valid(tls_ctx, &addr, addrlen))) {
 		/* Only allow to store peer address for DTLS servers. */
 		if (tls_ctx->options.role == ZTLS_IS_SERVER) {
 			dtls_peer_address_set(tls_ctx, &addr, addrlen);

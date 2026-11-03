@@ -3293,6 +3293,193 @@ ZTEST(net_socket_tls, test_dtls_client_handshake_timeout_latches)
 #endif
 }
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
+static int unpin_connect_errno;
+static int unpin_send_errno;
+
+static void dtls_client_unpin_work_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct connect_data *data = CONTAINER_OF(dwork, struct connect_data, work);
+	uint8_t tx_buf = 0;
+
+	unpin_connect_errno = zsock_connect(data->sock, data->addr,
+					    sizeof(struct sockaddr_in)) < 0 ? errno : 0;
+	unpin_send_errno = zsock_send(data->sock, &tx_buf, sizeof(tx_buf), 0) < 0 ? errno : 0;
+}
+#endif
+
+/* wolfSSL-only: a server driven without blocking lets go of a peer that went silent. */
+ZTEST(net_socket_tls, test_dtls_server_unpins_silent_peer)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr c_saddr, s_saddr, h_saddr;
+	struct connect_data test_data;
+	struct timeval timeo_optval = { .tv_sec = 2 };
+	uint32_t timeout_min = 1000;
+	uint32_t timeout_max = 2000;
+	int role = TLS_DTLS_ROLE_SERVER;
+	int no = 0;
+	uint8_t hello[512];
+	uint8_t rx_buf;
+	int hello_len;
+	int ret = -1;
+
+	/* Capture a ClientHello on a plain UDP socket */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, (struct sockaddr_in *)&s_saddr);
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_no_assert_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	hello_len = zsock_recv(s_sock, hello, sizeof(hello), 0);
+	zassert_true(hello_len > 0, "no ClientHello captured (%d)", errno);
+	test_work_wait(&test_data.work);
+	test_sockets_close();
+
+	/* The server answers a replayed ClientHello from a peer that never replies */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_TIMEOUT_MIN,
+				    &timeout_min, sizeof(timeout_min)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+	(void)zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+
+	prepare_sock_udp_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			    (struct sockaddr_in *)&h_saddr);
+	test_bind(c_sock_2, &h_saddr, sizeof(struct sockaddr_in));
+	ret = zsock_sendto(c_sock_2, hello, hello_len, 0, &s_saddr, sizeof(struct sockaddr_in));
+	zassert_equal(ret, hello_len, "replay failed (%d)", errno);
+	k_msleep(10);
+	(void)zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+
+	/* A real client keeps retrying while the server is only polled */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_ON_CONNECT, &no,
+				    sizeof(no)));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.work, dtls_client_unpin_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	for (int i = 0; i < 150; i++) {
+		ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		if (ret == sizeof(rx_buf)) {
+			break;
+		}
+		k_msleep(100);
+	}
+	zassert_equal(ret, sizeof(rx_buf), "server stayed pinned to the silent peer (%d %d)",
+		      unpin_connect_errno, unpin_send_errno);
+	test_work_wait(&test_data.work);
+	zassert_equal(unpin_connect_errno, 0, "connect() failed (%d)", unpin_connect_errno);
+	zassert_equal(unpin_send_errno, 0, "send() failed (%d)", unpin_send_errno);
+
+	test_sockets_close();
+#endif
+}
+
+/* wolfSSL-only: replayed ClientHellos from many peers do not lock a real client out. */
+ZTEST(net_socket_tls, test_dtls_server_survives_hello_storm)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr c_saddr, s_saddr, h_saddr;
+	struct connect_data test_data;
+	struct timeval timeo_optval = { .tv_sec = 2 };
+	int role = TLS_DTLS_ROLE_SERVER;
+	int no = 0;
+	int storm[3];
+	uint8_t hello[512];
+	uint8_t rx_buf;
+	int hello_len;
+	int ret = -1;
+
+	/* Capture a ClientHello on a plain UDP socket */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			    (struct sockaddr_in *)&s_saddr);
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_no_assert_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	hello_len = zsock_recv(s_sock, hello, sizeof(hello), 0);
+	zassert_true(hello_len > 0, "no ClientHello captured (%d)", errno);
+	test_work_wait(&test_data.work);
+	test_sockets_close();
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+
+	for (int i = 0; i < ARRAY_SIZE(storm); i++) {
+		prepare_sock_udp_v4(MY_IPV4_ADDR, 4250 + i, &storm[i],
+				    (struct sockaddr_in *)&h_saddr);
+		test_bind(storm[i], &h_saddr, sizeof(struct sockaddr_in));
+	}
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_HANDSHAKE_ON_CONNECT,
+				    &no, sizeof(no)));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	test_data.sock = c_sock;
+	k_work_init_delayable(&test_data.work, dtls_client_unpin_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	/* Each storm peer repeats its ClientHello faster than a session expires */
+	for (int i = 0; i < 40; i++) {
+		for (int j = 0; j < ARRAY_SIZE(storm); j++) {
+			(void)zsock_sendto(storm[j], hello, hello_len, 0, &s_saddr,
+					   sizeof(struct sockaddr_in));
+		}
+
+		ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+		if (ret == sizeof(rx_buf)) {
+			break;
+		}
+		k_msleep(100);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(storm); i++) {
+		(void)zsock_close(storm[i]);
+	}
+
+	zassert_equal(ret, sizeof(rx_buf), "a real client was locked out (%d %d)",
+		      unpin_connect_errno, unpin_send_errno);
+	test_work_wait(&test_data.work);
+
+	test_sockets_close();
+#endif
+}
+
 /* wolfSSL-only: a DTLS server whose read side is shut down reads EOF. */
 ZTEST(net_socket_tls, test_dtls_server_shut_rd_reads_eof)
 {
