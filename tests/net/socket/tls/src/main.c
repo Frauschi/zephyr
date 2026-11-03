@@ -23,6 +23,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
 void test_wolfssl_send_fatal_alert(WOLFSSL *ssl);
+void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl);
 #endif
 
 #if defined(CONFIG_MBEDTLS)
@@ -3971,6 +3972,27 @@ ZTEST(net_socket_tls, test_dtls_client_retransmit_under_traffic)
 	test_work_wait(&test_data.work);
 	zassert_true(flights >= 2, "client sent %d ClientHello flight(s), no retransmission",
 		     flights);
+#endif
+}
+
+/* wolfSSL-only: a TCP FIN without a close_notify reads as EOF, OPENSSL_EXTRA or not. */
+ZTEST(net_socket_tls, test_tls_peer_fin_reads_eof)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	test_prepare_tls_connection(NET_AF_INET);
+
+	/* Closing the server then sends a FIN but no close_notify */
+	test_wolfssl_mark_close_notify_sent(ztls_get_wolfssl_context(new_sock));
+	test_close(new_sock);
+	new_sock = -1;
+
+	test_eof(c_sock);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
 #endif
 }
 
