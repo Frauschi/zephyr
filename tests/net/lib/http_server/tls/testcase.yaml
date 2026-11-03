@@ -21,7 +21,7 @@ tests:
       - host
       - llvm
   net.http.server.tls.wolfssl:
-    tags: http net server socket wolfssl
+    tags: wolfssl
     platform_allow:
       - native_sim
       - native_sim/native/64

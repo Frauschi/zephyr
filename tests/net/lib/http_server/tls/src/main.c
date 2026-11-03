@@ -13,6 +13,9 @@
 #include <zephyr/net/tls_credentials.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/ztest.h>
+#if defined(CONFIG_WOLFSSL)
+#include <time.h>
+#endif
 
 LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 
@@ -160,11 +163,6 @@ static void test_tls(void)
 		const sec_tag_t *sec_tag_list;
 		size_t sec_tag_list_size;
 
-		/* sizeof(sec_tag_list_verify_none), not sizeof(sec_tag_list)
-		 * - the latter is sizeof(pointer), which on 64-bit hosts
-		 * (e.g. native_sim/native/64) feeds an extra garbage sec_tag
-		 * into setsockopt and breaks credential lookup.
-		 */
 		sec_tag_list_size = sizeof(sec_tag_list_verify_none);
 		sec_tag_list = sec_tag_list_verify_none;
 
@@ -267,4 +265,27 @@ static void *setup(void)
 	return NULL;
 }
 
-ZTEST_SUITE(framework_tests_tls, NULL, setup, NULL, NULL, NULL);
+#if defined(CONFIG_WOLFSSL)
+/* 2025-06-01, inside the 2024..2124 validity of the test certificates */
+#define WOLFSSL_CERT_VALID_TIME 1748736000
+
+static void set_cert_validity_clock(void *fixture)
+{
+	const struct timespec ts = {
+		.tv_sec = WOLFSSL_CERT_VALID_TIME,
+		.tv_nsec = 0,
+	};
+	int ret;
+
+	ARG_UNUSED(fixture);
+
+	/* ztest resets the realtime clock to 1970 after each test, so set it before each one */
+	ret = clock_settime(CLOCK_REALTIME, &ts);
+	zassert_ok(ret, "failed to set CLOCK_REALTIME (%d)", ret);
+}
+#define HTTP_TLS_BEFORE set_cert_validity_clock
+#else
+#define HTTP_TLS_BEFORE NULL
+#endif /* CONFIG_WOLFSSL */
+
+ZTEST_SUITE(framework_tests_tls, NULL, setup, HTTP_TLS_BEFORE, NULL, NULL);

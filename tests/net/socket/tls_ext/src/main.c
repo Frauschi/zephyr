@@ -10,11 +10,11 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/net/tls_credentials.h>
 #include <zephyr/posix/unistd.h>
-#include <time.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/ztest.h>
 
 #if defined(CONFIG_WOLFSSL)
+#include <time.h>
 #include <wolfssl/ssl.h>
 #include <zephyr/net/tls_verify.h>
 #else
@@ -72,6 +72,8 @@ enum tls_tag {
 	SERVER_CERTIFICATE_TAG,
 	/** Used for both the public and private client keys */
 	CLIENT_CERTIFICATE_TAG,
+	/** The CA of the OCSP stapling tests */
+	OCSP_CA_TAG,
 };
 
 /** @brief synchronization object for server & client threads */
@@ -133,6 +135,24 @@ static const unsigned char client[] = {
 static const unsigned char client_privkey[] = {
 #include "client_privkey.inc"
 };
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+static const unsigned char ocsp_ca[] = {
+#include "ocsp_ca.inc"
+};
+
+static const unsigned char ocsp_server[] = {
+#include "ocsp_server.inc"
+};
+
+static const unsigned char ocsp_server_key[] = {
+#include "ocsp_server_key.inc"
+};
+
+static const unsigned char ocsp_good[] = {
+#include "ocsp_good.inc"
+};
+#endif
 #else /* CONFIG_TLS_CREDENTIALS */
 #define ca NULL
 #define server NULL
@@ -346,8 +366,8 @@ static int test_configure_client(struct sockaddr_in *sa, bool own_cert,
 	 * as a peer identity that cannot be verified.
 	 */
 	if (hostname != NULL) {
-		r = setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, hostname,
-			       strlen(hostname) + 1);
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, hostname,
+				     strlen(hostname) + 1);
 		zassert_not_equal(r, -1, "failed to set TLS_HOSTNAME (%d)", errno);
 	}
 
@@ -438,6 +458,27 @@ ZTEST(net_socket_tls_api_extension, test_tls_peer_verify_none)
 	test_common(TLS_PEER_VERIFY_NONE);
 }
 
+ZTEST(net_socket_tls_api_extension, test_tls_own_cert_padded_der)
+{
+	static uint8_t padded[sizeof(server) + 4];
+	int r;
+
+	memcpy(padded, server, sizeof(server));
+	memset(padded + sizeof(server), 0xff, 4);
+
+	(void)tls_credential_delete(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	r = tls_credential_add(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+			       padded, sizeof(padded));
+	zassert_ok(r, "failed to add padded server certificate (%d)", r);
+
+	test_common(TLS_PEER_VERIFY_OPTIONAL);
+
+	(void)tls_credential_delete(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	r = tls_credential_add(SERVER_CERTIFICATE_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+			       server, sizeof(server));
+	zassert_ok(r, "failed to restore server certificate (%d)", r);
+}
+
 ZTEST(net_socket_tls_api_extension, test_tls_peer_verify_optional)
 {
 	test_common(TLS_PEER_VERIFY_OPTIONAL);
@@ -500,10 +541,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_bad_cn)
 	test_tls_cert_verify_result_opt_common(MBEDTLS_X509_BADCERT_CN_MISMATCH);
 }
 
-/* A client that never sets TLS_HOSTNAME has no name to check the peer
- * certificate against, so TLS_PEER_VERIFY_REQUIRED must reject it rather
- * than accept a certificate issued for any name.
- */
+/* Without TLS_HOSTNAME, REQUIRED has no name to check, so the handshake fails */
 ZTEST(net_socket_tls_api_extension, test_tls_no_hostname_required_rejected)
 {
 	int server_fd, client_fd, ret;
@@ -515,20 +553,17 @@ ZTEST(net_socket_tls_api_extension, test_tls_no_hostname_required_rejected)
 					  false, true);
 	client_fd = test_configure_client(&sa, false, NULL);
 
-	ret = setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
-			 &peer_verify, sizeof(peer_verify));
+	ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
 	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
 
-	ret = connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
 	zassert_equal(ret, -1, "connect succeeded without a hostname to verify");
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 }
 
-/* TLS_PEER_VERIFY_NONE means no peer verification at all, so a hostname
- * that cannot match must not fail the handshake. Guards against the name
- * check making NONE stricter than OPTIONAL.
- */
+/* NONE skips the name check, so it is never stricter than OPTIONAL */
 ZTEST(net_socket_tls_api_extension, test_tls_verify_none_ignores_hostname)
 {
 	int server_fd, client_fd, ret;
@@ -540,13 +575,51 @@ ZTEST(net_socket_tls_api_extension, test_tls_verify_none_ignores_hostname)
 					  false, false);
 	client_fd = test_configure_client(&sa, false, "dummy");
 
-	ret = setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
-			 &peer_verify, sizeof(peer_verify));
+	ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
 	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
 
-	ret = connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
 	zassert_not_equal(ret, -1, "TLS_PEER_VERIFY_NONE rejected a hostname mismatch (%d)",
 			  errno);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
+/* optlen often counts the terminating NUL, which both backends accept */
+ZTEST(net_socket_tls_api_extension, test_tls_hostname_trailing_nul)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint32_t optval;
+	socklen_t optlen = sizeof(optval);
+	int peer_verify = TLS_PEER_VERIFY_OPTIONAL;
+
+	server_fd = test_configure_server(&server_thread_id,
+					  TLS_PEER_VERIFY_NONE,
+					  false, false);
+	client_fd = test_configure_client(&sa, false, "localhost");
+
+	/* Override the hostname with optlen including the terminating NUL. */
+	ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME,
+			       "localhost", sizeof("localhost"));
+	zassert_ok(ret, "failed to set TLS_HOSTNAME (%d)", errno);
+
+	ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+	ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(ret, -1, "failed to connect (%d)", errno);
+
+	/* The CN must have matched despite the NUL-terminated optval. */
+	ret = zsock_getsockopt(client_fd, SOL_TLS,
+			       TLS_CERT_VERIFY_RESULT, &optval, &optlen);
+	zassert_equal(ret, 0, "getsockopt failed (%d)", errno);
+	zassert_equal(optval, 0,
+		      "unexpected verify result 0x%x (hostname mismatch?)",
+		      optval);
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 }
@@ -561,7 +634,7 @@ struct test_cert_verify_ctx {
 };
 
 static int cert_verify_cb(void *ctx, mbedtls_x509_crt *crt, int depth,
-			   uint32_t *flags)
+			  uint32_t *flags)
 {
 	struct test_cert_verify_ctx *test_ctx = (struct test_cert_verify_ctx *)ctx;
 
@@ -581,7 +654,6 @@ static void test_tls_cert_verify_cb_opt_common(int result)
 	int server_fd, client_fd, ret;
 	k_tid_t server_thread_id;
 	struct sockaddr_in sa;
-
 	struct test_cert_verify_ctx ctx = {
 		.cb_called = false,
 		.result = result,
@@ -623,13 +695,8 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_cb_opt_bad_cert)
 
 #endif /* CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK */
 
-#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK)
-/* Contract test: TLS_CERT_VERIFY_CALLBACK (opt 20) is the mbedTLS-style
- * cert-verify callback. Under CONFIG_WOLFSSL the option is documented to
- * return -ENOTSUP; users must use TLS_CERT_VERIFY_CALLBACK_WOLFSSL
- * instead. This test pins that contract so a future setsockopt
- * dispatcher change can't silently start accepting opt 20 under wolfSSL.
- */
+#if defined(CONFIG_WOLFSSL)
+/* Option 20 is the mbedTLS-style callback and returns -ENOTSUP on wolfSSL */
 ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_cb_opt20_enotsup_on_wolfssl)
 {
 	int client_fd;
@@ -647,22 +714,109 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_cb_opt20_enotsup_on_wol
 
 	(void)zsock_close(client_fd);
 }
-#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK */
+#endif /* CONFIG_WOLFSSL */
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_WOLFSSL_MAX_FRAGMENT) && \
+	defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+/* One socket for all cases: the net_context pool is small and reclaimed lazily. */
+ZTEST(net_socket_tls_api_extension, test_tls_mfl_opt_values)
+{
+	static const int accept[] = {
+		TLS_MFL_DEFAULT, TLS_MFL_DISABLED, TLS_MFL_512,
+		TLS_MFL_1024, TLS_MFL_2048, TLS_MFL_4096,
+	};
+	/* 5 and 6 are wolfSSL's non-RFC-6066 8192 and 256 codes. */
+	static const int reject[] = { -2, 5, 6, 255 };
+	int accept_r[ARRAY_SIZE(accept)];
+	int reject_r[ARRAY_SIZE(reject)];
+	int reject_e[ARRAY_SIZE(reject)];
+	int short_r, short_e, null_r, null_e;
+	int fd, val;
+
+	fd = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
+	zassert_true(fd >= 0, "socket() failed (%d)", errno);
+
+	/* Collect results first, so the socket is closed even if an assertion aborts. */
+	for (int i = 0; i < ARRAY_SIZE(accept); i++) {
+		val = accept[i];
+		accept_r[i] = zsock_setsockopt(fd, SOL_TLS,
+					       TLS_MAX_FRAGMENT_LENGTH,
+					       &val, sizeof(val));
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(reject); i++) {
+		val = reject[i];
+		reject_r[i] = zsock_setsockopt(fd, SOL_TLS,
+					       TLS_MAX_FRAGMENT_LENGTH,
+					       &val, sizeof(val));
+		reject_e[i] = errno;
+	}
+
+	val = TLS_MFL_512;
+	short_r = zsock_setsockopt(fd, SOL_TLS, TLS_MAX_FRAGMENT_LENGTH,
+				   &val, sizeof(val) - 1);
+	short_e = errno;
+
+	null_r = zsock_setsockopt(fd, SOL_TLS, TLS_MAX_FRAGMENT_LENGTH,
+				  NULL, sizeof(val));
+	null_e = errno;
+
+	(void)zsock_close(fd);
+
+	for (int i = 0; i < ARRAY_SIZE(accept); i++) {
+		zassert_ok(accept_r[i], "MFL %d rejected", accept[i]);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(reject); i++) {
+		zassert_equal(reject_r[i], -1, "MFL %d accepted", reject[i]);
+		zassert_equal(reject_e[i], EINVAL, "MFL %d: errno %d, want EINVAL",
+			      reject[i], reject_e[i]);
+	}
+
+	zassert_equal(short_r, -1, "short optlen accepted");
+	zassert_equal(short_e, EINVAL, "short optlen: errno %d, want EINVAL", short_e);
+	zassert_equal(null_r, -1, "NULL optval accepted");
+	zassert_equal(null_e, EINVAL, "NULL optval: errno %d, want EINVAL", null_e);
+}
+
+ZTEST(net_socket_tls_api_extension, test_tls_mfl_handshake)
+{
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int mfl = TLS_MFL_512;
+	int server_fd;
+	int client_fd;
+	int r;
+
+	server_fd = test_configure_server(&server_thread_id,
+					  TLS_PEER_VERIFY_NONE, true, false);
+	client_fd = test_configure_client(&sa, false, "localhost");
+
+	r = zsock_setsockopt(client_fd, SOL_TLS, TLS_MAX_FRAGMENT_LENGTH,
+			     &mfl, sizeof(mfl));
+	zassert_ok(r, "failed to set TLS_MAX_FRAGMENT_LENGTH (%d)", errno);
+
+	r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(SECRET_SIZE, r, "send() failed (%d)", errno);
+
+	memset(rx_buf, 0, sizeof(rx_buf));
+	r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(SECRET_SIZE, r, "recv() failed (%d)", errno);
+	zassert_mem_equal(SECRET, rx_buf, SECRET_SIZE, "payload mismatch");
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_WOLFSSL_MAX_FRAGMENT &&
+	* CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
+	*/
 
 static void *setup(void)
 {
 	int r;
-
-	/* native_sim starts with CLOCK_REALTIME at epoch 0 (1970).
-	 * wolfSSL validates certificate dates, so set the clock to a
-	 * date within the test certificates' validity period.
-	 */
-	const struct timespec ts = {
-		.tv_sec = 1704067200, /* 2024-01-01T00:00:00Z */
-		.tv_nsec = 0,
-	};
-
-	(void)clock_settime(CLOCK_REALTIME, &ts);
 
 	/*
 	 * Load both client & server credentials
@@ -891,10 +1045,7 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_null_ctx)
 	k_tid_t server_thread_id;
 	struct sockaddr_in sa;
 
-	/* Register wolfSSL-style callback with ctx set to NULL.
-	 * wolfSSL should NOT call wolfSSL_SetCertCbCtx, so
-	 * store->userCtx in the callback should be NULL.
-	 */
+	/* With a NULL ctx, store->userCtx in the callback is NULL */
 	struct tls_cert_verify_cb_wolfssl cb = {
 		.cb = wolfssl_verify_null_ctx_cb,
 		.ctx = NULL,
@@ -933,12 +1084,12 @@ static void server_thread_wolfssl_verify_fn(void *arg0, void *arg1, void *arg2)
 	addrlen = sizeof(sa);
 
 	k_sem_give(&server_sem);
-	r = accept(server_fd, (struct sockaddr *)&sa, &addrlen);
-	zassert_not_equal(r, -1, "accept() failed (%d)", errno);
+	r = zsock_accept(server_fd, (struct sockaddr *)&sa, &addrlen);
+	zassert_not_equal(r, -1, "zsock_accept() failed (%d)", errno);
 	client_fd = r;
 
-	r = close(client_fd);
-	zassert_not_equal(r, -1, "close() failed on the server fd (%d)", errno);
+	r = zsock_close(client_fd);
+	zassert_not_equal(r, -1, "zsock_close() failed on the server fd (%d)", errno);
 }
 
 ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
@@ -950,13 +1101,7 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	int server_fd, client_fd, ret;
 	k_tid_t tid;
 	struct sockaddr_in sa;
-	/* Use REQUIRED, not OPTIONAL. On the server side OPTIONAL maps to
-	 * plain WOLFSSL_VERIFY_PEER (request a cert, but accept the handshake
-	 * if the client doesn't present one), so a misbehaving client that
-	 * skips its certificate never triggers the verify callback. REQUIRED
-	 * adds WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT, forcing the server to
-	 * actually demand a client certificate and exercise the callback.
-	 */
+	/* Only REQUIRED makes a server demand a client certificate and run the callback */
 	int peer_verify = TLS_PEER_VERIFY_REQUIRED;
 
 	memset(&server_wolfssl_verify_ctx, 0, sizeof(server_wolfssl_verify_ctx));
@@ -970,28 +1115,28 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	k_sem_init(&server_sem, 0, 1);
 
 	/* Create server socket */
-	ret = socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
+	ret = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
 	zassert_not_equal(ret, -1, "failed to create server socket (%d)", errno);
 	server_fd = ret;
 
 	int yes = true;
 
-	ret = setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	ret = zsock_setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 	zassert_not_equal(ret, -1, "failed to set SO_REUSEADDR (%d)", errno);
 
-	ret = setsockopt(server_fd, SOL_TLS, TLS_SEC_TAG_LIST,
+	ret = zsock_setsockopt(server_fd, SOL_TLS, TLS_SEC_TAG_LIST,
 			 server_tag_list, sizeof(server_tag_list));
 	zassert_not_equal(ret, -1, "failed to set TLS_SEC_TAG_LIST (%d)", errno);
 
-	ret = setsockopt(server_fd, SOL_TLS, TLS_HOSTNAME, "localhost",
+	ret = zsock_setsockopt(server_fd, SOL_TLS, TLS_HOSTNAME, "localhost",
 			 sizeof("localhost"));
 	zassert_not_equal(ret, -1, "failed to set TLS_HOSTNAME (%d)", errno);
 
-	ret = setsockopt(server_fd, SOL_TLS, TLS_PEER_VERIFY,
+	ret = zsock_setsockopt(server_fd, SOL_TLS, TLS_PEER_VERIFY,
 			 &peer_verify, sizeof(peer_verify));
 	zassert_not_equal(ret, -1, "failed to set TLS_PEER_VERIFY (%d)", errno);
 
-	ret = setsockopt(server_fd, SOL_TLS, TLS_CERT_VERIFY_CALLBACK_WOLFSSL,
+	ret = zsock_setsockopt(server_fd, SOL_TLS, TLS_CERT_VERIFY_CALLBACK_WOLFSSL,
 			 &cb, sizeof(cb));
 	zassert_ok(ret, "failed to set TLS_CERT_VERIFY_CALLBACK_WOLFSSL (%d)", errno);
 
@@ -1000,10 +1145,10 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons(PORT);
 
-	ret = bind(server_fd, (struct sockaddr *)&sa, sizeof(sa));
+	ret = zsock_bind(server_fd, (struct sockaddr *)&sa, sizeof(sa));
 	zassert_not_equal(ret, -1, "failed to bind (%d)", errno);
 
-	ret = listen(server_fd, 1);
+	ret = zsock_listen(server_fd, 1);
 	zassert_not_equal(ret, -1, "failed to listen (%d)", errno);
 
 	tid = k_thread_create(&server_thread, server_stack, STACK_SIZE,
@@ -1021,15 +1166,15 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	zassert_equal(ret, 0, "failed to connect (%d)", errno);
 
 	/* The server's wolfSSL-style verify callback should have been invoked
-	 * during accept() on the cloned child context.
+	 * during zsock_accept() on the cloned child context.
 	 */
 	zassert_true(server_wolfssl_verify_ctx.cb_called,
 		     "server wolfSSL-style verify callback was not called");
 
-	ret = close(client_fd);
-	zassert_not_equal(-1, ret, "close() failed on client fd (%d)", errno);
-	ret = close(server_fd);
-	zassert_not_equal(-1, ret, "close() failed on server fd (%d)", errno);
+	ret = zsock_close(client_fd);
+	zassert_not_equal(-1, ret, "zsock_close() failed on client fd (%d)", errno);
+	ret = zsock_close(server_fd);
+	zassert_not_equal(-1, ret, "zsock_close() failed on server fd (%d)", errno);
 	ret = k_thread_join(&server_thread, K_FOREVER);
 	zassert_equal(0, ret, "k_thread_join() failed (%d)", ret);
 	k_yield();
@@ -1037,4 +1182,214 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
 
-ZTEST_SUITE(net_socket_tls_api_extension, NULL, setup, NULL, NULL, NULL);
+#if defined(CONFIG_WOLFSSL)
+/* 2025-06-01, inside the 2020..2119 validity of the test certificates */
+#define WOLFSSL_CERT_VALID_TIME 1748736000
+
+static void set_cert_validity_clock(void *fixture)
+{
+	const struct timespec ts = {
+		.tv_sec = WOLFSSL_CERT_VALID_TIME,
+		.tv_nsec = 0,
+	};
+	int ret;
+
+	ARG_UNUSED(fixture);
+
+	/* ztest resets the realtime clock to 1970 after each test, so set it before each one */
+	ret = clock_settime(CLOCK_REALTIME, &ts);
+	zassert_ok(ret, "failed to set CLOCK_REALTIME (%d)", ret);
+}
+#define TLS_EXT_BEFORE set_cert_validity_clock
+#else
+#define TLS_EXT_BEFORE NULL
+#endif /* CONFIG_WOLFSSL */
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+#define OCSP_PORT 4243
+#define OCSP_STACK_SIZE 16384
+
+static K_THREAD_STACK_DEFINE(ocsp_server_stack, OCSP_STACK_SIZE);
+
+static int ocsp_io_cb(void *ctx, const char *url, int url_len, unsigned char *req,
+		      int req_len, unsigned char **resp)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(url);
+	ARG_UNUSED(url_len);
+	ARG_UNUSED(req);
+	ARG_UNUSED(req_len);
+
+	*resp = (unsigned char *)ocsp_good;
+	return sizeof(ocsp_good);
+}
+
+static void ocsp_resp_free_cb(void *ctx, unsigned char *resp)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(resp);
+}
+
+/* A Zephyr TLS server socket cannot staple, so the peer is plain wolfSSL. */
+static void ocsp_server_fn(void *p1, void *p2, void *p3)
+{
+	int listen_fd = POINTER_TO_INT(p1);
+	bool staple = POINTER_TO_INT(p2);
+	WOLFSSL_CTX *ctx;
+	WOLFSSL *ssl = NULL;
+	int fd = -1;
+
+	ARG_UNUSED(p3);
+
+	ctx = wolfSSL_CTX_new(wolfTLSv1_2_server_method());
+	if (ctx == NULL ||
+	    wolfSSL_CTX_use_certificate_buffer(ctx, ocsp_server, sizeof(ocsp_server),
+					       WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+	    wolfSSL_CTX_use_PrivateKey_buffer(ctx, ocsp_server_key, sizeof(ocsp_server_key),
+					      WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+		goto out;
+	}
+
+	if (staple &&
+	    (wolfSSL_CTX_load_verify_buffer(ctx, ocsp_ca, sizeof(ocsp_ca),
+					    WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_EnableOCSP(ctx, WOLFSSL_OCSP_URL_OVERRIDE | WOLFSSL_OCSP_NO_NONCE) !=
+	     WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_SetOCSP_OverrideURL(ctx, "http://127.0.0.1/") != WOLFSSL_SUCCESS ||
+	     wolfSSL_CTX_EnableOCSPStapling(ctx) != WOLFSSL_SUCCESS ||
+	     /* After EnableOCSPStapling(), which installs the default lookup. */
+	     wolfSSL_CTX_SetOCSP_Cb(ctx, ocsp_io_cb, ocsp_resp_free_cb, NULL) !=
+	     WOLFSSL_SUCCESS)) {
+		goto out;
+	}
+
+	fd = zsock_accept(listen_fd, NULL, NULL);
+	if (fd < 0) {
+		goto out;
+	}
+
+	ssl = wolfSSL_new(ctx);
+	if (ssl != NULL && wolfSSL_set_fd(ssl, fd) == WOLFSSL_SUCCESS &&
+	    wolfSSL_accept(ssl) == WOLFSSL_SUCCESS) {
+		(void)wolfSSL_shutdown(ssl);
+	}
+
+out:
+	wolfSSL_free(ssl);
+	if (fd >= 0) {
+		zsock_close(fd);
+	}
+	wolfSSL_CTX_free(ctx);
+}
+
+/* Returns 0 or the errno of a failed connect(), and the verify result. */
+static int ocsp_connect(int peer_verify, bool staple, uint32_t *verify_result)
+{
+	static const sec_tag_t tags[] = { OCSP_CA_TAG };
+	struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(OCSP_PORT) };
+	socklen_t optlen = sizeof(*verify_result);
+	int listen_fd, client_fd, yes = 1, ret, err = 0;
+
+	zassert_equal(zsock_inet_pton(AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+
+	listen_fd = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	zassert_true(listen_fd >= 0, "socket() failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes,
+				    sizeof(yes)));
+	zassert_ok(zsock_bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)));
+	zassert_ok(zsock_listen(listen_fd, 1));
+
+	(void)k_thread_create(&server_thread, ocsp_server_stack, OCSP_STACK_SIZE, ocsp_server_fn,
+			      INT_TO_POINTER(listen_fd), INT_TO_POINTER(staple), NULL,
+			      K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+
+	client_fd = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
+	zassert_true(client_fd >= 0, "TLS socket() failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST, tags,
+				    sizeof(tags)));
+	zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, "localhost",
+				    sizeof("localhost")));
+	zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY, &peer_verify,
+				    sizeof(peer_verify)));
+
+	ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	if (ret != 0) {
+		err = errno;
+	} else {
+		*verify_result = UINT32_MAX;
+		zassert_ok(zsock_getsockopt(client_fd, SOL_TLS, TLS_CERT_VERIFY_RESULT,
+					    verify_result, &optlen));
+	}
+
+	zsock_close(client_fd);
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zsock_close(listen_fd);
+
+	return err;
+}
+
+static void ocsp_expect(int peer_verify, bool staple, int want_err)
+{
+	uint32_t result = 0;
+	int err = ocsp_connect(peer_verify, staple, &result);
+
+	zassert_equal(err, want_err, "verify %d, staple %d: errno %d, want %d", peer_verify,
+		      staple, err, want_err);
+	if (err == 0) {
+		zassert_equal(result, 0, "verify %d, staple %d: verify result 0x%x", peer_verify,
+			      staple, result);
+	}
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_required)
+{
+	ocsp_expect(TLS_PEER_VERIFY_REQUIRED, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_optional)
+{
+	ocsp_expect(TLS_PEER_VERIFY_OPTIONAL, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_staple_none)
+{
+	ocsp_expect(TLS_PEER_VERIFY_NONE, true, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_required)
+{
+	ocsp_expect(TLS_PEER_VERIFY_REQUIRED, false,
+		    IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE) ? ECONNABORTED : 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_optional)
+{
+	ocsp_expect(TLS_PEER_VERIFY_OPTIONAL, false, 0);
+}
+
+ZTEST(net_socket_tls_ocsp, test_tls_ocsp_no_staple_none)
+{
+	ocsp_expect(TLS_PEER_VERIFY_NONE, false, 0);
+}
+
+static void *ocsp_setup(void)
+{
+	zassert_ok(tls_credential_add(OCSP_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE, ocsp_ca,
+				      sizeof(ocsp_ca)));
+	return NULL;
+}
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
+
+/* The suite's own TLS server cannot staple, so must-staple fails its handshakes. */
+static bool tls_ext_predicate(const void *state)
+{
+	ARG_UNUSED(state);
+
+	return !IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE);
+}
+
+ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE, NULL, NULL);
+
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
+ZTEST_SUITE(net_socket_tls_ocsp, NULL, ocsp_setup, TLS_EXT_BEFORE, NULL, NULL);
+#endif

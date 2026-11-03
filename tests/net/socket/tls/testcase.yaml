@@ -27,6 +27,32 @@ tests:
       - native_sim/native/64
     integration_platforms:
       - native_sim
-    tags: net socket tls wolfssl
+    tags: wolfssl
     extra_args:
-      - OVERLAY_CONFIG=overlay-wolfssl.conf
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+  net.socket.tls.wolfssl_ocsp_stapling:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
+  # Build-only: must-staple fails every handshake here, because the test's
+  # own TLS server has no OCSP response to staple.
+  net.socket.tls.wolfssl_ocsp_must_staple:
+    build_only: true
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
+      - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE=y

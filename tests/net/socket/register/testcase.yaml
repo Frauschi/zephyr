@@ -26,7 +26,7 @@ tests:
     platform_allow:
       - native_sim
       - native_sim/native/64
-    tags: net socket socket.register wolfssl
+    tags: wolfssl
     extra_configs:
       - CONFIG_MBEDTLS=n
       - CONFIG_POSIX_API=y

@@ -12,9 +12,7 @@ tests:
       - tls
       - trusted-firmware-m
   net.tls_credentials.wolfssl:
-    # Exercises the credentials API alongside a WOLFSSL=y build to catch
-    # symbol/include collisions in a TLS-credentials-only configuration
-    # (no NET_SOCKETS_SOCKOPT_TLS). The API itself is backend-agnostic.
+    # Catches symbol clashes between a WOLFSSL=y build and the credentials API
     tags:
       - net
       - tls
