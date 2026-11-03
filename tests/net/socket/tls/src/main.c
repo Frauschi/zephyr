@@ -3129,6 +3129,62 @@ ZTEST(net_socket_tls, test_dtls_client_reconnect_new_peer)
 #endif
 }
 
+/* wolfSSL-only: a reconnect does not inherit the error the last session latched. */
+ZTEST(net_socket_tls, test_dtls_client_reconnect_clears_error)
+{
+#if !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr c_saddr, s_saddr, s2_saddr;
+	struct connect_data test_data;
+	struct timeval timeo_optval = { .tv_sec = 2 };
+	int role = TLS_DTLS_ROLE_SERVER;
+	uint8_t rx_buf;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct sockaddr_in *)&c_saddr, IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct sockaddr_in *)&s_saddr, IPPROTO_DTLS_1_2);
+	/* c_sock_2 serves as the second server */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			     (struct sockaddr_in *)&s2_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	test_config_psk(c_sock_2, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(c_sock_2, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(c_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+	test_bind(c_sock_2, &s2_saddr, sizeof(struct sockaddr_in));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "server 1 recv() failed");
+	test_work_wait(&test_data.work);
+
+	/* The first server's close_notify latches ENOTCONN on the client */
+	test_close(s_sock);
+	s_sock = -1;
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, -1, "recv() after close_notify returned %d", ret);
+	zassert_equal(errno, ENOTCONN, "unexpected errno %d", errno);
+
+	test_data.addr = &s2_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "server 2 recv() failed");
+	test_work_wait(&test_data.work);
+
+	test_sockets_close();
+#endif
+}
+
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_WOLFSSL)
 static void *test_wolfssl_null_malloc(size_t size)
 {
