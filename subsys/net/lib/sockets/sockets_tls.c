@@ -1787,6 +1787,20 @@ static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	return sent;
 }
 
+static bool dtls_server_has_session(struct tls_context *tls_ctx,
+				    const struct net_sockaddr *addr, net_socklen_t addrlen)
+{
+	struct tls_session_context *session_ctx;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&tls_ctx->sessions, session_ctx, node) {
+		if (dtls_is_peer_addr_valid(session_ctx, addr, addrlen)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 {
 	struct tls_context *tls_ctx = ctx;
@@ -1822,7 +1836,13 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 		/* Peer address does not match the current session, exit now
 		 * and try to find the appropriate session or allocate a new one.
 		 */
-		return WOLFSSL_CBIO_ERR_WANT_READ;
+		if (wolfSSL_is_stateful(ssl) ||
+		    dtls_server_has_session(tls_ctx, net_sad(&addr), addrlen)) {
+			return WOLFSSL_CBIO_ERR_WANT_READ;
+		}
+
+		/* A session still answering statelessly holds no peer, so this one takes it */
+		tls_ctx->active_session->dtls_peer_addrlen = 0;
 	}
 
 	/* If the session matches, read the actual packet. */
