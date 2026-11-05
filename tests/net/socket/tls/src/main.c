@@ -4477,6 +4477,53 @@ ZTEST(net_socket_tls, test_tls13_psk_handshake)
 #endif
 }
 
+ZTEST(net_socket_tls, test_tls13_client_poll_after_ticket)
+{
+#if !defined(WOLFSSL_TLS13) || !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct net_sockaddr_in6 c_saddr, s_saddr;
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+	uint8_t tx_buf[] = TEST_STR_SMALL;
+	uint8_t rx_buf[sizeof(tx_buf)];
+	struct zsock_pollfd fds[1];
+	int ret;
+
+	prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &c_sock, &c_saddr, NET_IPPROTO_TLS_1_3);
+	prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &s_sock, &s_saddr, NET_IPPROTO_TLS_1_3);
+	test_config_psk(s_sock, c_sock);
+	test_config_tls13_suites(s_sock, c_sock);
+	test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(struct net_sockaddr_in6));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct net_sockaddr *)&s_saddr;
+	test_data.peer_sock = &s_sock;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	k_sleep(K_MSEC(100));
+	fds[0].fd = c_sock;
+	fds[0].events = ZSOCK_POLLIN;
+	ret = zsock_poll(fds, 1, 100);
+	zassert_equal(ret, 0, "poll() after ticket: ret %d revents 0x%x", ret, fds[0].revents);
+
+	test_send(new_sock, tx_buf, sizeof(tx_buf), 0);
+	ret = zsock_poll(fds, 1, 500);
+	zassert_equal(ret, 1, "poll() missed data");
+	zassert_equal(fds[0].revents, ZSOCK_POLLIN, "revents 0x%x", fds[0].revents);
+	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(tx_buf), "recv() failed %d", errno);
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
+}
+
 static void *tls_tests_setup(void)
 {
 	k_work_queue_init(&tls_test_work_queue);
