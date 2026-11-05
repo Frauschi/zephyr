@@ -1221,6 +1221,41 @@ ZTEST(net_socket_tls_api_extension, test_tls_mfl_handshake)
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 }
+
+/* send() writes one record per call, so it returns a short count, as on mbedTLS */
+ZTEST(net_socket_tls_api_extension, test_tls_send_one_record)
+{
+	static uint8_t big[1000];
+	k_tid_t server_thread_id;
+	uint8_t rx_buf[16];
+	struct net_sockaddr_in sa;
+	int mfl = ZSOCK_TLS_MFL_512;
+	int server_fd;
+	int client_fd;
+	int r;
+
+	server_fd = test_configure_server(&server_thread_id,
+					  ZSOCK_TLS_PEER_VERIFY_NONE, true, false);
+	client_fd = test_configure_client(&sa, false, "localhost");
+
+	r = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_MAX_FRAGMENT_LENGTH,
+			     &mfl, sizeof(mfl));
+	zassert_ok(r, "failed to set ZSOCK_TLS_MAX_FRAGMENT_LENGTH (%d)", errno);
+
+	r = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(SECRET_SIZE, r, "send() failed (%d)", errno);
+
+	r = zsock_send(client_fd, big, sizeof(big), 0);
+	zassert_true(r > 0 && r <= 512, "send() of %zu bytes returned %d", sizeof(big), r);
+
+	r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(SECRET_SIZE, r, "recv() failed (%d)", errno);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
 #endif /* CONFIG_WOLFSSL && CONFIG_WOLFSSL_MAX_FRAGMENT &&
 	* CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 	*/

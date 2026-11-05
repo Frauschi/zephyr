@@ -4662,4 +4662,19 @@ ZTEST(net_socket_tls, test_tls_peer_rst_is_error)
 #endif
 }
 
+/* A datagram bigger than one DTLS record fails, as mbedTLS refuses it */
+ZTEST(net_socket_tls, test_dtls_send_oversized_datagram)
+{
+	static uint8_t big[4000];
+	ssize_t ret;
+
+	test_prepare_dtls_connection(NET_AF_INET);
+
+	ret = zsock_send(c_sock, big, sizeof(big), 0);
+	zassert_equal(ret, -1, "an oversized datagram sent %d bytes", (int)ret);
+	zassert_equal(errno, ECONNABORTED, "unexpected errno %d", errno);
+
+	test_sockets_close();
+}
+
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);
