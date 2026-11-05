@@ -54,6 +54,9 @@ int z_impl_sys_csrand_get(void *dst, size_t outlen)
 		word32 len = (word32)MIN(outlen, (size_t)RNG_MAX_BLOCK_LEN);
 
 		if (wc_RNG_GenerateBlock(&rng_ctx, out, len) != 0) {
+			/* A failed DRBG stays failed, so the next call instantiates a new one */
+			(void)wc_FreeRng(&rng_ctx);
+			rng_initialised = false;
 			ret = -EIO;
 			goto end;
 		}
