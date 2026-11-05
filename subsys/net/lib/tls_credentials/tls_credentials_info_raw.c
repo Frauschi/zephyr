@@ -13,6 +13,11 @@
 
 #if defined(CONFIG_MBEDTLS_X509_CRT_PARSE_C)
 #include <mbedtls/x509_crt.h>
+#elif defined(CONFIG_WOLFSSL)
+#include <string.h>
+#include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/wolfcrypt/asn.h>
+#include <wolfssl/wolfcrypt/asn_public.h>
 #endif
 
 int credential_info_expiry_get(struct tls_credential *credential, time_t *expiry_out)
@@ -50,6 +55,75 @@ int credential_info_expiry_get(struct tls_credential *credential, time_t *expiry
 	*expiry_out = expiry;
 exit:
 	mbedtls_x509_crt_free(&crt);
+
+	return ret;
+#elif defined(CONFIG_WOLFSSL) && !defined(NO_ASN_TIME)
+	const char *pem_header = "-----BEGIN CERTIFICATE-----";
+	const byte *cert_buf = credential->buf;
+	word32 cert_len = credential->len;
+	struct DecodedCert *cert;
+	struct tm tm_expiry;
+	const byte *date;
+	byte *der = NULL;
+	time_t expiry;
+	int date_len;
+	byte format;
+	int ret = -EINVAL;
+
+	/* PEM must be NUL-terminated, as for mbedtls_x509_crt_parse() */
+	if (cert_len > 0 && cert_buf[cert_len - 1] == '\0' &&
+	    strstr((const char *)cert_buf, pem_header) != NULL) {
+#if defined(WOLFSSL_PEM_TO_DER)
+		int der_len;
+
+		der = XMALLOC(cert_len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		if (der == NULL) {
+			return -ENOMEM;
+		}
+
+		der_len = wc_CertPemToDer(cert_buf, (int)cert_len, der, (int)cert_len,
+					  CERT_TYPE);
+		if (der_len <= 0) {
+			XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			return -EINVAL;
+		}
+
+		cert_buf = der;
+		cert_len = (word32)der_len;
+#else
+		return -ENOTSUP;
+#endif /* WOLFSSL_PEM_TO_DER */
+	}
+
+	cert = XMALLOC(sizeof(*cert), NULL, DYNAMIC_TYPE_DCERT);
+	if (cert == NULL) {
+		XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		return -ENOMEM;
+	}
+
+	wc_InitDecodedCert(cert, cert_buf, cert_len, NULL);
+
+	if (wc_ParseCert(cert, CERT_TYPE, NO_VERIFY, NULL) != 0 ||
+	    wc_GetDateInfo(cert->afterDate, cert->afterDateLen, &date, &format,
+			   &date_len) != 0 ||
+	    wc_GetDateAsCalendarTime(date, date_len, format, &tm_expiry) != 0) {
+		goto exit;
+	}
+
+	errno = 0;
+	expiry = timeutil_timegm(&tm_expiry);
+	/* Only if errno is set to non-zero is the conversion considered failed */
+	if (expiry == -1 && errno != 0) {
+		ret = -errno;
+		goto exit;
+	}
+
+	*expiry_out = expiry;
+	ret = 0;
+exit:
+	wc_FreeDecodedCert(cert);
+	XFREE(cert, NULL, DYNAMIC_TYPE_DCERT);
+	XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 
 	return ret;
 #else

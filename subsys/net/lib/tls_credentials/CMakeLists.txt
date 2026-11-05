@@ -17,6 +17,7 @@ zephyr_library_sources_ifdef(CONFIG_TLS_CREDENTIALS_SHELL
 )
 
 zephyr_library_link_libraries_ifdef(CONFIG_MBEDTLS_BUILTIN mbedtls_iface)
+zephyr_library_link_libraries_ifdef(CONFIG_WOLFSSL wolfSSL)
 
 if(CONFIG_TLS_CREDENTIALS_BACKEND_PROTECTED_STORAGE AND CONFIG_BUILD_WITH_TFM)
   target_include_directories(${ZEPHYR_CURRENT_LIBRARY} PRIVATE

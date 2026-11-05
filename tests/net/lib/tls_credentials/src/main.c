@@ -169,7 +169,7 @@ static void test_credential_internal_iterate(void)
 	zassert_is_null(key, "Should have return NULL after last credential");
 }
 
-#if defined(CONFIG_MBEDTLS_X509_CRT_PARSE_C)
+#if defined(CONFIG_MBEDTLS_X509_CRT_PARSE_C) || defined(CONFIG_WOLFSSL)
 static void test_credential_expiry(void)
 {
 	int ret;
