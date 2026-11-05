@@ -4351,7 +4351,7 @@ static int tls_opt_ciphersuite_used_get(struct tls_context *context,
 		const char *ciph;
 		byte b1, b2;
 
-		if (context->wssl == NULL) {
+		if (context->wssl == NULL || !is_handshake_complete(context)) {
 			return -ENOTCONN;
 		}
 
@@ -4363,9 +4363,7 @@ static int tls_opt_ciphersuite_used_get(struct tls_context *context,
 		int flags = 0;
 
 		if (wolfSSL_get_cipher_suite_from_name(ciph, &b1, &b2, &flags) != 0) {
-			/* Not a connection-state error: the session is up but
-			 * the cipher name didn't resolve back to a known ID.
-			 */
+			/* The session is up, but its suite name maps to no known ID */
 			return -ENOENT;
 		}
 
