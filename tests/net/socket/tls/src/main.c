@@ -2400,22 +2400,24 @@ ZTEST(net_socket_tls, test_session_cache)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-static void tls_set_session_cache_client_cb(void)
+static void tls_set_session_cache_client_cb(bool server_cache)
 {
 	int t = ZSOCK_TLS_SESSION_CACHE_ENABLED;
 	int l = sizeof(int);
 	int ret;
 
-	ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
-			       (void *)&t, l);
-	zassert_equal(ret, 0, "Unable to set session cache on server");
+	if (server_cache) {
+		ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+				       (void *)&t, l);
+		zassert_equal(ret, 0, "Unable to set session cache on server");
+	}
 	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
 			       (void *)&t, l);
 	zassert_equal(ret, 0, "Unable to set session cache on client");
 }
 
 /* A fixed server port gives both connections the same peer address, the cache key */
-static void prepare_tls_session_resume_connection(uint16_t server_port, int proto)
+static void prepare_tls_session_resume_ex(uint16_t server_port, int proto, bool server_cache)
 {
 	struct net_sockaddr_in c_saddr;
 	struct net_sockaddr_in s_saddr;
@@ -2428,7 +2430,7 @@ static void prepare_tls_session_resume_connection(uint16_t server_port, int prot
 	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, proto);
 	prepare_sock_tls_v4(MY_IPV4_ADDR, server_port, &s_sock, &s_saddr, proto);
 
-	tls_set_session_cache_client_cb();
+	tls_set_session_cache_client_cb(server_cache);
 
 	test_config_psk(s_sock, c_sock);
 	if (proto == NET_IPPROTO_TLS_1_3) {
@@ -2451,6 +2453,11 @@ static void prepare_tls_session_resume_connection(uint16_t server_port, int prot
 
 	test_accept(s_sock, &new_sock, &addr, &addrlen);
 	test_work_wait(&test_data.work);
+}
+
+static void prepare_tls_session_resume_connection(uint16_t server_port, int proto)
+{
+	prepare_tls_session_resume_ex(server_port, proto, true);
 }
 
 static void check_verify_result(int sock, uint32_t expected)
@@ -2617,6 +2624,46 @@ ZTEST(net_socket_tls, test_session_cache_tls13_ticket_offered)
 
 		test_sockets_close();
 		k_sleep(TCP_TEARDOWN_TIMEOUT);
+	}
+#endif
+}
+
+/* A server with TLS_SESSION_CACHE off issues no ticket, so the client offers none */
+ZTEST(net_socket_tls, test_session_cache_server_disabled_no_ticket)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(HAVE_EXT_CACHE) || defined(NO_SESSION_CACHE)
+	ztest_test_skip();
+#else
+	static const int protos[] = {
+		NET_IPPROTO_TLS_1_2,
+#if defined(WOLFSSL_TLS13)
+		NET_IPPROTO_TLS_1_3,
+#endif
+	};
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	int reused[ARRAY_SIZE(protos)][2];
+	int ret;
+
+	for (int p = 0; p < ARRAY_SIZE(protos); p++) {
+		tls_session_cache_purge();
+
+		for (int i = 0; i < 2; i++) {
+			prepare_tls_session_resume_ex(RESUME_SERVER_PORT, protos[p], false);
+			reused[p][i] = wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock));
+
+			/* A TLS 1.3 ticket arrives with the data */
+			test_send(new_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+			ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
+			zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+
+			test_sockets_close();
+			k_sleep(TCP_TEARDOWN_TIMEOUT);
+		}
+	}
+
+	for (int p = 0; p < ARRAY_SIZE(protos); p++) {
+		zassert_equal(reused[p][0] + reused[p][1], 0,
+			      "proto %d resumed with the server cache off", protos[p]);
 	}
 #endif
 }
@@ -4628,6 +4675,10 @@ ZTEST(net_socket_tls, test_tls13_client_poll_after_ticket)
 	prepare_sock_tls_v6(MY_IPV6_ADDR, ANY_PORT, &s_sock, &s_saddr, NET_IPPROTO_TLS_1_3);
 	test_config_psk(s_sock, c_sock);
 	test_config_tls13_suites(s_sock, c_sock);
+	/* The server sends a ticket only with its session cache on */
+	ret = ZSOCK_TLS_SESSION_CACHE_ENABLED;
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE, &ret,
+				    sizeof(ret)), "server session cache (%d)", errno);
 	test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(struct net_sockaddr_in6));
 	test_listen(s_sock);
 
