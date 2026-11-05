@@ -3837,13 +3837,13 @@ static int tls_wolfssl_set_dtls_timeouts(struct tls_context *context,
 		int max_s;
 
 		/* wolfSSL takes whole seconds; round up so a sub-second value does not become 0. */
-		init_s = (int)((context->options.dtls_handshake_timeout_min +
-				MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		init_s = (int)DIV_ROUND_UP((uint64_t)context->options.dtls_handshake_timeout_min,
+					   MSEC_PER_SEC);
 		if (init_s < 1) {
 			init_s = 1;
 		}
-		max_s = (int)((context->options.dtls_handshake_timeout_max +
-			       MSEC_PER_SEC - 1) / MSEC_PER_SEC);
+		max_s = (int)DIV_ROUND_UP((uint64_t)context->options.dtls_handshake_timeout_max,
+					  MSEC_PER_SEC);
 		if (max_s < init_s) {
 			max_s = init_s;
 		}

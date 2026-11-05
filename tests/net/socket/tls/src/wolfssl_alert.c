@@ -56,4 +56,11 @@ int test_wolfssl_send_held_records(WOLFSSL *ssl)
 	return held_send(ssl, (char *)held_records, held_len, ssl->IOCB_WriteCtx);
 }
 
+#ifdef WOLFSSL_DTLS
+int test_wolfssl_dtls_timeout_max(WOLFSSL *ssl)
+{
+	return ssl->dtls_timeout_max;
+}
+#endif /* WOLFSSL_DTLS */
+
 #endif /* CONFIG_WOLFSSL */

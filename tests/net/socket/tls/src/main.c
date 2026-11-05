@@ -29,6 +29,7 @@ void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl);
 /* Collect the records a session sends, and send them as one datagram */
 void test_wolfssl_hold_records(WOLFSSL *ssl);
 int test_wolfssl_send_held_records(WOLFSSL *ssl);
+int test_wolfssl_dtls_timeout_max(WOLFSSL *ssl);
 #endif
 
 #if defined(CONFIG_MBEDTLS)
@@ -563,6 +564,26 @@ static void test_prepare_dtls_connection(net_sa_family_t family)
 	zassert_equal(ret, sizeof(rx_buf), "zsock_recv() failed");
 
 	test_work_wait(&test_data.work);
+}
+
+/* A handshake timeout near UINT32_MAX ms must not wrap when wolfSSL takes it in seconds */
+ZTEST(net_socket_tls, test_dtls_handshake_timeout_max_large)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(WOLFSSL_DTLS)
+	ztest_test_skip();
+#else
+	uint32_t timeout_max = UINT32_MAX;
+
+	test_prepare_dtls_connection(NET_AF_INET);
+
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	zassert_equal(test_wolfssl_dtls_timeout_max(ztls_get_wolfssl_context(c_sock)),
+		      DIV_ROUND_UP((uint64_t)UINT32_MAX, MSEC_PER_SEC),
+		      "wolfSSL got a wrapped DTLS timeout maximum");
+
+	test_sockets_close();
+#endif
 }
 
 /* Function pointer type for function to be called after socket creation but
