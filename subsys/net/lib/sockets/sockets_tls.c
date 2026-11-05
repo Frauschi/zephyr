@@ -282,10 +282,14 @@ struct tls_session_context {
 	bool dtls_rtx_armed;
 #endif
 
-	/* Accumulated mbedTLS-compatible verify result flags for the
-	 * handshake performed on this session.
-	 */
+	/* mbedTLS-compatible verify result flags of this session's handshake */
 	uint32_t verify_result_flags;
+
+	/* Verify result saved with the session this handshake tries to resume. */
+	uint32_t resumed_verify_result;
+
+	bool cert_verify_ran;
+	bool psk_used;
 #endif /* CONFIG_WOLFSSL */
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
@@ -1220,6 +1224,34 @@ static void tls_session_purge(void)
 #endif /* CONFIG_MBEDTLS */
 
 #if defined(CONFIG_WOLFSSL)
+/* Without a certificate check the result is SKIP_VERIFY or MISSING, as on mbedTLS */
+static uint32_t tls_wolfssl_verify_result(struct tls_context *context,
+					  struct tls_session_context *session_ctx)
+{
+	bool is_server = context->options.role == ZTLS_IS_SERVER;
+
+	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_NONE ||
+	    (context->options.verify_level == -1 && is_server)) {
+		return MBEDTLS_X509_BADCERT_SKIP_VERIFY;
+	}
+
+	if (session_ctx->cert_verify_ran) {
+		return session_ctx->verify_result_flags;
+	}
+
+	if (wolfSSL_session_reused(session_ctx->wssl)) {
+		/* A server session keeps no client certificate result */
+		return is_server ? MBEDTLS_X509_BADCERT_SKIP_VERIFY
+				 : session_ctx->resumed_verify_result;
+	}
+
+	if (is_server && !session_ctx->psk_used) {
+		return MBEDTLS_X509_BADCERT_MISSING;
+	}
+
+	return MBEDTLS_X509_BADCERT_SKIP_VERIFY;
+}
+
 #if defined(ZTLS_WOLFSSL_EXT_CACHE)
 /* Caller holds session_cache_lock. */
 static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
@@ -1277,6 +1309,7 @@ static void tls_session_store(struct tls_context *context,
 	struct net_sockaddr_storage peer_addr = { 0 };
 	unsigned char *serialized = NULL;
 	size_t alloc_len = 0;
+	uint32_t verify_result;
 	int size;
 
 	if (!context->options.cache_enabled ||
@@ -1303,7 +1336,8 @@ static void tls_session_store(struct tls_context *context,
 		goto exit;
 	}
 
-	alloc_len = (size_t)size;
+	/* The verify result goes first, since a resumption verifies no certificate */
+	alloc_len = sizeof(verify_result) + (size_t)size;
 
 	serialized = XMALLOC(alloc_len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (serialized == NULL) {
@@ -1311,8 +1345,11 @@ static void tls_session_store(struct tls_context *context,
 		goto exit;
 	}
 
+	verify_result = tls_wolfssl_verify_result(context, context->active_session);
+	memcpy(serialized, &verify_result, sizeof(verify_result));
+
 	{
-		unsigned char *p = serialized;
+		unsigned char *p = serialized + sizeof(verify_result);
 
 		size = wolfSSL_i2d_SSL_SESSION(session, &p);
 	}
@@ -1330,7 +1367,7 @@ static void tls_session_store(struct tls_context *context,
 	}
 
 	entry->session = serialized;
-	entry->session_len = (size_t)size;
+	entry->session_len = alloc_len;
 	entry->timestamp = k_uptime_get();
 	memcpy(&entry->peer_addr, &peer_addr, sizeof(peer_addr));
 	serialized = NULL;
@@ -1363,6 +1400,7 @@ static void tls_session_restore(struct tls_context *context,
 	const uint8_t *stale;
 	int64_t stale_ts;
 	const unsigned char *p;
+	uint32_t verify_result;
 
 	if (!context->options.cache_enabled ||
 	    context->active_session->wssl == NULL) {
@@ -1406,8 +1444,12 @@ static void tls_session_restore(struct tls_context *context,
 	stale_ts = entry->timestamp;
 	k_mutex_unlock(&session_cache_lock);
 
-	p = serialized_copy;
-	session = wolfSSL_d2i_SSL_SESSION(NULL, &p, (long)serialized_len);
+	if (serialized_len > sizeof(verify_result)) {
+		memcpy(&verify_result, serialized_copy, sizeof(verify_result));
+		p = serialized_copy + sizeof(verify_result);
+		session = wolfSSL_d2i_SSL_SESSION(NULL, &p,
+						  (long)(serialized_len - sizeof(verify_result)));
+	}
 	if (session == NULL) {
 		NET_ERR("Failed to load TLS session");
 		/* Evict the entry only if no other socket replaced it meanwhile. */
@@ -1433,6 +1475,8 @@ static void tls_session_restore(struct tls_context *context,
 	if (wolfSSL_set_session(context->active_session->wssl, session) !=
 	    WOLFSSL_SUCCESS) {
 		NET_DBG("Failed to set session for %p", context);
+	} else {
+		context->active_session->resumed_verify_result = verify_result;
 	}
 
 	wolfSSL_SESSION_free(session);
@@ -2919,6 +2963,10 @@ static unsigned int tls_psk_server_cb(WOLFSSL *ssl, const char *identity,
 
 	XMEMCPY(key, context->psk, context->psk_len);
 
+	if (context->active_session != NULL) {
+		context->active_session->psk_used = true;
+	}
+
 	return context->psk_len;
 }
 
@@ -3195,6 +3243,10 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 	session_ctx = (struct tls_session_context *)store->userCtx;
 	context = session_ctx->tls_ctx;
 	effective_ok = preverify_ok;
+	/* wolfSSL also calls this for an empty Certificate message */
+	if (store->totalCerts > 0) {
+		session_ctx->cert_verify_ran = true;
+	}
 
 	if (!preverify_ok && store->error != 0) {
 		session_ctx->verify_result_flags |=
@@ -3236,6 +3288,10 @@ static int tls_wolfssl_verify_cb_wrapper(int preverify_ok,
 	session_ctx = (struct tls_session_context *)store->userCtx;
 	context = session_ctx->tls_ctx;
 	effective_ok = preverify_ok;
+	/* wolfSSL also calls this for an empty Certificate message */
+	if (store->totalCerts > 0) {
+		session_ctx->cert_verify_ran = true;
+	}
 
 	if (!preverify_ok && store->error != 0) {
 		session_ctx->verify_result_flags |=
@@ -3504,6 +3560,9 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 #endif /* !NO_PSK */
 
 	session_ctx->verify_result_flags = 0;
+	session_ctx->resumed_verify_result = 0;
+	session_ctx->cert_verify_ran = false;
+	session_ctx->psk_used = false;
 
 	ret = tls_wolfssl_set_verify(tls_ctx, session_ctx);
 	if (ret != 0) {
@@ -3650,6 +3709,9 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 
 	session_ctx->handshake_timestamp = 0;
 	session_ctx->verify_result_flags = 0;
+	session_ctx->resumed_verify_result = 0;
+	session_ctx->cert_verify_ran = false;
+	session_ctx->psk_used = false;
 
 	k_sem_reset(&session_ctx->tls_established);
 
@@ -5159,8 +5221,7 @@ static int tls_opt_cert_verify_result_get(struct tls_context *context,
 		return -ENOTCONN;
 	}
 
-	/* WOLFSSL_ALWAYS_VERIFY_CB runs the callback at every depth, so the flags are complete. */
-	*(uint32_t *)optval = session_ctx->verify_result_flags;
+	*(uint32_t *)optval = tls_wolfssl_verify_result(context, session_ctx);
 #else
 	*(uint32_t *)optval = mbedtls_ssl_get_verify_result(&session_ctx->ssl);
 #endif /* CONFIG_WOLFSSL */

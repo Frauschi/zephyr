@@ -20,6 +20,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <user_settings.h>
 #endif
 #include <wolfssl/ssl.h>
+#include <zephyr/net/tls_verify.h>
 #include "tcp_internal.h"
 WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
@@ -2201,6 +2202,16 @@ static void prepare_tls_session_resume_connection(uint16_t server_port)
 }
 
 /* The second connect to the same peer resumes the session */
+static void check_verify_result(int sock, uint32_t expected)
+{
+	uint32_t result;
+	net_socklen_t optlen = sizeof(result);
+
+	zassert_ok(zsock_getsockopt(sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT, &result,
+				    &optlen), "getsockopt(TLS_CERT_VERIFY_RESULT) failed (%d)", errno);
+	zassert_equal(result, expected, "verify result 0x%x, expected 0x%x", result, expected);
+}
+
 ZTEST(net_socket_tls, test_session_cache_client_resume)
 {
 	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1] = { 0 };
@@ -2230,6 +2241,10 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 
 	/* First connection - should perform full handshake, then store. */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+
+	/* PSK verifies no certificate, and a resumption keeps that result */
+	check_verify_result(c_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
+	check_verify_result(new_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
 
 #if defined(CONFIG_WOLFSSL)
 	{
@@ -2269,6 +2284,8 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 				  "Second connect did not reuse session");
 	}
 #endif
+
+	check_verify_result(c_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
 
 	memset(rx_buf, 0, sizeof(rx_buf));
 	test_data.sock = c_sock;
