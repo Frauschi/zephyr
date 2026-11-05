@@ -1425,7 +1425,9 @@ static void test_prepare_fake_tcp_server(struct fake_tcp_server_data *s_data,
 
 ZTEST(net_socket_tls, test_connect_invalid_handshake_data)
 {
+	net_socklen_t cipher_len = sizeof(int);
 	struct fake_tcp_server_data server_data;
+	int cipher;
 	struct net_sockaddr_in6 c_saddr;
 	struct net_sockaddr_in6 s_saddr;
 
@@ -1438,6 +1440,11 @@ ZTEST(net_socket_tls, test_connect_invalid_handshake_data)
 	zassert_equal(zsock_connect(c_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr)), -1,
 		      "zsock_connect() succeed");
 	zassert_equal(errno, ECONNABORTED, "zsock_connect() should fail, got %d", errno);
+
+	/* A failed handshake negotiated no suite */
+	zassert_equal(zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED, &cipher,
+				       &cipher_len), -1, "TLS_CIPHERSUITE_USED succeeded");
+	zassert_equal(errno, ENOTCONN, "TLS_CIPHERSUITE_USED: errno %d, want ENOTCONN", errno);
 
 	test_close(c_sock);
 	c_sock = -1;
