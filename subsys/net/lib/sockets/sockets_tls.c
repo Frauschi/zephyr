@@ -378,6 +378,12 @@ __net_socket struct tls_context {
 	/** Accumulated mbedTLS-compatible verify result flags. */
 	uint32_t verify_result_flags;
 
+	/* Verify result saved with the session this handshake tries to resume. */
+	uint32_t resumed_verify_result;
+
+	bool cert_verify_ran;
+	bool psk_used;
+
 	/* An I/O callback reported the transport closed */
 	bool transport_closed;
 
@@ -1097,6 +1103,38 @@ static void tls_session_purge(void)
 #endif /* CONFIG_MBEDTLS */
 
 #if defined(CONFIG_WOLFSSL)
+/* The result mbedTLS 3.6 reports: 0 for a skipped client check or PSK */
+static uint32_t tls_wolfssl_verify_result(struct tls_context *context)
+{
+	bool is_server = context->options.role == ZTLS_IS_SERVER;
+	bool verify_none = context->options.verify_level == TLS_PEER_VERIFY_NONE ||
+			   (context->options.verify_level == -1 && is_server);
+
+	if (verify_none && !is_server) {
+		return 0;
+	}
+
+	if (verify_none && !context->psk_used) {
+		return MBEDTLS_X509_BADCERT_SKIP_VERIFY;
+	}
+
+	if (context->cert_verify_ran) {
+		return context->verify_result_flags;
+	}
+
+	if (wolfSSL_session_reused(context->wssl)) {
+		/* A server session keeps no client certificate result */
+		return is_server ? MBEDTLS_X509_BADCERT_SKIP_VERIFY
+				 : context->resumed_verify_result;
+	}
+
+	if (is_server && !context->psk_used) {
+		return MBEDTLS_X509_BADCERT_MISSING;
+	}
+
+	return 0;
+}
+
 #if defined(ZTLS_WOLFSSL_EXT_CACHE)
 /* Caller holds session_cache_lock. */
 static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
@@ -1154,6 +1192,7 @@ static void tls_session_store(struct tls_context *context,
 	struct sockaddr peer_addr = { 0 };
 	unsigned char *serialized = NULL;
 	size_t alloc_len = 0;
+	uint32_t verify_result;
 	int size;
 
 	if (!context->options.cache_enabled || context->wssl == NULL) {
@@ -1179,7 +1218,8 @@ static void tls_session_store(struct tls_context *context,
 		goto exit;
 	}
 
-	alloc_len = (size_t)size;
+	/* The verify result goes first, since a resumption verifies no certificate */
+	alloc_len = sizeof(verify_result) + (size_t)size;
 
 	serialized = XMALLOC(alloc_len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (serialized == NULL) {
@@ -1187,8 +1227,11 @@ static void tls_session_store(struct tls_context *context,
 		goto exit;
 	}
 
+	verify_result = tls_wolfssl_verify_result(context);
+	memcpy(serialized, &verify_result, sizeof(verify_result));
+
 	{
-		unsigned char *p = serialized;
+		unsigned char *p = serialized + sizeof(verify_result);
 
 		size = wolfSSL_i2d_SSL_SESSION(session, &p);
 	}
@@ -1206,7 +1249,7 @@ static void tls_session_store(struct tls_context *context,
 	}
 
 	entry->session = serialized;
-	entry->session_len = (size_t)size;
+	entry->session_len = alloc_len;
 	entry->timestamp = k_uptime_get();
 	memcpy(&entry->peer_addr, &peer_addr, sizeof(peer_addr));
 	serialized = NULL;
@@ -1239,6 +1282,7 @@ static void tls_session_restore(struct tls_context *context,
 	const uint8_t *stale;
 	int64_t stale_ts;
 	const unsigned char *p;
+	uint32_t verify_result;
 
 	if (!context->options.cache_enabled || context->wssl == NULL) {
 		return;
@@ -1280,8 +1324,12 @@ static void tls_session_restore(struct tls_context *context,
 	stale_ts = entry->timestamp;
 	k_mutex_unlock(&session_cache_lock);
 
-	p = serialized_copy;
-	session = wolfSSL_d2i_SSL_SESSION(NULL, &p, (long)serialized_len);
+	if (serialized_len > sizeof(verify_result)) {
+		memcpy(&verify_result, serialized_copy, sizeof(verify_result));
+		p = serialized_copy + sizeof(verify_result);
+		session = wolfSSL_d2i_SSL_SESSION(NULL, &p,
+						  (long)(serialized_len - sizeof(verify_result)));
+	}
 	if (session == NULL) {
 		NET_ERR("Failed to load TLS session");
 		/* Evict the entry only if no other socket replaced it meanwhile. */
@@ -1306,6 +1354,8 @@ static void tls_session_restore(struct tls_context *context,
 
 	if (wolfSSL_set_session(context->wssl, session) != WOLFSSL_SUCCESS) {
 		NET_DBG("Failed to set session for %p", context);
+	} else {
+		context->resumed_verify_result = verify_result;
 	}
 
 	wolfSSL_SESSION_free(session);
@@ -2755,6 +2805,9 @@ static int tls_wolfssl_reset(struct tls_context *context)
 	k_sem_reset(&context->tls_established);
 
 	context->verify_result_flags = 0;
+	context->resumed_verify_result = 0;
+	context->cert_verify_ran = false;
+	context->psk_used = false;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Server role: reset the address so that a new
@@ -3102,6 +3155,7 @@ static unsigned int tls_psk_server_cb(WOLFSSL *ssl, const char *identity,
 	}
 
 	XMEMCPY(key, context->psk, context->psk_len);
+	context->psk_used = true;
 
 	return context->psk_len;
 }
@@ -3377,6 +3431,10 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 
 	context = (struct tls_context *)store->userCtx;
 	effective_ok = preverify_ok;
+	/* wolfSSL also calls this for an empty Certificate message */
+	if (store->totalCerts > 0) {
+		context->cert_verify_ran = true;
+	}
 
 	if (!preverify_ok && store->error != 0) {
 		context->verify_result_flags |=
@@ -3416,6 +3474,10 @@ static int tls_wolfssl_verify_cb_wrapper(int preverify_ok,
 
 	context = (struct tls_context *)store->userCtx;
 	effective_ok = preverify_ok;
+	/* wolfSSL also calls this for an empty Certificate message */
+	if (store->totalCerts > 0) {
+		context->cert_verify_ran = true;
+	}
 
 	if (!preverify_ok && store->error != 0) {
 		context->verify_result_flags |=
@@ -3713,6 +3775,9 @@ static int tls_wolfssl_session_init(struct tls_context *context, bool is_server)
 
 	context->transport_closed = false;
 	context->verify_result_flags = 0;
+	context->resumed_verify_result = 0;
+	context->cert_verify_ran = false;
+	context->psk_used = false;
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	context->dtls_rtx_armed = false;
 	context->dtls_rtx_tx_count = context->dtls_tx_count;
@@ -4664,7 +4729,7 @@ static int tls_opt_cert_verify_result_get(struct tls_context *context,
 		return -ENOTCONN;
 	}
 
-	*(uint32_t *)optval = context->verify_result_flags;
+	*(uint32_t *)optval = tls_wolfssl_verify_result(context);
 	return 0;
 #else
 	*(uint32_t *)optval = mbedtls_ssl_get_verify_result(&context->ssl);
