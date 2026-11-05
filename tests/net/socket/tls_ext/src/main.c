@@ -230,8 +230,9 @@ static void server_thread_fn(void *arg0, void *arg1, void *arg2)
 	zassert_not_equal(r, -1, "close() failed on the server fd (%d)", errno);
 }
 
-static int test_configure_server(k_tid_t *server_thread_id, int peer_verify,
-				 int echo, int expect_failure)
+static int test_configure_server_ex(k_tid_t *server_thread_id, int peer_verify,
+				    int echo, int expect_failure, const sec_tag_t *tags,
+				    size_t tags_size, bool cache, k_thread_entry_t entry)
 {
 	static const sec_tag_t server_tag_list_verify_none[] = {
 		SERVER_CERTIFICATE_TAG,
@@ -282,9 +283,22 @@ static int test_configure_server(k_tid_t *server_thread_id, int peer_verify,
 		return -1;
 	}
 
+	if (tags != NULL) {
+		sec_tag_list = tags;
+		sec_tag_list_size = tags_size;
+	}
+
 	r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST,
 			     sec_tag_list, sec_tag_list_size);
 	zassert_not_equal(r, -1, "failed to set ZSOCK_TLS_SEC_TAG_LIST (%d)", errno);
+
+	if (cache) {
+		const int cache_on = ZSOCK_TLS_SESSION_CACHE_ENABLED;
+
+		r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+				     &cache_on, sizeof(cache_on));
+		zassert_not_equal(r, -1, "failed to set ZSOCK_TLS_SESSION_CACHE (%d)", errno);
+	}
 
 	r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, "localhost",
 			     sizeof("localhost"));
@@ -312,7 +326,7 @@ static int test_configure_server(k_tid_t *server_thread_id, int peer_verify,
 
 	NET_DBG("Creating server thread");
 	*server_thread_id = k_thread_create(&server_thread, server_stack,
-					    STACK_SIZE, server_thread_fn,
+					    STACK_SIZE, entry,
 					    INT_TO_POINTER(server_fd),
 					    INT_TO_POINTER(echo),
 					    INT_TO_POINTER(expect_failure),
@@ -322,6 +336,13 @@ static int test_configure_server(k_tid_t *server_thread_id, int peer_verify,
 	zassert_equal(0, r, "failed to synchronize with server thread (%d)", r);
 
 	return server_fd;
+}
+
+static int test_configure_server(k_tid_t *server_thread_id, int peer_verify,
+				 int echo, int expect_failure)
+{
+	return test_configure_server_ex(server_thread_id, peer_verify, echo, expect_failure,
+					NULL, 0, false, server_thread_fn);
 }
 
 static int test_configure_client(struct net_sockaddr_in *sa, bool own_cert,
@@ -497,7 +518,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_peer_verify_required)
 
 /* --- Unified cert verify result tests (both backends) --- */
 
-static void test_tls_cert_verify_result_opt_common(uint32_t expect)
+static void test_tls_cert_verify_result_common(int peer_verify, uint32_t expect)
 {
 	int server_fd, client_fd, ret;
 	k_tid_t server_thread_id;
@@ -505,7 +526,6 @@ static void test_tls_cert_verify_result_opt_common(uint32_t expect)
 	uint32_t optval;
 	net_socklen_t optlen = sizeof(optval);
 	const char *hostname = "localhost";
-	int peer_verify = ZSOCK_TLS_PEER_VERIFY_OPTIONAL;
 
 	if (expect == MBEDTLS_X509_BADCERT_CN_MISMATCH) {
 		hostname = "dummy";
@@ -533,12 +553,102 @@ static void test_tls_cert_verify_result_opt_common(uint32_t expect)
 
 ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_ok)
 {
-	test_tls_cert_verify_result_opt_common(0);
+	test_tls_cert_verify_result_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, 0);
 }
 
 ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_opt_bad_cn)
 {
-	test_tls_cert_verify_result_opt_common(MBEDTLS_X509_BADCERT_CN_MISMATCH);
+	test_tls_cert_verify_result_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL,
+					   MBEDTLS_X509_BADCERT_CN_MISMATCH);
+}
+
+ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_none_skipped)
+{
+	test_tls_cert_verify_result_common(ZSOCK_TLS_PEER_VERIFY_NONE,
+					   MBEDTLS_X509_BADCERT_SKIP_VERIFY);
+}
+
+static uint32_t resumed_verify_result[2];
+
+static void server_thread_resume_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	net_socklen_t optlen;
+	char buf[16];
+	int client_fd;
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+		client_fd = zsock_accept(server_fd, NULL, NULL);
+		zassert_not_equal(client_fd, -1, "accept() failed (%d)", errno);
+
+		optlen = sizeof(resumed_verify_result[i]);
+		r = zsock_getsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT,
+				     &resumed_verify_result[i], &optlen);
+		zassert_ok(r, "getsockopt failed (%d)", errno);
+
+		r = zsock_recv(client_fd, buf, sizeof(buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		(void)zsock_close(client_fd);
+	}
+}
+
+/* A server that resumed a session checked no client certificate, so it never reports 0 */
+ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
+{
+	const int cache_on = ZSOCK_TLS_SESSION_CACHE_ENABLED;
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd, r;
+
+	server_fd = test_configure_server_ex(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_OPTIONAL,
+					     false, false, NULL, 0, true,
+					     server_thread_resume_fn);
+#if defined(CONFIG_WOLFSSL)
+	/* A TLS 1.2 suite, since only the session cache resumes on a wolfSSL server */
+	const int tls12_suite = 0xC02F;
+
+	r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST, &tls12_suite,
+			     sizeof(tls12_suite));
+	zassert_ok(r, "failed to set ZSOCK_TLS_CIPHERSUITE_LIST (%d)", errno);
+#endif
+
+	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+		client_fd = test_configure_client(&sa, false, "localhost");
+		r = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE,
+				     &cache_on, sizeof(cache_on));
+		zassert_ok(r, "failed to set ZSOCK_TLS_SESSION_CACHE (%d)", errno);
+
+		r = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+		zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+
+		if (i + 1 < ARRAY_SIZE(resumed_verify_result)) {
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		}
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+
+	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_MISSING,
+		      "full handshake: verify result 0x%x, resumption 0x%x",
+		      resumed_verify_result[0], resumed_verify_result[1]);
+	zassert_not_equal(resumed_verify_result[1], 0, "resumption reported a verified client");
+#if defined(CONFIG_WOLFSSL)
+	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_SKIP_VERIFY,
+		      "resumption: verify result 0x%x", resumed_verify_result[1]);
+#endif
 }
 
 /* Without TLS_HOSTNAME, REQUIRED has no name to check, so the handshake fails */
@@ -1338,8 +1448,11 @@ static void ocsp_expect(int peer_verify, bool staple, int want_err)
 	zassert_equal(err, want_err, "verify %d, staple %d: errno %d, want %d", peer_verify,
 		      staple, err, want_err);
 	if (err == 0) {
-		zassert_equal(result, 0, "verify %d, staple %d: verify result 0x%x", peer_verify,
-			      staple, result);
+		uint32_t want = peer_verify == ZSOCK_TLS_PEER_VERIFY_NONE ?
+					MBEDTLS_X509_BADCERT_SKIP_VERIFY : 0;
+
+		zassert_equal(result, want, "verify %d, staple %d: verify result 0x%x",
+			      peer_verify, staple, result);
 	}
 }
 

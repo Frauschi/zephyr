@@ -20,6 +20,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <user_settings.h>
 #endif
 #include <wolfssl/ssl.h>
+#include <zephyr/net/tls_verify.h>
 #include "tcp_internal.h"
 WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
@@ -2364,6 +2365,16 @@ static void prepare_tls_session_resume_connection(uint16_t server_port, int prot
 	test_work_wait(&test_data.work);
 }
 
+static void check_verify_result(int sock, uint32_t expected)
+{
+	uint32_t result;
+	net_socklen_t optlen = sizeof(result);
+
+	zassert_ok(zsock_getsockopt(sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT, &result,
+				    &optlen), "getsockopt(TLS_CERT_VERIFY_RESULT) failed (%d)", errno);
+	zassert_equal(result, expected, "verify result 0x%x, expected 0x%x", result, expected);
+}
+
 static void tls_session_cache_purge(void)
 {
 	int sock = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
@@ -2432,6 +2443,10 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	/* First connection - should perform full handshake, then store. */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 
+	/* PSK verifies no certificate, and a resumption keeps that result */
+	check_verify_result(c_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
+	check_verify_result(new_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
+
 #if defined(CONFIG_WOLFSSL)
 	{
 		WOLFSSL *ssl = ztls_get_wolfssl_context(c_sock);
@@ -2472,6 +2487,8 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	}
 #endif
 
+	check_verify_result(c_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
+
 	memset(rx_buf, 0, sizeof(rx_buf));
 	test_data.sock = c_sock;
 	test_data.peer_sock = &new_sock;
@@ -2499,8 +2516,11 @@ ZTEST(net_socket_tls, test_session_cache_tls13_ticket_offered)
 
 	for (int i = 0; i < 2; i++) {
 		prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_3);
+		/* The client reports the offer; a Zephyr server cannot redeem it and uses the PSK */
 		zassert_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), i,
-			      "connection %d: unexpected resumption state", i);
+			      "connection %d: ticket offered %d", i,
+			      wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)));
+		check_verify_result(c_sock, MBEDTLS_X509_BADCERT_SKIP_VERIFY);
 
 		/* The client reads the ticket together with the data */
 		test_send(new_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
