@@ -7210,8 +7210,8 @@ static int tls_data_check(struct tls_context *ctx)
 				return -ENOTCONN;
 			}
 
-			if (wolfSSL_want_read(ctx->active_session->wssl) ||
-			    wolfSSL_want_write(ctx->active_session->wssl)) {
+			if (err == WOLFSSL_ERROR_WANT_READ ||
+			    err == WOLFSSL_ERROR_WANT_WRITE) {
 				return 0;
 			}
 
@@ -7395,8 +7395,8 @@ again:
 			return -ENOTCONN;
 		}
 
-		if (wolfSSL_want_read(ctx->active_session->wssl) ||
-		    wolfSSL_want_write(ctx->active_session->wssl)) {
+		if (err == WOLFSSL_ERROR_WANT_READ ||
+		    err == WOLFSSL_ERROR_WANT_WRITE) {
 			if (is_server) {
 				ret = dtls_server_switch_session_on_rx(ctx);
 				if (ret == 0) {
