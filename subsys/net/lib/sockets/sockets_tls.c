@@ -2831,6 +2831,7 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 	const bool is_block = is_blocking(ctx->sock, flags);
 	int ret = 0;
 	int err = 0;
+	int max_len;
 	k_timeout_t timeout;
 	k_timepoint_t end;
 
@@ -2851,6 +2852,14 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 	}
 
 	end = sys_timepoint_calc(timeout);
+
+	/* One record per call, so a short count reports what went out, as on mbedTLS */
+	if (ctx->type == SOCK_STREAM) {
+		max_len = wolfSSL_GetMaxOutputSize(ctx->wssl);
+		if (max_len > 0) {
+			len = MIN(len, (size_t)max_len);
+		}
+	}
 
 	do {
 		ret = wolfSSL_write(ctx->wssl, buf, (int)MIN(len, (size_t)INT_MAX));
