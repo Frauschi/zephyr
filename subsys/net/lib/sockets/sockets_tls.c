@@ -525,7 +525,8 @@ static K_MUTEX_DEFINE(session_cache_lock);
 static mbedtls_ssl_cache_context server_cache;
 #endif
 
-#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT) && TLS_SESSION_CACHE_PRESENT
+#define TLS_SESSION_CACHE_PERSISTENT_PRESENT 1
 
 #define TLS_SETTINGS_PREFIX CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX
 
@@ -562,7 +563,11 @@ static int tls_session_cache_settings_set(const char *key, size_t len, settings_
 		}
 		client_cache[idx].timestamp = k_uptime_get();
 	} else if (strcmp(next, "data") == 0) {
+#if defined(CONFIG_WOLFSSL)
+		uint8_t *buf = XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+#else
 		uint8_t *buf = mbedtls_calloc(1, len);
+#endif
 
 		if (buf == NULL) {
 			NET_ERR("TLS session alloc failed for slot %ld", idx);
@@ -570,6 +575,17 @@ static int tls_session_cache_settings_set(const char *key, size_t len, settings_
 			goto out;
 		}
 		rc = read_cb(cb_arg, buf, len);
+#if defined(CONFIG_WOLFSSL)
+		if (rc < 0) {
+			wc_ForceZero(buf, len);
+			XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+			goto out;
+		}
+		if (client_cache[idx].session != NULL) {
+			wc_ForceZero(client_cache[idx].session, client_cache[idx].session_len);
+			XFREE(client_cache[idx].session, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		}
+#else
 		if (rc < 0) {
 			mbedtls_free(buf);
 			goto out;
@@ -577,6 +593,7 @@ static int tls_session_cache_settings_set(const char *key, size_t len, settings_
 		if (client_cache[idx].session != NULL) {
 			mbedtls_free(client_cache[idx].session);
 		}
+#endif /* CONFIG_WOLFSSL */
 		client_cache[idx].session = buf;
 		client_cache[idx].session_len = len;
 		NET_DBG("TLS session %ld restored from settings", idx);
@@ -642,7 +659,7 @@ static void tls_session_cache_settings_clear(void)
 	}
 }
 
-#endif /* CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT */
+#endif /* CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT && TLS_SESSION_CACHE_PRESENT */
 
 /* A mutex for protecting TLS context allocation. */
 static K_MUTEX_DEFINE(context_lock);
@@ -801,7 +818,7 @@ static int tls_init(void)
 	mbedtls_ssl_cache_init(&server_cache);
 #endif
 
-#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#if defined(TLS_SESSION_CACHE_PERSISTENT_PRESENT)
 	tls_session_cache_settings_load();
 #endif
 #if defined(CONFIG_WOLFSSL) && defined(WOLFSSL_TLS13) && !defined(NO_PSK)
@@ -1243,7 +1260,7 @@ static int tls_session_save(const struct net_sockaddr *peer_addr,
 	entry->timestamp = k_uptime_get();
 	memcpy(&entry->peer_addr, peer_addr, sizeof(*peer_addr));
 
-#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#if defined(TLS_SESSION_CACHE_PERSISTENT_PRESENT)
 	tls_session_cache_settings_save(entry - client_cache);
 #endif
 
@@ -1385,7 +1402,7 @@ static void tls_session_purge(void)
 {
 	tls_session_cache_reset();
 
-#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#if defined(TLS_SESSION_CACHE_PERSISTENT_PRESENT)
 	tls_session_cache_settings_clear();
 #endif
 
@@ -1511,6 +1528,9 @@ static void tls_session_store(struct tls_context *context,
 	entry->timestamp = k_uptime_get();
 	memcpy(&entry->peer_addr, &peer_addr, sizeof(peer_addr));
 	serialized = NULL;
+#if defined(TLS_SESSION_CACHE_PERSISTENT_PRESENT)
+	tls_session_cache_settings_save(entry - client_cache);
+#endif
 	k_mutex_unlock(&session_cache_lock);
 
 exit:
@@ -1622,6 +1642,10 @@ static void tls_session_purge(void)
 {
 #if TLS_SESSION_CACHE_PRESENT
 	tls_session_cache_reset();
+#endif
+
+#if defined(TLS_SESSION_CACHE_PERSISTENT_PRESENT)
+	tls_session_cache_settings_clear();
 #endif
 }
 #endif /* CONFIG_WOLFSSL */

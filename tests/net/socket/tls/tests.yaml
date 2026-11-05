@@ -32,6 +32,19 @@ tests:
       - CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID=n
     integration_platforms:
       - qemu_x86
+  net.socket.tls.session_persistent:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    extra_configs: &session_persistent_configs
+      - CONFIG_FLASH=y
+      - CONFIG_FLASH_MAP=y
+      - CONFIG_NVS=y
+      - CONFIG_SETTINGS=y
+      - CONFIG_SETTINGS_NVS=y
+      - CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT=y
   net.socket.tls.wolfssl:
     platform_allow:
       - native_sim
@@ -67,3 +80,13 @@ tests:
     extra_configs:
       - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
       - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE=y
+  net.socket.tls.wolfssl_session_persistent:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - CONF_FILE=prj_wolfssl.conf
+    extra_configs: *session_persistent_configs

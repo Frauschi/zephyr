@@ -40,11 +40,13 @@ mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
 
 #include "../../socket_helpers.h"
 
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#include <zephyr/settings/settings.h>
+#endif
+
 uint32_t ztls_get_session_count(void);
 
-/* Only the CBC suite is enabled for mbedTLS; more suites would change the default cipher,
- * whose record overhead the SO_RCVBUF tests depend on.
- */
+/* The SO_RCVBUF tests depend on the record overhead of this one mbedTLS suite */
 static const int cipher_list_psk[] = {
 	TEST_TLS_PSK_WITH_AES_256_CBC_SHA384,
 	TEST_TLS_PSK_WITH_AES_128_GCM_SHA256
@@ -2340,6 +2342,53 @@ static void prepare_tls_session_resume_connection(uint16_t server_port)
 	test_work_wait(&test_data.work);
 }
 
+static void tls_session_cache_purge(void)
+{
+	int sock = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+
+	zassert_true(sock >= 0, "purge socket open failed");
+	zassert_ok(zsock_setsockopt(sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE_PURGE, NULL, 0),
+		   "purge setsockopt failed");
+	zsock_close(sock);
+}
+
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#define TLS_CACHE_KEY(name) CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX "/0/" name
+
+static struct {
+	struct net_sockaddr_storage addr;
+	uint8_t data[1024];
+	size_t addr_len;
+	size_t data_len;
+} persisted;
+
+static int persisted_session_cb(const char *key, size_t len, settings_read_cb read_cb,
+				void *cb_arg, void *param)
+{
+	ARG_UNUSED(param);
+
+	if (strcmp(key, "0/addr") == 0 && len == sizeof(persisted.addr)) {
+		if (read_cb(cb_arg, &persisted.addr, len) == len) {
+			persisted.addr_len = len;
+		}
+	} else if (strcmp(key, "0/data") == 0 && len <= sizeof(persisted.data)) {
+		if (read_cb(cb_arg, persisted.data, len) == len) {
+			persisted.data_len = len;
+		}
+	}
+
+	return 0;
+}
+
+static void persisted_session_read(void)
+{
+	memset(&persisted, 0, sizeof(persisted));
+	zassert_ok(settings_load_subtree_direct(
+			   CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX,
+			   persisted_session_cb, NULL));
+}
+#endif /* CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT */
+
 /* The second connect to the same peer resumes the session */
 ZTEST(net_socket_tls, test_session_cache_client_resume)
 {
@@ -2355,18 +2404,8 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	ztest_test_skip();
 #endif
 
-	/* Purge any sessions left by earlier tests so we can observe the
-	 * transition from "no cached session" to "cached session".
-	 */
-	{
-		int dummy = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
-
-		zassert_true(dummy >= 0, "purge socket open failed");
-		ret = zsock_setsockopt(dummy, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE_PURGE,
-				       NULL, 0);
-		zassert_equal(ret, 0, "purge setsockopt failed");
-		zsock_close(dummy);
-	}
+	/* Start without a cached session */
+	tls_session_cache_purge();
 
 	/* First connection - should perform full handshake, then store. */
 	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
@@ -2422,6 +2461,58 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
+/* The client session cache is saved to and reloaded from the settings subsystem */
+ZTEST(net_socket_tls, test_session_cache_persistent)
+{
+#if !defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT) || \
+	(defined(CONFIG_WOLFSSL) && (!defined(HAVE_EXT_CACHE) || defined(NO_SESSION_CACHE)))
+	ztest_test_skip();
+#else
+	static uint8_t data[sizeof(persisted.data)];
+	static const uint8_t junk[16];
+	size_t data_len;
+
+	tls_session_cache_purge();
+
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	persisted_session_read();
+	zassert_equal(persisted.addr_len, sizeof(persisted.addr), "peer address not saved");
+	zassert_true(persisted.data_len > 0, "session not saved");
+	memcpy(data, persisted.data, persisted.data_len);
+	data_len = persisted.data_len;
+
+	/* Loading replaces the cached session, so a bad one costs the resumption */
+	zassert_ok(settings_save_one(TLS_CACHE_KEY("data"), junk, sizeof(junk)));
+	zassert_ok(settings_load_subtree(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX));
+
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+#if defined(CONFIG_WOLFSSL)
+	zassert_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), 0,
+		      "resumed without a valid session");
+#endif
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	zassert_ok(settings_save_one(TLS_CACHE_KEY("data"), data, data_len));
+	zassert_ok(settings_load_subtree(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX));
+
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+#if defined(CONFIG_WOLFSSL)
+	zassert_not_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), 0,
+			  "reloaded session not resumed");
+#endif
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	tls_session_cache_purge();
+	persisted_session_read();
+	zassert_equal(persisted.addr_len + persisted.data_len, 0, "purge left the settings copy");
+#endif
 }
 
 /* A handshake completes with secure renegotiation enabled */
