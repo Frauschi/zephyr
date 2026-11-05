@@ -25,6 +25,9 @@ WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
 void test_wolfssl_send_fatal_alert(WOLFSSL *ssl);
 void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl);
+/* Collect the records a session sends, and send them as one datagram */
+void test_wolfssl_hold_records(WOLFSSL *ssl);
+int test_wolfssl_send_held_records(WOLFSSL *ssl);
 #endif
 
 #if defined(CONFIG_MBEDTLS)
@@ -2851,21 +2854,37 @@ static int coalesce_send(void *ctx, const unsigned char *buf, size_t len)
  */
 ZTEST(net_socket_tls, test_poll_dtls_second_record_in_datagram)
 {
-#if !defined(CONFIG_MBEDTLS)
-	ztest_test_skip();
-#else
 	static const uint8_t rec_a = 'A';
 	static const uint8_t rec_b = 'B';
+#if defined(CONFIG_WOLFSSL)
+	WOLFSSL *ssl;
+#else
 	mbedtls_ssl_context *ssl;
 	mbedtls_ssl_send_t *orig_send;
 	mbedtls_ssl_recv_t *orig_recv;
-	struct zsock_pollfd fds[1];
 	void *p_bio;
+#endif
+	struct zsock_pollfd fds[1];
 	uint8_t byte;
 	int ret;
 
 	test_prepare_dtls_connection(NET_AF_INET6);
 
+#if defined(CONFIG_WOLFSSL)
+	ssl = ztls_get_wolfssl_context(s_sock);
+	zassert_not_null(ssl, "No wolfSSL session for the server socket");
+
+	test_wolfssl_hold_records(ssl);
+
+	ret = zsock_send(s_sock, &rec_a, sizeof(rec_a), 0);
+	zassert_equal(ret, sizeof(rec_a), "Cannot write the first record");
+
+	ret = zsock_send(s_sock, &rec_b, sizeof(rec_b), 0);
+	zassert_equal(ret, sizeof(rec_b), "Cannot write the second record");
+
+	ret = test_wolfssl_send_held_records(ssl);
+	zassert_true(ret > 0, "Cannot send the records");
+#else
 	ssl = ztls_get_mbedtls_ssl_context(s_sock);
 	zassert_not_null(ssl, "No Mbed TLS context for the server socket");
 
@@ -2889,6 +2908,7 @@ ZTEST(net_socket_tls, test_poll_dtls_second_record_in_datagram)
 
 	ret = orig_send(p_bio, coalesce_buf, coalesce_len);
 	zassert_equal(ret, coalesce_len, "Cannot send the records");
+#endif /* CONFIG_WOLFSSL */
 
 	fds[0].fd = c_sock;
 	fds[0].events = ZSOCK_POLLIN;
@@ -2915,7 +2935,6 @@ ZTEST(net_socket_tls, test_poll_dtls_second_record_in_datagram)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
-#endif
 }
 
 ZTEST(net_socket_tls, test_poll_tls_pollout)
