@@ -23,4 +23,9 @@ void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl)
 	ssl->options.sentNotify = 1;
 }
 
+int test_wolfssl_dtls_timeout_max(WOLFSSL *ssl)
+{
+	return ssl->dtls_timeout_max;
+}
+
 #endif /* CONFIG_WOLFSSL */
