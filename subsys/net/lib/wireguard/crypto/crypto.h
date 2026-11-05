@@ -11,7 +11,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#if defined(CONFIG_MBEDTLS)
 #include <mbedtls/constant_time.h>
+#endif
 
 /*
  * BLAKE2S IMPLEMENTATION
@@ -82,7 +84,32 @@
 		(p)[0] = U8V((v) >> 56);                                                           \
 	} while (0)
 
+#if defined(CONFIG_MBEDTLS)
 #define crypto_zero(dest, len) mbedtls_platform_zeroize(dest, len)
 #define crypto_equal(a, b, n) (mbedtls_ct_memcmp(a, b, n) == 0 ? true : false)
+#else
+static inline void crypto_zero(void *dest, size_t len)
+{
+	volatile uint8_t *p = (volatile uint8_t *)dest;
+
+	while (len--) {
+		*p++ = 0U;
+	}
+}
+
+/* Compares authentication tags, so it runs in constant time */
+static inline bool crypto_equal(const void *a, const void *b, size_t n)
+{
+	const volatile uint8_t *pa = (const volatile uint8_t *)a;
+	const volatile uint8_t *pb = (const volatile uint8_t *)b;
+	uint8_t diff = 0U;
+
+	while (n--) {
+		diff |= (uint8_t)(*pa++ ^ *pb++);
+	}
+
+	return diff == 0U;
+}
+#endif /* CONFIG_MBEDTLS */
 
 #endif /* _CRYPTO_H_ */
