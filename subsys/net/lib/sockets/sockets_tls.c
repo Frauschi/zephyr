@@ -3074,18 +3074,41 @@ exit:
 
 static int tls_wolfssl_set_session_cache_mode(struct tls_context *context)
 {
+	bool is_server = context->options.role == ZTLS_IS_SERVER;
 #if !defined(NO_SESSION_CACHE)
-	if ((context->options.role == ZTLS_IS_SERVER) &&
-	    (0 == context->options.cache_enabled)) {
-		if (wolfSSL_CTX_set_session_cache_mode(context->ctx,
-				SSL_SESS_CACHE_OFF) != WOLFSSL_SUCCESS) {
-			return -EINVAL;
-		}
+	long mode = WOLFSSL_SESS_CACHE_OFF;
+#endif
+
+	if (is_server && context->options.cache_enabled) {
+		return 0;
 	}
-#else
-	/* Nothing caches a session, so TLS_SESSION_CACHE is already off. */
-	ARG_UNUSED(context);
+
+#if !defined(NO_SESSION_CACHE)
+#if defined(ZTLS_WOLFSSL_EXT_CACHE)
+	/* The socket cache keeps client sessions itself */
+	if (!is_server) {
+		mode = WOLFSSL_SESS_CACHE_NO_INTERNAL;
+	}
+#endif
+	if (wolfSSL_CTX_set_session_cache_mode(context->ctx, mode) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
 #endif /* !NO_SESSION_CACHE */
+
+	if (!is_server) {
+		return 0;
+	}
+
+#if defined(HAVE_SESSION_TICKET) && !defined(NO_WOLFSSL_SERVER)
+	/* Tickets resume a session too, so they follow the cache setting */
+	if (wolfSSL_CTX_NoTicketTLSv12(context->ctx) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+#if defined(WOLFSSL_TLS13)
+	/* Fails only on a context limited to TLS 1.2, which sends no TLS 1.3 ticket */
+	(void)wolfSSL_CTX_no_ticket_TLSv13(context->ctx);
+#endif
+#endif /* HAVE_SESSION_TICKET && !NO_WOLFSSL_SERVER */
 
 	return 0;
 }
