@@ -2251,6 +2251,31 @@ ZTEST(net_socket_tls, test_alpn)
 #endif
 }
 
+/* A zero-length read returns 0 once data is there, and leaves the data in place */
+ZTEST(net_socket_tls, test_recv_zero_length)
+{
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	struct zsock_pollfd fds[1];
+	int ret;
+
+	test_prepare_tls_connection(AF_INET6);
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+	fds[0].fd = new_sock;
+	fds[0].events = ZSOCK_POLLIN;
+	zassert_equal(zsock_poll(fds, 1, 1000), 1, "poll() missed data");
+
+	ret = zsock_recv(new_sock, NULL, 0, 0);
+	zassert_equal(ret, 0, "zero-length recv() returned %d (%d)", ret, errno);
+
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, sizeof(rx_buf), "recv() after a zero-length read failed (%d)", errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
 ZTEST(net_socket_tls, test_poll_tls_pollin)
 {
 	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];

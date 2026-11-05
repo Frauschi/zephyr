@@ -2913,8 +2913,14 @@ static ssize_t recv_tls_wolfssl(struct tls_context *ctx, void *buf,
 	const bool is_block = is_blocking(ctx->sock, flags);
 	k_timeout_t timeout;
 	k_timepoint_t end;
+	uint8_t zero_len_buf;
 	int ret;
 	int err;
+
+	/* wolfSSL_read() rejects a NULL buffer even for a zero-length read */
+	if (buf == NULL && max_len == 0) {
+		buf = &zero_len_buf;
+	}
 
 	if (ctx->error != 0) {
 		errno = ctx->error;
@@ -2988,6 +2994,10 @@ err:
 		if (ret == 0) {
 			/* A clean closure reads as 0; send() then fails as on mbedTLS */
 			err = wolfSSL_get_error(ctx->wssl, ret);
+			if (err == WOLFSSL_ERROR_NONE && max_len == 0) {
+				break;
+			}
+
 			if (!tls_wolfssl_peer_closed(ctx, err)) {
 				NET_ERR("TLS recv error: %x", err);
 				errno = EIO;
@@ -5757,6 +5767,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 	k_timeout_t timeout;
 	k_timepoint_t end;
 	int remaining;
+	uint8_t zero_len_buf;
 	bool retry;
 
 	if (ctx->error != 0) {
@@ -5765,6 +5776,10 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 
 	if (ctx->recv_eof) {
 		return 0;
+	}
+
+	if (buf == NULL && max_len == 0) {
+		buf = &zero_len_buf;
 	}
 
 	if (!is_block) {
