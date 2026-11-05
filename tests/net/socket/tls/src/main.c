@@ -586,6 +586,73 @@ ZTEST(net_socket_tls, test_dtls_handshake_timeout_max_large)
 #endif
 }
 
+void loopback_enable_address_swap(bool swap_addresses);
+
+/* A wildcard-bound DTLS server answers from whichever address the client sent to */
+ZTEST(net_socket_tls, test_dtls_server_replies_from_local_addr)
+{
+#if !defined(CONFIG_NET_CONTEXT_RECV_PKTINFO)
+	ztest_test_skip();
+#else
+	static const char *const dst_addrs[] = { MY_IPV4_ADDR, "127.0.0.2" };
+	const char *failed_addr = NULL;
+	int unused_sock = -1;
+	struct zsock_timeval rcv_timeout = { .tv_sec = 3 };
+	struct net_if *iface = net_if_get_default();
+	struct net_sockaddr_in c_saddr, s_saddr;
+	struct net_in_addr second_addr;
+	struct connect_data test_data;
+	int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	int one = 1;
+	uint8_t rx_buf;
+	int ret;
+
+	zassert_equal(zsock_inet_pton(NET_AF_INET, dst_addrs[1], &second_addr), 1);
+	zassert_not_null(net_if_ipv4_addr_add(iface, &second_addr, NET_ADDR_MANUAL, 0),
+			 "cannot add a second address");
+	loopback_enable_address_swap(false);
+
+	/* The stack picks one source address for both, so one reply needs PKTINFO */
+	for (int i = 0; i < ARRAY_SIZE(dst_addrs); i++) {
+		prepare_sock_dtls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr,
+				     NET_IPPROTO_DTLS_1_2);
+		prepare_sock_dtls_v4("0.0.0.0", SERVER_PORT + i, &s_sock, &s_saddr,
+				     NET_IPPROTO_DTLS_1_2);
+		test_config_psk(s_sock, c_sock);
+		zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+					    sizeof(role)));
+		zassert_ok(zsock_setsockopt(s_sock, NET_IPPROTO_IP, ZSOCK_IP_PKTINFO, &one,
+					    sizeof(one)));
+		zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &rcv_timeout,
+					    sizeof(rcv_timeout)));
+		test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr));
+
+		zassert_equal(zsock_inet_pton(NET_AF_INET, dst_addrs[i], &s_saddr.sin_addr), 1);
+		test_data.sock = c_sock;
+		/* A failed handshake must not close the socket this thread polls */
+		test_data.peer_sock = &unused_sock;
+		test_data.addr = (struct net_sockaddr *)&s_saddr;
+		k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+		test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+		/* The handshake runs inside recv(), which gives up with the client */
+		ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+		test_work_wait(&test_data.work);
+		test_sockets_close();
+
+		if (ret != sizeof(rx_buf)) {
+			failed_addr = dst_addrs[i];
+			break;
+		}
+	}
+
+	/* Undo the setup before asserting, so a failure does not break later tests */
+	loopback_enable_address_swap(true);
+	zassert_true(net_if_ipv4_addr_rm(iface, &second_addr));
+	zassert_is_null(failed_addr, "no DTLS handshake through %s", failed_addr);
+#endif
+}
+
 /* Function pointer type for function to be called after socket creation but
  * before any bind/listen/connect operations */
 typedef void (*tls_pre_cb)(void);
