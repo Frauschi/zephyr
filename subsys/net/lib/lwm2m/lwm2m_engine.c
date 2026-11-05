@@ -36,7 +36,11 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #if defined(CONFIG_LWM2M_DTLS_SUPPORT)
 #include <zephyr/net/tls_credentials.h>
-#include <mbedtls/ssl_ciphersuites.h>
+
+/* IANA IDs, so the list does not need an mbedTLS header */
+#define LWM2M_TLS_PSK_WITH_AES_128_CCM_8              0xC0A8
+#define LWM2M_TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8      0xC0AE
+#define LWM2M_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 0xC02B
 #endif
 #if defined(CONFIG_DNS_RESOLVER)
 #include <zephyr/net/dns_resolve.h>
@@ -1062,12 +1066,12 @@ static int lwm2m_load_tls_credentials(struct lwm2m_ctx *ctx)
 }
 
 static const int cipher_list_psk[] = {
-	MBEDTLS_TLS_PSK_WITH_AES_128_CCM_8,
+	LWM2M_TLS_PSK_WITH_AES_128_CCM_8,
 };
 
 static const int cipher_list_cert[] = {
-	MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8,
-	MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	LWM2M_TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8,
+	LWM2M_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 };
 
 #endif /* CONFIG_LWM2M_DTLS_SUPPORT */
