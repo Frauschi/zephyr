@@ -138,6 +138,8 @@ config NET_SOCKETS_SOCKOPT_TLS
 		&& !WOLFSSL_HAS_SETTINGS_FILE
 	select WOLFSSL_SESSION_CACHE if WOLFSSL && !MBEDTLS \
 		&& !WOLFSSL_HAS_SETTINGS_FILE
+	select WOLFSSL_IP_ALT_NAME if WOLFSSL && !MBEDTLS \
+		&& !WOLFSSL_HAS_SETTINGS_FILE
 	help
 	  Enable TLS socket option support which automatically establishes
 	  a TLS connection to the remote host.
