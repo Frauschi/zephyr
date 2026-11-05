@@ -6422,8 +6422,8 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 				return -ENOTCONN;
 			}
 
-			if (wolfSSL_want_read(ctx->wssl) ||
-			    wolfSSL_want_write(ctx->wssl)) {
+			if (err == WOLFSSL_ERROR_WANT_READ ||
+			    err == WOLFSSL_ERROR_WANT_WRITE) {
 				return 0;
 			}
 
