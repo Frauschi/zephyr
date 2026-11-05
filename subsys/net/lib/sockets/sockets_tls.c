@@ -1346,22 +1346,6 @@ exit:
 	mbedtls_ssl_session_free(&session);
 }
 
-static void tls_session_store_current(struct tls_context *context)
-{
-	struct net_sockaddr_storage peer_addr = { 0 };
-	net_socklen_t peer_addrlen = sizeof(peer_addr);
-
-	if (!context->options.cache_enabled) {
-		return;
-	}
-
-	if (zsock_getpeername(context->sock, net_sad(&peer_addr), &peer_addrlen) < 0) {
-		return;
-	}
-
-	tls_session_store(context, net_sad(&peer_addr), peer_addrlen);
-}
-
 static void tls_session_restore(struct tls_context *context,
 				const struct net_sockaddr *addr,
 				net_socklen_t addrlen)
@@ -1649,6 +1633,24 @@ static void tls_session_purge(void)
 #endif
 }
 #endif /* CONFIG_WOLFSSL */
+
+#if defined(CONFIG_MBEDTLS) || (defined(ZTLS_WOLFSSL_EXT_CACHE) && defined(WOLFSSL_TLS13))
+static void tls_session_store_current(struct tls_context *context)
+{
+	struct net_sockaddr_storage peer_addr = { 0 };
+	net_socklen_t peer_addrlen = sizeof(peer_addr);
+
+	if (!context->options.cache_enabled) {
+		return;
+	}
+
+	if (zsock_getpeername(context->sock, net_sad(&peer_addr), &peer_addrlen) < 0) {
+		return;
+	}
+
+	tls_session_store(context, net_sad(&peer_addr), peer_addrlen);
+}
+#endif
 
 static inline int time_left(uint32_t start, uint32_t timeout)
 {
@@ -4171,6 +4173,40 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	return ret;
 }
 
+#if defined(ZTLS_WOLFSSL_EXT_CACHE) && defined(WOLFSSL_TLS13)
+/* TLS 1.3 tickets arrive after the handshake, in NewSessionTicket. */
+static int tls_wolfssl_new_session_cb(WOLFSSL *ssl, WOLFSSL_SESSION *session)
+{
+	struct tls_context *context = wolfSSL_GetIOReadCtx(ssl);
+
+	ARG_UNUSED(session);
+
+	if (context != NULL && wolfSSL_GetVersion(ssl) == WOLFSSL_TLSV1_3) {
+		tls_session_store_current(context);
+	}
+
+	return 0;
+}
+#endif /* ZTLS_WOLFSSL_EXT_CACHE && WOLFSSL_TLS13 */
+
+#if defined(WOLFSSL_TLS13) && !defined(WOLFSSL_NO_TLS12)
+/* A wolfSSL server picks TLS 1.3 from the ClientHello alone, even without a 1.3 suite. */
+static bool tls_wolfssl_suites_allow_tls13(const struct tls_context *context)
+{
+	if (context->options.ciphersuites[0] == 0) {
+		return true;
+	}
+
+	for (int i = 0; context->options.ciphersuites[i] != 0; i++) {
+		if ((context->options.ciphersuites[i] >> 8) == 0x13) {
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif /* WOLFSSL_TLS13 && !WOLFSSL_NO_TLS12 */
+
 static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 					      bool is_server)
 {
@@ -4186,6 +4222,13 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 		/* mbedTLS 4 has no TLS 1.0 or 1.1 either, so these sockets run TLS 1.2. */
 		case NET_IPPROTO_TLS_1_1:
 		case NET_IPPROTO_TLS_1_0:
+#ifdef WOLFSSL_TLS13
+			/* TLS 1.2 is the minimum; tls_wolfssl_init() sets it */
+			if (tls_wolfssl_suites_allow_tls13(context)) {
+				return is_server ? wolfSSLv23_server_method()
+						 : wolfSSLv23_client_method();
+			}
+#endif /* WOLFSSL_TLS13 */
 			return is_server ? wolfTLSv1_2_server_method()
 					 : wolfTLSv1_2_client_method();
 #endif /* !WOLFSSL_NO_TLS12 */
@@ -4272,6 +4315,21 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 		if (context->ctx == NULL) {
 			return -ENOMEM;
 		}
+
+#if defined(WOLFSSL_TLS13) && !defined(WOLFSSL_NO_TLS12)
+		if (context->type == NET_SOCK_STREAM &&
+		    context->tls_version != NET_IPPROTO_TLS_1_3 &&
+		    wolfSSL_CTX_SetMinVersion(context->ctx, WOLFSSL_TLSV1_2) != WOLFSSL_SUCCESS) {
+			ret = -ENOMEM;
+			goto err_cleanup;
+		}
+#endif /* WOLFSSL_TLS13 && !WOLFSSL_NO_TLS12 */
+
+#if defined(ZTLS_WOLFSSL_EXT_CACHE) && defined(WOLFSSL_TLS13)
+		if (!is_server) {
+			wolfSSL_CTX_sess_set_new_cb(context->ctx, tls_wolfssl_new_session_cb);
+		}
+#endif
 	}
 
 	ret = tls_wolfssl_set_credentials(context);
@@ -5962,7 +6020,10 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct net_sockaddr *addr,
 			goto error;
 		}
 
-		tls_session_store(ctx, addr, addrlen);
+		/* TLS 1.3 tickets arrive after the handshake. */
+		if (wolfSSL_GetVersion(ctx->active_session->wssl) != WOLFSSL_TLSV1_3) {
+			tls_session_store(ctx, addr, addrlen);
+		}
 #else
 		ret = tls_mbedtls_init(ctx, false);
 		if (ret < 0) {

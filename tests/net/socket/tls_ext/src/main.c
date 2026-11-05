@@ -1165,6 +1165,10 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	ret = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
 	zassert_equal(ret, 0, "failed to connect (%d)", errno);
 
+	/* A TLS 1.3 client is done before the server has checked its certificate */
+	ret = k_thread_join(&server_thread, K_FOREVER);
+	zassert_equal(0, ret, "k_thread_join() failed (%d)", ret);
+
 	/* The server's wolfSSL-style verify callback should have been invoked
 	 * during zsock_accept() on the cloned child context.
 	 */
@@ -1175,8 +1179,6 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	zassert_not_equal(-1, ret, "zsock_close() failed on client fd (%d)", errno);
 	ret = zsock_close(server_fd);
 	zassert_not_equal(-1, ret, "zsock_close() failed on server fd (%d)", errno);
-	ret = k_thread_join(&server_thread, K_FOREVER);
-	zassert_equal(0, ret, "k_thread_join() failed (%d)", ret);
 	k_yield();
 }
 

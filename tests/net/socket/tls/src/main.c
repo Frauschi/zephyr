@@ -52,6 +52,11 @@ static const int cipher_list_psk[] = {
 	TEST_TLS_PSK_WITH_AES_128_GCM_SHA256
 };
 
+/* TLS_AES_128_GCM_SHA256, since test_config_psk() pins a TLS 1.2 suite */
+static const int tls13_cipher_list[] = {
+	0x1301,
+};
+
 /* Test test_set_ciphersuites() assumes [0] of this list is the
  * cipher that will be negotiated */
 static const int cipher_list_psk2[] = {
@@ -110,6 +115,19 @@ static const unsigned char psk[] = {
 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
 };
 static const char psk_id[] = "test_identity";
+
+static void test_config_tls13_suites(int s_sock, int c_sock)
+{
+	if (s_sock >= 0) {
+		zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+					    tls13_cipher_list, sizeof(tls13_cipher_list)));
+	}
+
+	if (c_sock >= 0) {
+		zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
+					    tls13_cipher_list, sizeof(tls13_cipher_list)));
+	}
+}
 
 static void test_config_psk(int s_sock, int c_sock)
 {
@@ -2305,7 +2323,7 @@ static void tls_set_session_cache_client_cb(void)
 }
 
 /* A fixed server port gives both connections the same peer address, the cache key */
-static void prepare_tls_session_resume_connection(uint16_t server_port)
+static void prepare_tls_session_resume_connection(uint16_t server_port, int proto)
 {
 	struct net_sockaddr_in c_saddr;
 	struct net_sockaddr_in s_saddr;
@@ -2315,14 +2333,15 @@ static void prepare_tls_session_resume_connection(uint16_t server_port)
 	int reuse = 1;
 	int ret;
 
-	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr,
-			    NET_IPPROTO_TLS_1_2);
-	prepare_sock_tls_v4(MY_IPV4_ADDR, server_port, &s_sock, &s_saddr,
-			    NET_IPPROTO_TLS_1_2);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, proto);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, server_port, &s_sock, &s_saddr, proto);
 
 	tls_set_session_cache_client_cb();
 
 	test_config_psk(s_sock, c_sock);
+	if (proto == NET_IPPROTO_TLS_1_3) {
+		test_config_tls13_suites(s_sock, c_sock);
+	}
 
 	/* Rebinding the fixed port must not fail on a TIME_WAIT entry */
 	ret = zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_REUSEADDR,
@@ -2408,7 +2427,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	tls_session_cache_purge();
 
 	/* First connection - should perform full handshake, then store. */
-	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 
 #if defined(CONFIG_WOLFSSL)
 	{
@@ -2436,7 +2455,7 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	/* Second connection to the SAME server port - should restore the
 	 * stored session and resume.
 	 */
-	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 
 #if defined(CONFIG_WOLFSSL)
 	{
@@ -2463,6 +2482,70 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+/* The client stores the ticket that arrives after a TLS 1.3 handshake and offers it next time */
+ZTEST(net_socket_tls, test_session_cache_tls13_ticket_offered)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(WOLFSSL_TLS13) || !defined(HAVE_SESSION_TICKET) || \
+	!defined(HAVE_EXT_CACHE) || defined(NO_SESSION_CACHE)
+	ztest_test_skip();
+#else
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	int ret;
+
+	tls_session_cache_purge();
+
+	for (int i = 0; i < 2; i++) {
+		prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_3);
+		zassert_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), i,
+			      "connection %d: unexpected resumption state", i);
+
+		/* The client reads the ticket together with the data */
+		test_send(new_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+		ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+
+		test_sockets_close();
+		k_sleep(TCP_TEARDOWN_TIMEOUT);
+	}
+#endif
+}
+
+/* A TLS 1.2 socket sets the minimum version, so it runs TLS 1.3 with a TLS 1.3 peer */
+ZTEST(net_socket_tls, test_tls_1_2_socket_runs_tls_1_3)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(WOLFSSL_TLS13)
+	ztest_test_skip();
+#else
+	struct net_sockaddr c_saddr, s_saddr, addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, (struct net_sockaddr_in *)&c_saddr,
+			    NET_IPPROTO_TLS_1_2);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &s_sock, (struct net_sockaddr_in *)&s_saddr,
+			    NET_IPPROTO_TLS_1_3);
+	test_config_psk(s_sock, c_sock);
+	test_config_tls13_suites(s_sock, c_sock);
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	test_data.peer_sock = &s_sock;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	zassert_equal(wolfSSL_GetVersion(ztls_get_wolfssl_context(c_sock)), WOLFSSL_TLSV1_3,
+		      "TLS 1.2 socket did not negotiate TLS 1.3");
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
+}
+
 /* The client session cache is saved to and reloaded from the settings subsystem */
 ZTEST(net_socket_tls, test_session_cache_persistent)
 {
@@ -2476,7 +2559,7 @@ ZTEST(net_socket_tls, test_session_cache_persistent)
 
 	tls_session_cache_purge();
 
-	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 
@@ -2490,7 +2573,7 @@ ZTEST(net_socket_tls, test_session_cache_persistent)
 	zassert_ok(settings_save_one(TLS_CACHE_KEY("data"), junk, sizeof(junk)));
 	zassert_ok(settings_load_subtree(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX));
 
-	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 #if defined(CONFIG_WOLFSSL)
 	zassert_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), 0,
 		      "resumed without a valid session");
@@ -2501,7 +2584,7 @@ ZTEST(net_socket_tls, test_session_cache_persistent)
 	zassert_ok(settings_save_one(TLS_CACHE_KEY("data"), data, data_len));
 	zassert_ok(settings_load_subtree(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT_PREFIX));
 
-	prepare_tls_session_resume_connection(RESUME_SERVER_PORT);
+	prepare_tls_session_resume_connection(RESUME_SERVER_PORT, NET_IPPROTO_TLS_1_2);
 #if defined(CONFIG_WOLFSSL)
 	zassert_not_equal(wolfSSL_session_reused(ztls_get_wolfssl_context(c_sock)), 0,
 			  "reloaded session not resumed");
@@ -4321,7 +4404,6 @@ ZTEST(net_socket_tls, test_tls13_psk_handshake)
 	uint8_t tx_buf[] = TEST_STR_SMALL;
 	uint8_t rx_buf[sizeof(tx_buf)];
 	int ret;
-	static const int tls13_cipher_list[] = { 0x1301 };
 	int optval;
 	net_socklen_t optlen = sizeof(optval);
 
@@ -4331,11 +4413,7 @@ ZTEST(net_socket_tls, test_tls13_psk_handshake)
 			    &s_saddr, NET_IPPROTO_TLS_1_3);
 
 	test_config_psk(s_sock, c_sock);
-	/* test_config_psk() pins a TLS 1.2 suite */
-	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
-				    tls13_cipher_list, sizeof(tls13_cipher_list)));
-	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
-				    tls13_cipher_list, sizeof(tls13_cipher_list)));
+	test_config_tls13_suites(s_sock, c_sock);
 
 	test_bind(s_sock, (struct net_sockaddr *)&s_saddr,
 		  sizeof(struct net_sockaddr_in6));
