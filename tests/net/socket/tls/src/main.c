@@ -4610,12 +4610,16 @@ ZTEST(net_socket_tls, test_dtls_client_retransmit_under_traffic)
 #endif
 }
 
-/* wolfSSL-only: a TCP FIN without a close_notify reads as EOF, OPENSSL_EXTRA or not. */
-ZTEST(net_socket_tls, test_tls_peer_fin_reads_eof)
+/* wolfSSL-only: a TCP FIN without a close_notify is a recv error, as on mbedTLS. */
+ZTEST(net_socket_tls, test_tls_peer_fin_is_error)
 {
 #if !defined(CONFIG_WOLFSSL)
 	ztest_test_skip();
 #else
+	struct timeval rcv_timeo = { .tv_sec = 2 };
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL)];
+	int ret;
+
 	test_prepare_tls_connection(NET_AF_INET);
 
 	/* Closing the server then sends a FIN but no close_notify */
@@ -4623,7 +4627,13 @@ ZTEST(net_socket_tls, test_tls_peer_fin_reads_eof)
 	test_close(new_sock);
 	new_sock = -1;
 
-	test_eof(c_sock);
+	ret = zsock_setsockopt(c_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &rcv_timeo,
+			       sizeof(rcv_timeo));
+	zassert_ok(ret, "failed to set ZSOCK_SO_RCVTIMEO (%d)", errno);
+
+	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, -1, "a FIN without close_notify read as %d", ret);
+	zassert_equal(errno, EIO, "unexpected errno %d", errno);
 
 	test_sockets_close();
 
