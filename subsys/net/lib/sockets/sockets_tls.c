@@ -285,9 +285,6 @@ struct tls_session_context {
 	/* Lets a verify callback reach the context of the session it verifies */
 	struct tls_context *tls_ctx;
 
-	/* An I/O callback reported the transport closed */
-	bool transport_closed;
-
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Lets the handshake tell a sent flight from other wakeups */
 	uint32_t dtls_tx_count;
@@ -1830,19 +1827,11 @@ static void ctx_set_lock(struct tls_context *ctx, struct k_mutex *lock)
 }
 
 #if defined(CONFIG_WOLFSSL)
-static int tls_wolfssl_io_closed(struct tls_context *tls_ctx)
-{
-	tls_ctx->active_session->transport_closed = true;
-
-	return WOLFSSL_CBIO_ERR_CONN_CLOSE;
-}
-
-/* With OPENSSL_EXTRA, wolfSSL_get_error() reports SOCKET_PEER_CLOSED_E as WOLFSSL_ERROR_SYSCALL. */
+/* Only a close_notify is a clean close; a bare FIN is a recv error, as on mbedTLS */
 static bool tls_wolfssl_peer_closed(struct tls_session_context *session_ctx, int err)
 {
-	return err == WOLFSSL_ERROR_ZERO_RETURN ||
-	       ((err == SOCKET_PEER_CLOSED_E || err == WOLFSSL_ERROR_SYSCALL) &&
-		session_ctx->transport_closed);
+	return err == WOLFSSL_ERROR_ZERO_RETURN &&
+	       (wolfSSL_get_shutdown(session_ctx->wssl) & WOLFSSL_RECEIVED_SHUTDOWN) != 0;
 }
 #endif /* CONFIG_WOLFSSL */
 
@@ -2058,7 +2047,7 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 		/* An empty datagram is EOF after a local read shutdown, and is dropped otherwise */
 		(void)zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
 				     ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
-		return tls_ctx->recv_eof ? tls_wolfssl_io_closed(tls_ctx)
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
 	}
 
@@ -2089,7 +2078,7 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 
 	if (received == 0) {
 		/* An empty datagram can arrive between the peek and this read */
-		return tls_ctx->recv_eof ? tls_wolfssl_io_closed(tls_ctx)
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
 	}
 
@@ -2129,7 +2118,7 @@ static int dtls_wolf_client_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 
 	if (received == 0) {
 		/* EOF after a local read shutdown; an empty datagram from the network is dropped */
-		return tls_ctx->recv_eof ? tls_wolfssl_io_closed(tls_ctx)
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
 	}
 
@@ -2613,7 +2602,7 @@ static int tls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 		case EINTR:
 			return WOLFSSL_CBIO_ERR_ISR;
 		case EPIPE:
-			return tls_wolfssl_io_closed(tls_ctx);
+			return WOLFSSL_CBIO_ERR_CONN_CLOSE;
 		default:
 			return WOLFSSL_CBIO_ERR_GENERAL;
 		}
@@ -2641,12 +2630,12 @@ static int tls_wolf_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 		case ECONNREFUSED:
 			return WOLFSSL_CBIO_ERR_WANT_READ;
 		case ECONNABORTED:
-			return tls_wolfssl_io_closed(tls_ctx);
+			return WOLFSSL_CBIO_ERR_CONN_CLOSE;
 		default:
 			return WOLFSSL_CBIO_ERR_GENERAL;
 		}
 	} else if (received == 0) {
-		return tls_wolfssl_io_closed(tls_ctx);
+		return WOLFSSL_CBIO_ERR_CONN_CLOSE;
 	}
 
 	return received;
@@ -4105,7 +4094,6 @@ static int tls_wolfssl_session_init(struct tls_session_context *session_ctx,
 		wolfSSL_free(session_ctx->wssl);
 	}
 
-	session_ctx->transport_closed = false;
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	session_ctx->dtls_rtx_armed = false;
 	session_ctx->dtls_rtx_tx_count = session_ctx->dtls_tx_count;
@@ -6926,7 +6914,7 @@ err:
 		if (ret == 0) {
 			/* A clean closure reads as 0; send() then fails as on mbedTLS */
 			err = wolfSSL_get_error(ctx->active_session->wssl, ret);
-			if (err == WOLFSSL_ERROR_NONE && max_len == 0) {
+			if ((err == WOLFSSL_ERROR_NONE && max_len == 0) || ctx->recv_eof) {
 				break;
 			}
 
