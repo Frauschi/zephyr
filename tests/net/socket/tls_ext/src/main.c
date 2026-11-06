@@ -623,14 +623,6 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 	server_fd = test_configure_server_ex(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_OPTIONAL,
 					     2, false, NULL, 0, true,
 					     server_thread_resume_fn);
-#if defined(CONFIG_WOLFSSL)
-	/* A TLS 1.2 suite, since only the session cache resumes on a wolfSSL server */
-	const int tls12_suite = 0xC02F;
-
-	r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST, &tls12_suite,
-			     sizeof(tls12_suite));
-	zassert_ok(r, "failed to set ZSOCK_TLS_CIPHERSUITE_LIST (%d)", errno);
-#endif
 
 	for (int i = 0; i < 2; i++) {
 		client_fd = test_configure_client(&sa, false, "localhost");

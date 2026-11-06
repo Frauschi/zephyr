@@ -39,6 +39,7 @@ static psa_storage_uid_t credentials_toc[CRED_MAX_SLOTS];
 
 /* A mutex for protecting access to the credentials array. */
 static K_MUTEX_DEFINE(credential_lock);
+static atomic_t credentials_gen;
 
 /* Whether the Table Of Content has been successfully loaded from storage.
  * The backend is loaded lazily on first access (under credential_lock).
@@ -374,6 +375,11 @@ void credentials_unlock(void)
 	k_mutex_unlock(&credential_lock);
 }
 
+uint32_t credentials_generation(void)
+{
+	return (uint32_t)atomic_get(&credentials_gen);
+}
+
 int tls_credential_add(sec_tag_t tag, enum tls_credential_type type,
 		       const void *cred, size_t credlen)
 {
@@ -419,6 +425,9 @@ int tls_credential_add(sec_tag_t tag, enum tls_credential_type type,
 	}
 
 	ret = credentials_toc_update(slot, uid);
+	if (ret == 0) {
+		atomic_inc(&credentials_gen);
+	}
 
 cleanup:
 	k_mutex_unlock(&credential_lock);
@@ -596,6 +605,8 @@ int tls_credential_delete(sec_tag_t tag, enum tls_credential_type type)
 		ret = -EIO;
 		goto cleanup;
 	}
+
+	atomic_inc(&credentials_gen);
 
 cleanup:
 	k_mutex_unlock(&credential_lock);
