@@ -290,6 +290,9 @@ struct tls_session_context {
 
 	bool cert_verify_ran;
 	bool psk_used;
+
+	/* A TCP session kept after a fatal error, which sends no close_notify */
+	bool failed;
 #endif /* CONFIG_WOLFSSL */
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
@@ -784,7 +787,7 @@ static void tls_session_free(struct tls_session_context *session_ctx)
 #if defined(CONFIG_WOLFSSL)
 	if (session_ctx->wssl != NULL) {
 		/* wolfSSL_shutdown before the handshake completes can corrupt global state */
-		if (wolfSSL_is_init_finished(session_ctx->wssl) &&
+		if (wolfSSL_is_init_finished(session_ctx->wssl) && !session_ctx->failed &&
 		    !(wolfSSL_get_shutdown(session_ctx->wssl) & WOLFSSL_SENT_SHUTDOWN)) {
 			(void)wolfSSL_shutdown(session_ctx->wssl);
 		}
@@ -1239,7 +1242,7 @@ static uint32_t tls_wolfssl_verify_result(struct tls_context *context,
 		return session_ctx->verify_result_flags;
 	}
 
-	if (wolfSSL_session_reused(session_ctx->wssl)) {
+	if (!session_ctx->failed && wolfSSL_session_reused(session_ctx->wssl)) {
 		/* A server session keeps no client certificate result */
 		return is_server ? MBEDTLS_X509_BADCERT_SKIP_VERIFY
 				 : session_ctx->resumed_verify_result;
@@ -3625,6 +3628,7 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 	session_ctx->resumed_psk = false;
 	session_ctx->cert_verify_ran = false;
 	session_ctx->psk_used = false;
+	session_ctx->failed = false;
 
 	ret = tls_wolfssl_set_verify(tls_ctx, session_ctx);
 	if (ret != 0) {
@@ -3757,7 +3761,8 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 {
 	struct tls_session_context *session_ctx = context->active_session;
 
-	if (context->ctx != NULL) {
+	/* A failed TCP session is never used again, so only DTLS needs a new object */
+	if (context->ctx != NULL && context->type != NET_SOCK_STREAM) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 
@@ -3774,6 +3779,7 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 	session_ctx->resumed_psk = false;
 	session_ctx->cert_verify_ran = false;
 	session_ctx->psk_used = false;
+	session_ctx->failed = context->type == NET_SOCK_STREAM;
 
 	k_sem_reset(&session_ctx->tls_established);
 
