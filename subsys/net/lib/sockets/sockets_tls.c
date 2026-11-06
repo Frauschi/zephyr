@@ -144,6 +144,8 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 /* wolfSSL drops its session API under NO_SESSION_CACHE, and serialisation without EXT_CACHE. */
 #if defined(HAVE_EXT_CACHE) && !defined(NO_SESSION_CACHE)
 #define ZTLS_WOLFSSL_EXT_CACHE
+/* Set in a cached verify result when a PSK authenticated the session */
+#define ZTLS_WOLFSSL_CACHE_PSK BIT(31)
 #endif
 
 #if defined(HAVE_MAX_FRAGMENT) && !defined(NO_WOLFSSL_CLIENT) && \
@@ -380,6 +382,7 @@ __net_socket struct tls_context {
 
 	/* Verify result saved with the session this handshake tries to resume. */
 	uint32_t resumed_verify_result;
+	bool resumed_psk;
 
 	bool cert_verify_ran;
 	bool psk_used;
@@ -1178,6 +1181,22 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 }
 #endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
+#if defined(ZTLS_WOLFSSL_EXT_CACHE)
+/* VERIFY_NONE may skip the certificate callback, and a resumption keeps its cached flag */
+static bool tls_wolfssl_psk_authenticated(struct tls_context *context)
+{
+	if (context->options.verify_level == TLS_PEER_VERIFY_NONE) {
+		return false;
+	}
+
+	if (wolfSSL_session_reused(context->wssl)) {
+		return context->resumed_psk;
+	}
+
+	return context->psk_used && !context->cert_verify_ran;
+}
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
+
 static void tls_session_store(struct tls_context *context,
 			      const struct sockaddr *addr,
 			      socklen_t addrlen)
@@ -1228,6 +1247,13 @@ static void tls_session_store(struct tls_context *context,
 	}
 
 	verify_result = tls_wolfssl_verify_result(context);
+	/* A VERIFY_NONE client reports 0 like mbedTLS 3.6, which the cache would take for checked */
+	if (context->options.verify_level == TLS_PEER_VERIFY_NONE) {
+		verify_result = MBEDTLS_X509_BADCERT_SKIP_VERIFY;
+	}
+	if (tls_wolfssl_psk_authenticated(context)) {
+		verify_result |= ZTLS_WOLFSSL_CACHE_PSK;
+	}
 	memcpy(serialized, &verify_result, sizeof(verify_result));
 
 	{
@@ -1265,6 +1291,17 @@ exit:
 #endif /* ZTLS_WOLFSSL_EXT_CACHE */
 }
 
+#if defined(ZTLS_WOLFSSL_EXT_CACHE)
+/* Under REQUIRED, only a session whose server was verified, or a PSK one, resumes */
+static bool tls_wolfssl_resume_allowed(struct tls_context *context, uint32_t verify_result,
+				       bool psk_session)
+{
+	return verify_result == 0 || psk_session ||
+	       (context->options.verify_level != TLS_PEER_VERIFY_REQUIRED &&
+		context->options.verify_level != -1);
+}
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
+
 static void tls_session_restore(struct tls_context *context,
 				const struct sockaddr *addr,
 				socklen_t addrlen)
@@ -1283,6 +1320,7 @@ static void tls_session_restore(struct tls_context *context,
 	int64_t stale_ts;
 	const unsigned char *p;
 	uint32_t verify_result;
+	bool psk_session;
 
 	if (!context->options.cache_enabled || context->wssl == NULL) {
 		return;
@@ -1352,10 +1390,16 @@ static void tls_session_restore(struct tls_context *context,
 		return;
 	}
 
-	if (wolfSSL_set_session(context->wssl, session) != WOLFSSL_SUCCESS) {
+	psk_session = (verify_result & ZTLS_WOLFSSL_CACHE_PSK) != 0;
+	verify_result &= ~ZTLS_WOLFSSL_CACHE_PSK;
+
+	if (!tls_wolfssl_resume_allowed(context, verify_result, psk_session)) {
+		NET_DBG("Cached session for %p was not verified, not resuming", context);
+	} else if (wolfSSL_set_session(context->wssl, session) != WOLFSSL_SUCCESS) {
 		NET_DBG("Failed to set session for %p", context);
 	} else {
 		context->resumed_verify_result = verify_result;
+		context->resumed_psk = psk_session;
 	}
 
 	wolfSSL_SESSION_free(session);
@@ -2806,6 +2850,7 @@ static int tls_wolfssl_reset(struct tls_context *context)
 
 	context->verify_result_flags = 0;
 	context->resumed_verify_result = 0;
+	context->resumed_psk = false;
 	context->cert_verify_ran = false;
 	context->psk_used = false;
 
@@ -3205,6 +3250,8 @@ static unsigned int tls_psk_client_cb(WOLFSSL *ssl, const char *hint,
 	XMEMCPY(identity, context->psk_id, context->psk_id_len);
 	identity[context->psk_id_len] = '\0';
 	XMEMCPY(key, context->psk, context->psk_len);
+
+	context->psk_used = true;
 
 	return context->psk_len;
 }
@@ -3816,6 +3863,7 @@ static int tls_wolfssl_session_init(struct tls_context *context, bool is_server)
 	context->transport_closed = false;
 	context->verify_result_flags = 0;
 	context->resumed_verify_result = 0;
+	context->resumed_psk = false;
 	context->cert_verify_ran = false;
 	context->psk_used = false;
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)

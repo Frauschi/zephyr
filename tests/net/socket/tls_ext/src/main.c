@@ -17,6 +17,8 @@
 #include <time.h>
 #include <wolfssl/ssl.h>
 #include <zephyr/net/tls_verify.h>
+
+struct WOLFSSL *ztls_get_wolfssl_context(int fd);
 #else
 #include <mbedtls/x509.h>
 #include <mbedtls/x509_crt.h>
@@ -77,6 +79,10 @@ enum tls_tag {
 	/** The CA and server of the IP address SAN test */
 	IP_SAN_CA_TAG,
 	IP_SAN_SERVER_TAG,
+	/** The client of the untrusted client certificate resumption test */
+	CLIENT_AUTH_TAG,
+	/** The PSK of the REQUIRED client resumption test */
+	EXT_PSK_TAG,
 };
 
 /** @brief synchronization object for server & client threads */
@@ -571,6 +577,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_none)
 
 static uint32_t resumed_verify_result[2];
 
+/* arg1 is the number of connections to accept */
 static void server_thread_resume_fn(void *arg0, void *arg1, void *arg2)
 {
 	const int server_fd = POINTER_TO_INT(arg0);
@@ -579,12 +586,11 @@ static void server_thread_resume_fn(void *arg0, void *arg1, void *arg2)
 	int client_fd;
 	int r;
 
-	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
 
 	k_sem_give(&server_sem);
 
-	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+	for (int i = 0; i < POINTER_TO_INT(arg1); i++) {
 		client_fd = zsock_accept(server_fd, NULL, NULL);
 		zassert_not_equal(client_fd, -1, "accept() failed (%d)", errno);
 
@@ -611,7 +617,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 	int server_fd, client_fd, r;
 
 	server_fd = test_configure_server_ex(&server_thread_id, TLS_PEER_VERIFY_OPTIONAL,
-					     false, false, NULL, 0, true,
+					     2, false, NULL, 0, true,
 					     server_thread_resume_fn);
 #if defined(CONFIG_WOLFSSL)
 	/* A TLS 1.2 suite, since only the session cache resumes on a wolfSSL server */
@@ -622,7 +628,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 	zassert_ok(r, "failed to set TLS_CIPHERSUITE_LIST (%d)", errno);
 #endif
 
-	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+	for (int i = 0; i < 2; i++) {
 		client_fd = test_configure_client(&sa, false, "localhost");
 		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SESSION_CACHE,
 				     &cache_on, sizeof(cache_on));
@@ -635,7 +641,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
 		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
 
-		if (i + 1 < ARRAY_SIZE(resumed_verify_result)) {
+		if (i + 1 < 2) {
 			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
 		}
 	}
@@ -649,6 +655,279 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 #if defined(CONFIG_WOLFSSL)
 	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_SKIP_VERIFY,
 		      "resumption: verify result 0x%x", resumed_verify_result[1]);
+#endif
+}
+
+/* wolfSSL-only: a resumed server session reports SKIP_VERIFY, also after a switch to REQUIRED */
+ZTEST(net_socket_tls_api_extension, test_tls_server_resumed_untrusted_cert)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	/* A client certificate with the clientAuth EKU that the server's CA did not sign */
+	static const uint8_t client_auth_cert_der[] = {
+		0x30, 0x82, 0x01, 0xbc, 0x30, 0x82, 0x01, 0x61, 0xa0, 0x03, 0x02, 0x01,
+		0x02, 0x02, 0x02, 0x20, 0x01, 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48,
+		0xce, 0x3d, 0x04, 0x03, 0x02, 0x30, 0x40, 0x31, 0x20, 0x30, 0x1e, 0x06,
+		0x03, 0x55, 0x04, 0x0a, 0x0c, 0x17, 0x5a, 0x65, 0x70, 0x68, 0x79, 0x72,
+		0x20, 0x54, 0x4c, 0x53, 0x20, 0x73, 0x6f, 0x63, 0x6b, 0x65, 0x74, 0x20,
+		0x74, 0x65, 0x73, 0x74, 0x73, 0x31, 0x1c, 0x30, 0x1a, 0x06, 0x03, 0x55,
+		0x04, 0x03, 0x0c, 0x13, 0x43, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x20, 0x61,
+		0x75, 0x74, 0x68, 0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x43, 0x41, 0x30,
+		0x20, 0x17, 0x0d, 0x32, 0x30, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30,
+		0x30, 0x30, 0x30, 0x5a, 0x18, 0x0f, 0x32, 0x31, 0x31, 0x39, 0x31, 0x32,
+		0x33, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a, 0x30, 0x33, 0x31,
+		0x20, 0x30, 0x1e, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x17, 0x5a, 0x65,
+		0x70, 0x68, 0x79, 0x72, 0x20, 0x54, 0x4c, 0x53, 0x20, 0x73, 0x6f, 0x63,
+		0x6b, 0x65, 0x74, 0x20, 0x74, 0x65, 0x73, 0x74, 0x73, 0x31, 0x0f, 0x30,
+		0x0d, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x06, 0x63, 0x6c, 0x69, 0x65,
+		0x6e, 0x74, 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+		0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01,
+		0x07, 0x03, 0x42, 0x00, 0x04, 0xd1, 0xa7, 0xce, 0xd1, 0x51, 0x1f, 0xa1,
+		0x16, 0x2c, 0xe9, 0x84, 0x47, 0x04, 0x54, 0xd8, 0xd8, 0x56, 0x6d, 0x50,
+		0x95, 0x0a, 0x81, 0x88, 0x99, 0x9c, 0x22, 0x0e, 0x6d, 0xf9, 0xd9, 0xe4,
+		0x25, 0x76, 0x0f, 0x3a, 0xe0, 0x82, 0xe9, 0xb7, 0x80, 0x79, 0xe2, 0x8b,
+		0xb4, 0x9d, 0x1f, 0x2c, 0x7b, 0x8d, 0x5a, 0x27, 0x3b, 0x25, 0x77, 0x30,
+		0x60, 0xc6, 0x5a, 0x82, 0x56, 0x01, 0xa7, 0x4f, 0x1b, 0xa3, 0x56, 0x30,
+		0x54, 0x30, 0x0c, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04,
+		0x02, 0x30, 0x00, 0x30, 0x0e, 0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01,
+		0xff, 0x04, 0x04, 0x03, 0x02, 0x07, 0x80, 0x30, 0x13, 0x06, 0x03, 0x55,
+		0x1d, 0x25, 0x04, 0x0c, 0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05,
+		0x05, 0x07, 0x03, 0x02, 0x30, 0x1f, 0x06, 0x03, 0x55, 0x1d, 0x23, 0x04,
+		0x18, 0x30, 0x16, 0x80, 0x14, 0x85, 0x72, 0x4e, 0x70, 0x90, 0xb7, 0xf0,
+		0x6e, 0x6f, 0xca, 0x0c, 0x80, 0xed, 0xe8, 0xdd, 0x44, 0x19, 0xa3, 0xd3,
+		0x3d, 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03,
+		0x02, 0x03, 0x49, 0x00, 0x30, 0x46, 0x02, 0x21, 0x00, 0xd6, 0x72, 0x2b,
+		0x3c, 0xad, 0x3b, 0x9b, 0xa2, 0x22, 0xd7, 0x69, 0x40, 0xd8, 0x0a, 0x57,
+		0xaa, 0x2c, 0xc7, 0xa2, 0x01, 0x45, 0x8e, 0x96, 0x3a, 0x93, 0x88, 0x16,
+		0x2e, 0x33, 0x94, 0x0e, 0xde, 0x02, 0x21, 0x00, 0x93, 0xbc, 0x72, 0x06,
+		0xb3, 0x94, 0xc1, 0x8b, 0x4d, 0xab, 0xea, 0xad, 0xd6, 0xe4, 0xc4, 0x0b,
+		0x43, 0xc0, 0x84, 0x48, 0x02, 0x67, 0xd2, 0xc6, 0x59, 0x37, 0x2c, 0x0c,
+		0xe9, 0x3b, 0x1c, 0xc5,
+	};
+
+	static const uint8_t client_auth_key_der[] = {
+		0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20, 0x83, 0xca, 0x2a, 0x4b, 0x9d,
+		0xfc, 0x87, 0xc0, 0x80, 0x2d, 0xcc, 0x9b, 0x9c, 0x5f, 0xf5, 0x1a, 0x11,
+		0xac, 0x31, 0x11, 0x9d, 0x67, 0xbf, 0xc4, 0xdf, 0xb4, 0x67, 0x3d, 0x39,
+		0xd4, 0x86, 0x8e, 0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+		0x03, 0x01, 0x07, 0xa1, 0x44, 0x03, 0x42, 0x00, 0x04, 0xd1, 0xa7, 0xce,
+		0xd1, 0x51, 0x1f, 0xa1, 0x16, 0x2c, 0xe9, 0x84, 0x47, 0x04, 0x54, 0xd8,
+		0xd8, 0x56, 0x6d, 0x50, 0x95, 0x0a, 0x81, 0x88, 0x99, 0x9c, 0x22, 0x0e,
+		0x6d, 0xf9, 0xd9, 0xe4, 0x25, 0x76, 0x0f, 0x3a, 0xe0, 0x82, 0xe9, 0xb7,
+		0x80, 0x79, 0xe2, 0x8b, 0xb4, 0x9d, 0x1f, 0x2c, 0x7b, 0x8d, 0x5a, 0x27,
+		0x3b, 0x25, 0x77, 0x30, 0x60, 0xc6, 0x5a, 0x82, 0x56, 0x01, 0xa7, 0x4f,
+		0x1b,
+	};
+
+	static const sec_tag_t client_tags[] = { CA_CERTIFICATE_TAG, CLIENT_AUTH_TAG };
+	const int cache_on = TLS_SESSION_CACHE_ENABLED;
+	const int required = TLS_PEER_VERIFY_REQUIRED;
+	/* A TLS 1.2 suite, whose sessions every listener CTX can resume */
+	const int tls12_suite = 0xC02F;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int reused[ARRAY_SIZE(resumed_verify_result)];
+	int server_fd, client_fd = -1, r;
+
+	zassert_ok(tls_credential_add(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      client_auth_cert_der, sizeof(client_auth_cert_der)));
+	zassert_ok(tls_credential_add(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      client_auth_key_der, sizeof(client_auth_key_der)));
+
+	server_fd = test_configure_server_ex(&server_thread_id, TLS_PEER_VERIFY_OPTIONAL,
+					     ARRAY_SIZE(resumed_verify_result), false, NULL, 0,
+					     true, server_thread_resume_fn);
+	r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CIPHERSUITE_LIST, &tls12_suite,
+			     sizeof(tls12_suite));
+	zassert_ok(r, "failed to set TLS_CIPHERSUITE_LIST (%d)", errno);
+
+	/* OPTIONAL accepts the certificate, then the listener switches to REQUIRED */
+	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+		if (client_fd >= 0) {
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		}
+
+		client_fd = test_configure_client(&sa, false, "localhost");
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST, client_tags,
+				     sizeof(client_tags));
+		zassert_ok(r, "failed to set TLS_SEC_TAG_LIST (%d)", errno);
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SESSION_CACHE,
+				     &cache_on, sizeof(cache_on));
+		zassert_ok(r, "failed to set TLS_SESSION_CACHE (%d)", errno);
+		if (i == 0) {
+			/* An earlier test may have left a session for this server */
+			r = zsock_setsockopt(client_fd, SOL_TLS,
+					     TLS_SESSION_CACHE_PURGE, NULL, 0);
+			zassert_ok(r, "failed to purge the session cache (%d)", errno);
+		} else {
+			r = zsock_setsockopt(server_fd, SOL_TLS, TLS_PEER_VERIFY,
+					     &required, sizeof(required));
+			zassert_ok(r, "failed to set TLS_PEER_VERIFY (%d)", errno);
+		}
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+		reused[i] = wolfSSL_session_reused(ztls_get_wolfssl_context(client_fd));
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+
+	zassert_not_equal(resumed_verify_result[0], 0, "untrusted certificate read as verified");
+	zassert_equal(reused[1], 1, "the session was not resumed");
+	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_SKIP_VERIFY,
+		      "REQUIRED resumption: 0x%x", resumed_verify_result[1]);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL)
+static void server_thread_echo_twice_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	char buf[16];
+	int client_fd;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	/* The second handshake may fail, which is what the test checks */
+	for (int i = 0; i < 2; i++) {
+		client_fd = zsock_accept(server_fd, NULL, NULL);
+		if (client_fd < 0) {
+			continue;
+		}
+
+		if (zsock_recv(client_fd, buf, sizeof(buf), 0) > 0) {
+			(void)zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		}
+		(void)zsock_close(client_fd);
+	}
+}
+#endif /* CONFIG_WOLFSSL */
+
+/* wolfSSL-only: a REQUIRED client does not resume a session whose server failed the check */
+ZTEST(net_socket_tls_api_extension, test_tls_required_skips_unverified_session)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	const int cache_on = TLS_SESSION_CACHE_ENABLED;
+	const int levels[] = { TLS_PEER_VERIFY_OPTIONAL, TLS_PEER_VERIFY_REQUIRED };
+	const int tls12_suite = 0xC02F;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd = -1, r;
+
+	server_fd = test_configure_server_ex(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					     false, false, NULL, 0, true,
+					     server_thread_echo_twice_fn);
+	/* A TLS 1.2 suite, since only the session cache resumes on a wolfSSL server */
+	r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CIPHERSUITE_LIST, &tls12_suite,
+			     sizeof(tls12_suite));
+	zassert_ok(r, "failed to set TLS_CIPHERSUITE_LIST (%d)", errno);
+
+	for (int i = 0; i < ARRAY_SIZE(levels); i++) {
+		client_fd = test_configure_client(&sa, false, "dummy");
+		if (i == 0) {
+			r = zsock_setsockopt(client_fd, SOL_TLS,
+					     TLS_SESSION_CACHE_PURGE, NULL, 0);
+			zassert_ok(r, "failed to purge the session cache (%d)", errno);
+		}
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SESSION_CACHE,
+				     &cache_on, sizeof(cache_on));
+		zassert_ok(r, "failed to set TLS_SESSION_CACHE (%d)", errno);
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+				     &levels[i], sizeof(levels[i]));
+		zassert_ok(r, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		if (i == 0) {
+			zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+			r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+			zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+			r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+			zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		} else {
+			zassert_equal(r, -1, "REQUIRED resumed a session with a name mismatch");
+		}
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+#endif
+}
+
+/* wolfSSL-only: a PSK on a REQUIRED client does not resume a session nobody verified */
+ZTEST(net_socket_tls_api_extension, test_tls_required_psk_skips_unverified_session)
+{
+#if !defined(CONFIG_WOLFSSL) || defined(NO_PSK)
+	ztest_test_skip();
+#else
+	static const uint8_t psk[] = {
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	};
+	static const char psk_id[] = "tls_ext_psk";
+	static const sec_tag_t client_tags[] = { CA_CERTIFICATE_TAG, EXT_PSK_TAG };
+	const int cache_on = TLS_SESSION_CACHE_ENABLED;
+	const int levels[] = { TLS_PEER_VERIFY_NONE, TLS_PEER_VERIFY_REQUIRED };
+	const int tls12_suite = 0xC02F;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd = -1, r;
+
+	zassert_ok(tls_credential_add(EXT_PSK_TAG, TLS_CREDENTIAL_PSK, psk, sizeof(psk)));
+	zassert_ok(tls_credential_add(EXT_PSK_TAG, TLS_CREDENTIAL_PSK_ID, psk_id,
+				      strlen(psk_id)));
+
+	server_fd = test_configure_server_ex(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					     false, false, NULL, 0, true,
+					     server_thread_echo_twice_fn);
+	r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CIPHERSUITE_LIST, &tls12_suite,
+			     sizeof(tls12_suite));
+	zassert_ok(r, "failed to set TLS_CIPHERSUITE_LIST (%d)", errno);
+
+	for (int i = 0; i < ARRAY_SIZE(levels); i++) {
+		client_fd = test_configure_client(&sa, false, "dummy");
+		if (i == 0) {
+			r = zsock_setsockopt(client_fd, SOL_TLS,
+					     TLS_SESSION_CACHE_PURGE, NULL, 0);
+			zassert_ok(r, "failed to purge the session cache (%d)", errno);
+		} else {
+			r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST,
+					     client_tags, sizeof(client_tags));
+			zassert_ok(r, "failed to set TLS_SEC_TAG_LIST (%d)", errno);
+		}
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SESSION_CACHE,
+				     &cache_on, sizeof(cache_on));
+		zassert_ok(r, "failed to set TLS_SESSION_CACHE (%d)", errno);
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY,
+				     &levels[i], sizeof(levels[i]));
+		zassert_ok(r, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		if (i == 0) {
+			zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+			r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+			zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+			r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+			zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		} else {
+			zassert_equal(r, -1, "REQUIRED resumed an unverified session through its PSK");
+		}
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
 #endif
 }
 
@@ -1863,7 +2142,19 @@ static bool tls_ext_predicate(const void *state)
 	return !IS_ENABLED(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE);
 }
 
-ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE, NULL, NULL);
+/* Runs also after a failed test, which leaves its credentials behind */
+static void tls_ext_after(void *fixture)
+{
+	ARG_UNUSED(fixture);
+
+	(void)tls_credential_delete(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	(void)tls_credential_delete(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
+	(void)tls_credential_delete(EXT_PSK_TAG, TLS_CREDENTIAL_PSK);
+	(void)tls_credential_delete(EXT_PSK_TAG, TLS_CREDENTIAL_PSK_ID);
+}
+
+ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE,
+	    tls_ext_after, NULL);
 
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING)
 ZTEST_SUITE(net_socket_tls_ocsp, NULL, ocsp_setup, TLS_EXT_BEFORE, NULL, NULL);
