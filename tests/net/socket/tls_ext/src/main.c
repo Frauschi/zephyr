@@ -974,6 +974,37 @@ ZTEST(net_socket_tls_api_extension, test_tls_no_hostname_required_rejected)
 	test_shutdown(client_fd, server_fd, server_thread_id);
 }
 
+/* A NULL TLS_HOSTNAME turns the name check off, so a mismatched name passes REQUIRED */
+ZTEST(net_socket_tls_api_extension, test_tls_null_hostname_skips_name_check)
+{
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	int peer_verify = ZSOCK_TLS_PEER_VERIFY_REQUIRED;
+	uint32_t verify_result = UINT32_MAX;
+	net_socklen_t optlen = sizeof(verify_result);
+
+	server_fd = test_configure_server(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_NONE,
+					  false, false);
+	client_fd = test_configure_client(&sa, false, "dummy");
+
+	ret = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, NULL, 0);
+	zassert_ok(ret, "failed to clear ZSOCK_TLS_HOSTNAME (%d)", errno);
+	ret = zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY,
+			       &peer_verify, sizeof(peer_verify));
+	zassert_ok(ret, "failed to set ZSOCK_TLS_PEER_VERIFY (%d)", errno);
+
+	ret = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(ret, -1, "connect failed with the name check off (%d)", errno);
+
+	ret = zsock_getsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT,
+			       &verify_result, &optlen);
+	zassert_ok(ret, "failed to get ZSOCK_TLS_CERT_VERIFY_RESULT (%d)", errno);
+	zassert_equal(verify_result, 0, "verify result 0x%x", verify_result);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
 /* NONE skips the name check, so it is never stricter than OPTIONAL */
 ZTEST(net_socket_tls_api_extension, test_tls_verify_none_ignores_hostname)
 {
