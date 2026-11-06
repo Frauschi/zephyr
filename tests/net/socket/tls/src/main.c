@@ -26,6 +26,7 @@ WOLFSSL *ztls_get_wolfssl_context(int fd);
 /* In wolfssl_alert.c, which keeps <wolfssl/internal.h> out of this file */
 void test_wolfssl_send_fatal_alert(WOLFSSL *ssl);
 void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl);
+int test_wolfssl_max_psk_id_len(void);
 /* Collect the records a session sends, and send them as one datagram */
 void test_wolfssl_hold_records(WOLFSSL *ssl);
 int test_wolfssl_send_held_records(WOLFSSL *ssl);
@@ -120,6 +121,7 @@ static const unsigned char psk[] = {
 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
 };
 static const char psk_id[] = "test_identity";
+static const char *test_psk_id = psk_id;
 
 static void test_config_tls13_suites(int s_sock, int c_sock)
 {
@@ -150,7 +152,7 @@ static void test_config_psk(int s_sock, int c_sock)
 					 psk, sizeof(psk)),
 		      0, "Failed to register PSK");
 	zassert_equal(tls_credential_add(PSK_TAG, TLS_CREDENTIAL_PSK_ID,
-					 psk_id, strlen(psk_id)),
+					 test_psk_id, strlen(test_psk_id)),
 		      0, "Failed to register PSK ID");
 
 	if (s_sock >= 0) {
@@ -4729,6 +4731,7 @@ static void tls_tests_after(void *arg)
 {
 	ARG_UNUSED(arg);
 
+	test_psk_id = psk_id;
 	test_sockets_close();
 }
 
@@ -5406,6 +5409,31 @@ ZTEST(net_socket_tls, test_dtls_send_oversized_datagram)
 	zassert_equal(errno, ECONNABORTED, "unexpected errno %d", errno);
 
 	test_sockets_close();
+}
+
+/* wolfSSL's PSK callback buffer holds MAX_PSK_ID_LEN bytes plus the terminator */
+ZTEST(net_socket_tls, test_tls_psk_identity_max_len)
+{
+	static char long_id[2048];
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	int id_len = 128;
+	int ret;
+
+#if defined(CONFIG_WOLFSSL)
+	id_len = test_wolfssl_max_psk_id_len();
+#endif
+	zassert_true(id_len < sizeof(long_id), "identity of %d bytes does not fit", id_len);
+	memset(long_id, 'i', id_len);
+	test_psk_id = long_id;
+	test_prepare_tls_connection(NET_AF_INET);
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(rx_buf), 0);
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_WAITALL);
+	zassert_equal(ret, sizeof(rx_buf), "recv() returned %d (%d)", ret, errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, sizeof(rx_buf));
+
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);

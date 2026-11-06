@@ -23,6 +23,11 @@ void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl)
 	ssl->options.sentNotify = 1;
 }
 
+int test_wolfssl_max_psk_id_len(void)
+{
+	return MAX_PSK_ID_LEN;
+}
+
 static byte held_records[512];
 static int held_len;
 static CallbackIOSend held_send;
