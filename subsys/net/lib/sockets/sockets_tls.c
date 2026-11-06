@@ -387,6 +387,9 @@ __net_socket struct tls_context {
 	bool cert_verify_ran;
 	bool psk_used;
 
+	/* A TCP session kept after a fatal error, which sends no close_notify */
+	bool failed;
+
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Lets the handshake tell a sent flight from other wakeups */
 	uint32_t dtls_tx_count;
@@ -858,7 +861,7 @@ static int tls_release(struct tls_context *tls)
 #endif /* !NO_PSK */
 	if (tls->wssl != NULL) {
 		/* wolfSSL_shutdown before the handshake completes can corrupt global state */
-		if (wolfSSL_is_init_finished(tls->wssl) &&
+		if (wolfSSL_is_init_finished(tls->wssl) && !tls->failed &&
 		    !(wolfSSL_get_shutdown(tls->wssl) & WOLFSSL_SENT_SHUTDOWN)) {
 			(void)wolfSSL_shutdown(tls->wssl);
 		}
@@ -1122,7 +1125,7 @@ static uint32_t tls_wolfssl_verify_result(struct tls_context *context)
 		return context->verify_result_flags;
 	}
 
-	if (wolfSSL_session_reused(context->wssl)) {
+	if (!context->failed && wolfSSL_session_reused(context->wssl)) {
 		/* A server session keeps no client certificate result */
 		return is_server ? MBEDTLS_X509_BADCERT_SKIP_VERIFY
 				 : context->resumed_verify_result;
@@ -2824,7 +2827,8 @@ exit:
 
 static int tls_wolfssl_reset(struct tls_context *context)
 {
-	if (context->ctx != NULL) {
+	/* A failed TCP session is never used again, so only DTLS needs a new object */
+	if (context->ctx != NULL && context->type != SOCK_STREAM) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 
@@ -2842,6 +2846,7 @@ static int tls_wolfssl_reset(struct tls_context *context)
 	context->resumed_psk = false;
 	context->cert_verify_ran = false;
 	context->psk_used = false;
+	context->failed = context->type == SOCK_STREAM;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Server role: reset the address so that a new
@@ -3854,6 +3859,7 @@ static int tls_wolfssl_session_init(struct tls_context *context, bool is_server)
 	context->resumed_psk = false;
 	context->cert_verify_ran = false;
 	context->psk_used = false;
+	context->failed = false;
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	context->dtls_rtx_armed = false;
 	context->dtls_rtx_tx_count = context->dtls_tx_count;
