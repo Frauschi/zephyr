@@ -3339,7 +3339,7 @@ static int tls_wolfssl_set_hostname(struct tls_context *context)
 	}
 
 #if defined(HAVE_SNI)
-	if (context->options.is_hostname_set) {
+	if (context->host_name != NULL) {
 		if (wolfSSL_UseSNI(context->wssl, WOLFSSL_SNI_HOST_NAME,
 				   (const char *)context->host_name,
 				   context->host_len) != WOLFSSL_SUCCESS) {
@@ -3352,7 +3352,7 @@ static int tls_wolfssl_set_hostname(struct tls_context *context)
 
 #if !defined(OPENSSL_EXTRA) && !defined(OPENSSL_EXTRA_X509_SMALL)
 	/* No current_cert without the compat layer, so wolfSSL matches the name itself. */
-	if (context->options.is_hostname_set &&
+	if (context->host_name != NULL &&
 	    context->options.verify_level != TLS_PEER_VERIFY_NONE &&
 	    wolfSSL_check_domain_name(context->wssl,
 				      (const char *)context->host_name) !=
@@ -3401,9 +3401,12 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 		return;
 	}
 	/* No name set matches no certificate, like the empty name mbedTLS sets */
-	if (!context->options.is_hostname_set || context->host_len == 0) {
+	if (!context->options.is_hostname_set) {
 		context->verify_result_flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
 		*effective_ok = 0;
+		return;
+	}
+	if (context->host_name == NULL) {
 		return;
 	}
 #if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
@@ -4154,7 +4157,8 @@ static int tls_opt_hostname_set(struct tls_context *context,
 			context->host_name = NULL;
 			context->host_len = 0;
 		}
-		context->options.is_hostname_set = false;
+		/* A NULL name turns the name check off, as on mbedTLS */
+		context->options.is_hostname_set = true;
 		return 0;
 	}
 
