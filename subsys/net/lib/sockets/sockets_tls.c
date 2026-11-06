@@ -2989,7 +2989,7 @@ static unsigned int tls_psk_client_cb(WOLFSSL *ssl, const char *hint,
 
 	if (context->psk_len == 0 || context->psk_len > key_max_len ||
 	    context->psk_id_len == 0 ||
-	    context->psk_id_len + 1 > id_max_len) {
+	    context->psk_id_len > id_max_len) {
 		return 0;
 	}
 
