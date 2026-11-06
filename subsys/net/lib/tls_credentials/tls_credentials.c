@@ -20,6 +20,7 @@ static struct tls_credential credentials[CONFIG_TLS_MAX_CREDENTIALS_NUMBER];
 
 /* A mutex for protecting access to the credentials array. */
 static struct k_mutex credential_lock;
+static atomic_t credentials_gen;
 
 static int credentials_init(void)
 {
@@ -120,6 +121,11 @@ void credentials_unlock(void)
 	k_mutex_unlock(&credential_lock);
 }
 
+uint32_t credentials_generation(void)
+{
+	return (uint32_t)atomic_get(&credentials_gen);
+}
+
 int tls_credential_add(sec_tag_t tag, enum tls_credential_type type,
 		       const void *cred, size_t credlen)
 {
@@ -144,6 +150,7 @@ int tls_credential_add(sec_tag_t tag, enum tls_credential_type type,
 	credential->type = type;
 	credential->buf = cred;
 	credential->len = credlen;
+	atomic_inc(&credentials_gen);
 
 exit:
 	credentials_unlock();
@@ -202,6 +209,7 @@ int tls_credential_delete(sec_tag_t tag, enum tls_credential_type type)
 
 	(void)memset(credential, 0, sizeof(struct tls_credential));
 	credential->type = TLS_CREDENTIAL_NONE;
+	atomic_inc(&credentials_gen);
 
 exit:
 	credentials_unlock();
