@@ -39,6 +39,9 @@ void credentials_lock(void);
 /* Unlock TLS credential access. */
 void credentials_unlock(void);
 
+/* Returns a value that changes whenever a credential is added or deleted. */
+uint32_t credentials_generation(void);
+
 /* Function for getting credential by tag and type.
  *
  * Note, that to assure thread safety, credential access should be locked with

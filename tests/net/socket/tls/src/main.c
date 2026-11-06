@@ -2138,6 +2138,192 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+/* Sockets accepted from one listener share its CTX, so the credentials load once */
+ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
+{
+#if !defined(CONFIG_WOLFSSL) || defined(SINGLE_THREADED)
+	ztest_test_skip();
+#else
+	struct sockaddr_in c_saddr;
+	struct sockaddr_in s_saddr;
+	struct sockaddr addr;
+	socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+	sec_tag_t sec_tag_list[] = { PSK_TAG };
+	int first_sock;
+	int reuse = 1;
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, IPPROTO_TLS_1_2);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock_2, &c_saddr, IPPROTO_TLS_1_2);
+	prepare_sock_tls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, &s_saddr, IPPROTO_TLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	test_config_psk(-1, c_sock_2);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &reuse,
+				    sizeof(reuse)));
+	test_bind(s_sock, (struct sockaddr *)&s_saddr, sizeof(s_saddr));
+	test_listen(s_sock);
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct sockaddr *)&s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &first_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	/* The first accepted socket stays open, so its CTX cannot be freed and reused */
+	test_close(c_sock);
+	c_sock = -1;
+	test_data.sock = c_sock_2;
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	zassert_equal_ptr(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "accepted sockets use different CTXs");
+
+	/* The cipher list picks the CTX method, so the next accept() builds a new CTX */
+	test_close(new_sock);
+	new_sock = -1;
+	test_close(c_sock_2);
+	c_sock_2 = -1;
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_CIPHERSUITE_LIST, cipher_list_psk,
+				    sizeof(cipher_list_psk)));
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, IPPROTO_TLS_1_2);
+	/* Re-adding the PSK would change the credentials and so the listener's CTX */
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_SEC_TAG_LIST, sec_tag_list,
+				    sizeof(sec_tag_list)));
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_CIPHERSUITE_LIST, cipher_list_psk,
+				    sizeof(cipher_list_psk)));
+	test_data.sock = c_sock;
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	zassert_not_equal(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "TLS_CIPHERSUITE_LIST kept the listener's CTX");
+
+	test_close(first_sock);
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL)
+/* The client keeps its own copy of the original PSK under this tag */
+#define CLIENT_PSK_TAG 16
+#define ID_ONLY_TAG 17
+
+static const unsigned char psk_new[] = {
+	0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08,
+	0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00
+};
+
+static void listener_psk_prepare(struct sockaddr_in *s_saddr)
+{
+	int reuse = 1;
+
+	(void)tls_credential_delete(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK);
+	(void)tls_credential_delete(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK_ID);
+	zassert_ok(tls_credential_add(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK, psk, sizeof(psk)));
+	zassert_ok(tls_credential_add(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK_ID, psk_id,
+				      strlen(psk_id)));
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, s_saddr, IPPROTO_TLS_1_2);
+	test_config_psk(s_sock, -1);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &reuse,
+				    sizeof(reuse)));
+	test_bind(s_sock, (struct sockaddr *)s_saddr, sizeof(*s_saddr));
+	test_listen(s_sock);
+}
+
+/* Connects a client holding the original PSK and returns what accept() returned */
+static int listener_psk_connect(struct sockaddr_in *s_saddr, bool expect_ok)
+{
+	sec_tag_t sec_tag_list[] = { CLIENT_PSK_TAG };
+	struct sockaddr_in c_saddr;
+	struct sockaddr addr;
+	socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+	int sock;
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, IPPROTO_TLS_1_2);
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_SEC_TAG_LIST, sec_tag_list,
+				    sizeof(sec_tag_list)));
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct sockaddr *)s_saddr;
+	k_work_init_delayable(&test_data.work, expect_ok ? client_connect_work_handler :
+							   client_connect_work_handler_err);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	sock = zsock_accept(s_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+
+	test_close(c_sock);
+	c_sock = -1;
+	if (sock >= 0) {
+		test_close(sock);
+	}
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	return sock;
+}
+
+static void listener_psk_cleanup(void)
+{
+	(void)tls_credential_delete(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK);
+	(void)tls_credential_delete(CLIENT_PSK_TAG, TLS_CREDENTIAL_PSK_ID);
+	(void)tls_credential_delete(ID_ONLY_TAG, TLS_CREDENTIAL_PSK_ID);
+	test_sockets_close();
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+#endif /* CONFIG_WOLFSSL */
+
+/* A credential replaced under the listener's sec tag reaches the next accept() */
+ZTEST(net_socket_tls, test_tls_listener_sees_credential_change)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	struct sockaddr_in s_saddr;
+
+	listener_psk_prepare(&s_saddr);
+	zassert_true(listener_psk_connect(&s_saddr, true) >= 0, "first accept failed");
+
+	zassert_ok(tls_credential_delete(PSK_TAG, TLS_CREDENTIAL_PSK));
+	zassert_ok(tls_credential_add(PSK_TAG, TLS_CREDENTIAL_PSK, psk_new, sizeof(psk_new)));
+	zassert_equal(listener_psk_connect(&s_saddr, false), -1,
+		      "accepted the PSK that was replaced");
+
+	listener_psk_cleanup();
+#endif
+}
+
+/* A listener switched to sec tags without a PSK stops accepting the old one */
+ZTEST(net_socket_tls, test_tls_listener_drops_removed_psk)
+{
+#if !defined(CONFIG_WOLFSSL)
+	ztest_test_skip();
+#else
+	sec_tag_t sec_tag_list[] = { ID_ONLY_TAG };
+	struct sockaddr_in s_saddr;
+
+	listener_psk_prepare(&s_saddr);
+	zassert_true(listener_psk_connect(&s_saddr, true) >= 0, "first accept failed");
+
+	(void)tls_credential_delete(ID_ONLY_TAG, TLS_CREDENTIAL_PSK_ID);
+	zassert_ok(tls_credential_add(ID_ONLY_TAG, TLS_CREDENTIAL_PSK_ID, psk_id,
+				      strlen(psk_id)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_SEC_TAG_LIST, sec_tag_list,
+				    sizeof(sec_tag_list)));
+	zassert_equal(listener_psk_connect(&s_saddr, false), -1,
+		      "accepted a PSK the sec tags no longer hold");
+
+	listener_psk_cleanup();
+#endif
+}
+
 /* A server with TLS_SESSION_CACHE off issues no ticket, so the client offers none */
 ZTEST(net_socket_tls, test_session_cache_server_disabled_no_ticket)
 {

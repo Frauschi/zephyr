@@ -260,6 +260,9 @@ __net_socket struct tls_context {
 
 	/* Set when the application chose TLS_DTLS_ROLE; tls_wolfssl_init() derives it otherwise */
 	bool role_set : 1;
+
+	/* ctx is a reference to the listening socket's CTX */
+	bool ctx_shared : 1;
 #endif /* CONFIG_WOLFSSL */
 
 	/** Socket type. */
@@ -376,6 +379,9 @@ __net_socket struct tls_context {
 	/* TLS_ALPN_LIST as the comma separated list wolfSSL_UseALPN() takes */
 	char *alpn_joined;
 #endif /* HAVE_ALPN */
+
+	/* credentials_generation() when a listening socket built its CTX */
+	uint32_t ctx_cred_gen;
 
 	/** Accumulated mbedTLS-compatible verify result flags. */
 	uint32_t verify_result_flags;
@@ -824,6 +830,39 @@ static struct tls_context *tls_clone(struct tls_context *source_tls)
 	return target_tls;
 }
 
+#if defined(CONFIG_WOLFSSL)
+#ifndef NO_PSK
+static void tls_wolfssl_psk_free(struct tls_context *tls)
+{
+	if (tls->psk != NULL) {
+		wc_ForceZero(tls->psk, tls->psk_len);
+		XFREE(tls->psk, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		tls->psk = NULL;
+		tls->psk_len = 0;
+	}
+	if (tls->psk_id != NULL) {
+		XFREE(tls->psk_id, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+		tls->psk_id = NULL;
+		tls->psk_id_len = 0;
+	}
+}
+#endif /* !NO_PSK */
+
+static void tls_wolfssl_ctx_release(struct tls_context *context)
+{
+	WOLFSSL_CTX *wolf_ctx;
+
+	k_mutex_lock(&context_lock, K_FOREVER);
+	wolf_ctx = context->ctx;
+	context->ctx = NULL;
+	k_mutex_unlock(&context_lock);
+
+	if (wolf_ctx != NULL) {
+		wolfSSL_CTX_free(wolf_ctx);
+	}
+}
+#endif /* CONFIG_WOLFSSL */
+
 /* Release TLS context. */
 static int tls_release(struct tls_context *tls)
 {
@@ -847,17 +886,7 @@ static int tls_release(struct tls_context *tls)
 	tls->alpn_joined = NULL;
 #endif /* HAVE_ALPN */
 #ifndef NO_PSK
-	if (NULL != tls->psk) {
-		wc_ForceZero(tls->psk, tls->psk_len);
-		XFREE(tls->psk, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		tls->psk = NULL;
-		tls->psk_len = 0;
-	}
-	if (NULL != tls->psk_id) {
-		XFREE(tls->psk_id, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		tls->psk_id = NULL;
-		tls->psk_id_len = 0;
-	}
+	tls_wolfssl_psk_free(tls);
 #endif /* !NO_PSK */
 	if (tls->wssl != NULL) {
 		/* wolfSSL_shutdown before the handshake completes can corrupt global state */
@@ -868,10 +897,7 @@ static int tls_release(struct tls_context *tls)
 		wolfSSL_free(tls->wssl);
 		tls->wssl = NULL;
 	}
-	if (tls->ctx != NULL) {
-		wolfSSL_CTX_free(tls->ctx);
-		tls->ctx = NULL;
-	}
+	tls_wolfssl_ctx_release(tls);
 #else
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	mbedtls_ssl_cookie_free(&tls->cookie);
@@ -3294,6 +3320,11 @@ static int tls_wolfssl_set_credentials(struct tls_context *tls)
 	int i, err = 0;
 	bool tag_found;
 
+#ifndef NO_PSK
+	/* Only the current sec tags may supply a PSK */
+	tls_wolfssl_psk_free(tls);
+#endif /* !NO_PSK */
+
 	credentials_lock();
 
 	for (i = 0; i < tls->options.sec_tag_list.sec_tag_count; i++) {
@@ -3989,33 +4020,26 @@ static int tls_wolfssl_ocsp_status_cb(WOLFSSL *ssl, int err, byte *resp, word32 
 }
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 
-static int tls_wolfssl_init(struct tls_context *context, bool is_server)
+static void tls_wolfssl_role_set(struct tls_context *context, bool is_server)
 {
-	WOLFSSL_METHOD *method;
-	int ret;
-
 	/* connect() must not demote a socket configured as a DTLS server */
 	if (!context->role_set) {
 		context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
 	}
+}
 
-#if defined(CONFIG_WOLFSSL_DEBUG)
-	wolfSSL_Debugging_ON();
-#endif /* CONFIG_WOLFSSL_DEBUG */
-
-	method = tls_wolfssl_get_method(context, is_server);
-
-	if (method == NULL) {
-		return -ENOTSUP;
-	}
-
-	/* Only wolfSSL_CTX_new() takes ownership of the method */
-	if (context->ctx != NULL) {
-		XFREE(method, NULL, DYNAMIC_TYPE_METHOD);
-		method = NULL;
-	}
+/* Everything set on the CTX, which accept() children share with their listening socket */
+static int tls_wolfssl_ctx_setup(struct tls_context *context, bool is_server)
+{
+	WOLFSSL_METHOD *method;
+	int ret;
 
 	if (context->ctx == NULL) {
+		method = tls_wolfssl_get_method(context, is_server);
+		if (method == NULL) {
+			return -ENOTSUP;
+		}
+
 		context->ctx = wolfSSL_CTX_new(method);
 		if (context->ctx == NULL) {
 			return -ENOMEM;
@@ -4038,7 +4062,7 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 
 	ret = tls_wolfssl_set_credentials(context);
 	if (ret != 0) {
-		goto err_cleanup;
+		return ret;
 	}
 
 #ifndef NO_PSK
@@ -4071,8 +4095,7 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 		    wolfSSL_CTX_UseOCSPStapling(context->ctx, WOLFSSL_CSR_OCSP,
 						0) != WOLFSSL_SUCCESS) {
 			NET_ERR("Failed to enable OCSP stapling");
-			ret = -EINVAL;
-			goto err_cleanup;
+			return -EINVAL;
 		}
 
 		wolfSSL_CTX_set_ocsp_status_verify_cb(context->ctx, tls_wolfssl_ocsp_status_cb,
@@ -4082,16 +4105,30 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 				   wolfSSL_CTX_DisableOCSPMustStaple(context->ctx)) !=
 		    WOLFSSL_SUCCESS) {
 			NET_ERR("Failed to set the OCSP must-staple policy");
-			ret = -EINVAL;
-			goto err_cleanup;
+			return -EINVAL;
 		}
 	}
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 
 	/* wolfSSL_new() copies the cache and ticket settings, so they go on the CTX first */
-	ret = tls_wolfssl_set_session_cache_mode(context);
-	if (ret != 0) {
-		goto err_cleanup;
+	return tls_wolfssl_set_session_cache_mode(context);
+}
+
+static int tls_wolfssl_init(struct tls_context *context, bool is_server)
+{
+	int ret;
+
+	tls_wolfssl_role_set(context, is_server);
+
+#if defined(CONFIG_WOLFSSL_DEBUG)
+	wolfSSL_Debugging_ON();
+#endif /* CONFIG_WOLFSSL_DEBUG */
+
+	if (!context->ctx_shared) {
+		ret = tls_wolfssl_ctx_setup(context, is_server);
+		if (ret != 0) {
+			goto err_cleanup;
+		}
 	}
 
 	ret = tls_wolfssl_session_init(context, is_server);
@@ -4112,16 +4149,59 @@ err_cleanup:
 		wolfSSL_free(context->wssl);
 		context->wssl = NULL;
 	}
-	if (context->ctx != NULL) {
-		wolfSSL_CTX_free(context->ctx);
-		context->ctx = NULL;
-	}
+
+	tls_wolfssl_ctx_release(context);
+	context->ctx_shared = false;
 
 	/* Nothing is left to reuse, so the next connect() or accept() sets up again */
 	context->is_initialized = false;
 
 	return ret;
 }
+
+#ifndef SINGLE_THREADED
+/* The listening socket builds the CTX once; every accepted child takes a reference */
+static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context *child)
+{
+	int ret;
+
+	/* A credential added or deleted since then must reach this connection */
+	if (parent->ctx != NULL && parent->ctx_cred_gen != credentials_generation()) {
+		tls_wolfssl_ctx_release(parent);
+	}
+
+	if (parent->ctx == NULL) {
+		parent->ctx_cred_gen = credentials_generation();
+		tls_wolfssl_role_set(parent, true);
+		ret = tls_wolfssl_ctx_setup(parent, true);
+		if (ret != 0) {
+			tls_wolfssl_ctx_release(parent);
+			return ret;
+		}
+	}
+
+#ifndef NO_PSK
+	if (parent->psk != NULL) {
+		struct tls_credential psk = { .buf = parent->psk, .len = parent->psk_len };
+		struct tls_credential psk_id = { .buf = parent->psk_id, .len = parent->psk_id_len };
+
+		ret = tls_set_psk(child, &psk, &psk_id);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+#endif /* !NO_PSK */
+
+	if (wolfSSL_CTX_up_ref(parent->ctx) != WOLFSSL_SUCCESS) {
+		return -ENOMEM;
+	}
+
+	child->ctx = parent->ctx;
+	child->ctx_shared = true;
+
+	return 0;
+}
+#endif /* !SINGLE_THREADED */
 #endif /* CONFIG_WOLFSSL */
 
 static int tls_opt_sec_tag_list_set(struct tls_context *context,
@@ -5288,6 +5368,14 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 	child->sock = sock;
 
 #if defined(CONFIG_WOLFSSL)
+#ifndef SINGLE_THREADED
+	/* Without locking, wolfSSL cannot count references across threads */
+	ret = tls_wolfssl_ctx_share(parent, child);
+	if (ret < 0) {
+		goto error;
+	}
+#endif /* !SINGLE_THREADED */
+
 	ret = tls_wolfssl_init(child, true);
 	if (ret < 0) {
 		goto error;
@@ -7220,6 +7308,13 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 		err = -ENOPROTOOPT;
 		break;
 	}
+
+#if defined(CONFIG_WOLFSSL)
+	/* The next accept() builds a new CTX; accepted sockets keep the old one */
+	if (err == 0 && ctx->is_listening) {
+		tls_wolfssl_ctx_release(ctx);
+	}
+#endif /* CONFIG_WOLFSSL */
 
 out:
 	if (err < 0) {
