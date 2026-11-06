@@ -23,9 +23,16 @@ void test_wolfssl_mark_close_notify_sent(WOLFSSL *ssl)
 	ssl->options.sentNotify = 1;
 }
 
+int test_wolfssl_max_psk_id_len(void)
+{
+	return MAX_PSK_ID_LEN;
+}
+
+#ifdef WOLFSSL_DTLS
 int test_wolfssl_dtls_timeout_max(WOLFSSL *ssl)
 {
 	return ssl->dtls_timeout_max;
 }
+#endif /* WOLFSSL_DTLS */
 
 #endif /* CONFIG_WOLFSSL */
