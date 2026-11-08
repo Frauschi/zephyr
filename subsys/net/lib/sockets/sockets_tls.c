@@ -4386,6 +4386,14 @@ static bool tls_wolfssl_suites_allow_tls13(const struct tls_context *context)
 }
 #endif /* WOLFSSL_TLS13 && !WOLFSSL_NO_TLS12 */
 
+/* A client-only wolfSSL build has no server methods */
+#ifdef NO_WOLFSSL_SERVER
+#define TLS_WOLFSSL_METHOD(is_server, ver) ((is_server) ? NULL : ver##_client_method())
+#else
+#define TLS_WOLFSSL_METHOD(is_server, ver) \
+	((is_server) ? ver##_server_method() : ver##_client_method())
+#endif
+
 static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 					      bool is_server)
 {
@@ -4393,8 +4401,7 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 		switch (context->tls_version) {
 #ifdef WOLFSSL_TLS13
 		case NET_IPPROTO_TLS_1_3:
-			return is_server ? wolfTLSv1_3_server_method()
-					 : wolfTLSv1_3_client_method();
+			return TLS_WOLFSSL_METHOD(is_server, wolfTLSv1_3);
 #endif /* WOLFSSL_TLS13 */
 #ifndef WOLFSSL_NO_TLS12
 		case NET_IPPROTO_TLS_1_2:
@@ -4404,12 +4411,10 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 #ifdef WOLFSSL_TLS13
 			/* TLS 1.2 is the minimum; tls_wolfssl_ctx_setup() sets it */
 			if (tls_wolfssl_suites_allow_tls13(context)) {
-				return is_server ? wolfSSLv23_server_method()
-						 : wolfSSLv23_client_method();
+				return TLS_WOLFSSL_METHOD(is_server, wolfSSLv23);
 			}
 #endif /* WOLFSSL_TLS13 */
-			return is_server ? wolfTLSv1_2_server_method()
-					 : wolfTLSv1_2_client_method();
+			return TLS_WOLFSSL_METHOD(is_server, wolfTLSv1_2);
 #endif /* !WOLFSSL_NO_TLS12 */
 		default:
 			return NULL;
@@ -4421,8 +4426,7 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 #ifndef WOLFSSL_NO_TLS12
 		case NET_IPPROTO_DTLS_1_2:
 		case NET_IPPROTO_DTLS_1_0:
-			return is_server ? wolfDTLSv1_2_server_method()
-					 : wolfDTLSv1_2_client_method();
+			return TLS_WOLFSSL_METHOD(is_server, wolfDTLSv1_2);
 #endif /* !WOLFSSL_NO_TLS12 */
 		default:
 			return NULL;
