@@ -4,18 +4,7 @@
  */
 
 /** @file
- * @brief Public TLS_CERT_VERIFY_RESULT bitmask constants for the wolfSSL
- *        socket backend.
- *
- * The wolfSSL backend accumulates certificate verification errors into the
- * TLS_CERT_VERIFY_RESULT getsockopt bitmask using the same hex values as
- * mbedtls/x509.h's MBEDTLS_X509_BADCERT_* macros - the layout is part of
- * the TLS_CERT_VERIFY_RESULT public contract and predates the wolfSSL
- * backend. Applications that already include mbedtls/x509.h are
- * automatically protected from redefinition by the #ifndef guards below.
- *
- * Under CONFIG_MBEDTLS this file is inert; applications pull the real
- * macros from mbedtls/x509.h.
+ * @brief TLS_CERT_VERIFY_RESULT flags of the wolfSSL socket backend, with mbedTLS's values.
  */
 
 #ifndef ZEPHYR_INCLUDE_NET_TLS_VERIFY_H_
