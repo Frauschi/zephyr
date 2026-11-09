@@ -161,6 +161,12 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #define ZTLS_WOLFSSL_MAX_FRAGMENT
 #endif
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(WOLFSSL_DTLS_CID)
+#define ZTLS_WOLFSSL_DTLS_CID
+/* Size of the CID the socket options keep; wolfSSL may allow fewer bytes */
+#define ZTLS_WOLFSSL_CID_LEN_MAX 32
+#endif
+
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
@@ -194,6 +200,13 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 
 #if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
 #define DTLS_CID_CHECK_BUF_SIZE (MBEDTLS_SSL_IN_CONTENT_LEN)
+#define DTLS_CID_OUT_LEN_MAX MBEDTLS_SSL_CID_OUT_LEN_MAX
+#define DTLS_CID_IN_LEN_MAX MBEDTLS_SSL_CID_IN_LEN_MAX
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+/* A DTLS 1.2 record header up to and including the CID */
+#define DTLS_CID_CHECK_BUF_SIZE (13 + ZTLS_WOLFSSL_CID_LEN_MAX)
+#define DTLS_CID_OUT_LEN_MAX MIN(wolfSSL_dtls_cid_max_size(), ZTLS_WOLFSSL_CID_LEN_MAX)
+#define DTLS_CID_IN_LEN_MAX DTLS_CID_OUT_LEN_MAX
 #else
 #define DTLS_CID_CHECK_BUF_SIZE 0
 #endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID */
@@ -249,14 +262,33 @@ struct tls_session_cache {
 	size_t session_len;
 };
 
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_MBEDTLS)
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && \
+	(defined(CONFIG_MBEDTLS) || defined(ZTLS_WOLFSSL_DTLS_CID))
 struct tls_dtls_cid {
 	bool enabled;
+#if defined(CONFIG_MBEDTLS)
 	unsigned char cid[MAX(MBEDTLS_SSL_CID_OUT_LEN_MAX,
 			      MBEDTLS_SSL_CID_IN_LEN_MAX)];
+#else
+	unsigned char cid[ZTLS_WOLFSSL_CID_LEN_MAX];
+#endif
 	size_t cid_len;
+	/* Set through TLS_DTLS_CID_VALUE rather than generated */
+	bool cid_from_value;
 };
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && CONFIG_MBEDTLS */
+#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && (CONFIG_MBEDTLS || ZTLS_WOLFSSL_DTLS_CID) */
+
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
+static int dtls_cid_random(unsigned char *cid, size_t len)
+{
+#if defined(CONFIG_CSPRNG_ENABLED)
+	return sys_csrand_get(cid, len);
+#else
+	sys_rand_get(cid, len);
+	return 0;
+#endif
+}
+#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID || ZTLS_WOLFSSL_DTLS_CID */
 
 struct tls_session_context {
 	sys_snode_t node;
@@ -325,6 +357,14 @@ struct tls_session_context {
 
 	/* DTLS session expiry time (server only). */
 	k_timepoint_t session_expiry;
+
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+	/* Address a CID match moved the peer to, kept until wolfSSL authenticates a record */
+	struct net_sockaddr_storage dtls_cid_addr;
+	struct net_sockaddr_storage dtls_cid_local_addr;
+	net_socklen_t dtls_cid_addrlen;
+	bool dtls_cid_addr_used;
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 };
 
@@ -433,7 +473,7 @@ __net_socket struct tls_context {
 		uint32_t dtls_handshake_timeout_min;
 		uint32_t dtls_handshake_timeout_max;
 
-#if defined(CONFIG_MBEDTLS)
+#if defined(CONFIG_MBEDTLS) || defined(ZTLS_WOLFSSL_DTLS_CID)
 		struct tls_dtls_cid dtls_cid;
 #endif
 
@@ -1857,6 +1897,81 @@ static bool tls_wolfssl_peer_closed(struct tls_session_context *session_ctx, int
 #endif /* CONFIG_WOLFSSL */
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+/* Takes the CID-matched address once wolfSSL has authenticated a record from it */
+static void dtls_cid_peer_commit(struct tls_session_context *session_ctx)
+{
+	struct net_sockaddr_storage peer;
+	unsigned int peer_len = sizeof(peer);
+
+	if (session_ctx->dtls_cid_addrlen == 0 || !session_ctx->dtls_cid_addr_used) {
+		return;
+	}
+
+	if (session_ctx->wssl != NULL &&
+	    wolfSSL_dtls_get_peer(session_ctx->wssl, &peer, &peer_len) == WOLFSSL_SUCCESS &&
+	    peer_len == session_ctx->dtls_cid_addrlen &&
+	    memcmp(&peer, &session_ctx->dtls_cid_addr, peer_len) == 0) {
+		memcpy(&session_ctx->dtls_peer_addr, &peer, peer_len);
+		session_ctx->dtls_peer_addrlen = peer_len;
+		session_ctx->dtls_local_addr = session_ctx->dtls_cid_local_addr;
+		dtls_server_refresh_session_timeout(session_ctx);
+	}
+
+	session_ctx->dtls_cid_addrlen = 0;
+	session_ctx->dtls_cid_addr_used = false;
+}
+
+/* Lets one datagram from a CID-matched address through to wolfSSL */
+static bool dtls_cid_addr_take(struct tls_session_context *session_ctx,
+			       const struct net_sockaddr *peer_addr, net_socklen_t addrlen)
+{
+	if (session_ctx->dtls_cid_addrlen != addrlen || session_ctx->dtls_cid_addr_used ||
+	    !peer_addr_cmp(net_sad(&session_ctx->dtls_cid_addr), peer_addr)) {
+		return false;
+	}
+
+	session_ctx->dtls_cid_addr_used = true;
+
+	return true;
+}
+
+/* A CID match is retried only while its datagram is still queued */
+static bool dtls_cid_addr_queued(struct tls_context *tls_ctx)
+{
+	struct tls_session_context *session_ctx = tls_ctx->active_session;
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
+	struct net_sockaddr_storage addr;
+	uint8_t tmp_buf;
+
+	if (session_ctx->dtls_cid_addrlen == 0 || session_ctx->dtls_cid_addr_used) {
+		return false;
+	}
+
+	if (zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
+			   ZSOCK_MSG_DONTWAIT | ZSOCK_MSG_PEEK, net_sad(&addr), &addrlen) >= 0 &&
+	    addrlen == session_ctx->dtls_cid_addrlen &&
+	    peer_addr_cmp(net_sad(&session_ctx->dtls_cid_addr), net_sad(&addr))) {
+		return true;
+	}
+
+	session_ctx->dtls_cid_addrlen = 0;
+
+	return false;
+}
+
+/* True while the datagram dtls_cid_addr_take() let through is unauthenticated */
+static bool dtls_cid_addr_unverified(struct tls_session_context *session_ctx)
+{
+	return session_ctx->dtls_cid_addrlen != 0 && session_ctx->dtls_cid_addr_used;
+}
+#else
+#define dtls_cid_peer_commit(...)
+#define dtls_cid_addr_take(...) false
+#define dtls_cid_addr_queued(...) false
+#define dtls_cid_addr_unverified(...) false
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
+
 static bool dtls_is_peer_addr_valid(struct tls_session_context *session_ctx,
 				    const struct net_sockaddr *peer_addr,
 				    net_socklen_t addrlen)
@@ -2016,6 +2131,21 @@ static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	return sent;
 }
 
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+static struct tls_session_context *dtls_server_find_session_by_cid(
+	struct tls_context *tls_ctx, struct net_sockaddr_storage *addr, net_socklen_t *addrlen);
+
+static bool dtls_server_has_cid_session(struct tls_context *tls_ctx)
+{
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
+	struct net_sockaddr_storage addr;
+
+	return dtls_server_find_session_by_cid(tls_ctx, &addr, &addrlen) != NULL;
+}
+#else
+#define dtls_server_has_cid_session(...) false
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
+
 static bool dtls_server_has_session(struct tls_context *tls_ctx,
 				    const struct net_sockaddr *addr, net_socklen_t addrlen)
 {
@@ -2032,6 +2162,7 @@ static bool dtls_server_has_session(struct tls_context *tls_ctx,
 
 static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 {
+	struct net_sockaddr_storage *local_addr;
 	struct tls_context *tls_ctx = ctx;
 	net_socklen_t addrlen = sizeof(struct net_sockaddr);
 	struct net_sockaddr_storage addr = { 0 };
@@ -2050,6 +2181,9 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	};
 	ssize_t received;
 	uint8_t tmp_buf;
+
+	/* wolfSSL has processed the previous record by now */
+	dtls_cid_peer_commit(tls_ctx->active_session);
 
 	/* Peek the packet first to check the peer address. */
 	received = zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
@@ -2074,12 +2208,14 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 
 	/* Check if the peer address matches the current session. */
 	if (tls_ctx->active_session->dtls_peer_addrlen != 0 &&
-	    !dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen)) {
+	    !dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen) &&
+	    !dtls_cid_addr_take(tls_ctx->active_session, net_sad(&addr), addrlen)) {
 		/* Peer address does not match the current session, exit now
 		 * and try to find the appropriate session or allocate a new one.
 		 */
 		if (wolfSSL_is_stateful(ssl) ||
-		    dtls_server_has_session(tls_ctx, net_sad(&addr), addrlen)) {
+		    dtls_server_has_session(tls_ctx, net_sad(&addr), addrlen) ||
+		    dtls_server_has_cid_session(tls_ctx)) {
 			return WOLFSSL_CBIO_ERR_WANT_READ;
 		}
 
@@ -2095,7 +2231,13 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	}
 
 	addrlen = msg.msg_namelen;
-	dtls_server_local_addr_from_cmsg(&msg, &tls_ctx->active_session->dtls_local_addr);
+	local_addr = &tls_ctx->active_session->dtls_local_addr;
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+	if (dtls_cid_addr_unverified(tls_ctx->active_session)) {
+		local_addr = &tls_ctx->active_session->dtls_cid_local_addr;
+	}
+#endif
+	dtls_server_local_addr_from_cmsg(&msg, local_addr);
 
 	if (received == 0) {
 		/* An empty datagram can arrive between the peek and this read */
@@ -2103,7 +2245,9 @@ static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 					 : WOLFSSL_CBIO_ERR_WANT_READ;
 	}
 
-	dtls_server_refresh_session_timeout(tls_ctx->active_session);
+	if (!dtls_cid_addr_unverified(tls_ctx->active_session)) {
+		dtls_server_refresh_session_timeout(tls_ctx->active_session);
+	}
 
 	/* Only allow to store peer address for DTLS servers. */
 	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
@@ -2459,6 +2603,79 @@ static int dtls_server_switch_active_session_by_cid(struct tls_context *tls_ctx)
 	k_mutex_unlock(&dtls_helper_buf_lock);
 
 	return result;
+}
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+/* Returns the session whose own CID the queued datagram carries, and its source address */
+static struct tls_session_context *dtls_server_find_session_by_cid(
+	struct tls_context *tls_ctx, struct net_sockaddr_storage *addr, net_socklen_t *addrlen)
+{
+	struct tls_session_context *session_ctx;
+	struct tls_session_context *found = NULL;
+	ssize_t len;
+
+	if (!tls_ctx->options.dtls_cid.enabled) {
+		return NULL;
+	}
+
+	k_mutex_lock(&dtls_helper_buf_lock, K_FOREVER);
+
+	len = zsock_recvfrom(tls_ctx->sock, &dtls_helper_buf, DTLS_CID_CHECK_BUF_SIZE,
+			     ZSOCK_MSG_DONTWAIT | ZSOCK_MSG_PEEK, net_sad(addr), addrlen);
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&tls_ctx->sessions, session_ctx, node) {
+		const unsigned char *record_cid;
+		unsigned char *cid = NULL;
+		unsigned int cid_len = 0;
+
+		if (len < 0) {
+			break;
+		}
+
+		if (session_ctx->wssl == NULL || !wolfSSL_dtls_cid_is_enabled(session_ctx->wssl) ||
+		    wolfSSL_dtls_cid_get_rx_size(session_ctx->wssl, &cid_len) != WOLFSSL_SUCCESS ||
+		    cid_len == 0 ||
+		    wolfSSL_dtls_cid_get0_rx(session_ctx->wssl, &cid) != WOLFSSL_SUCCESS) {
+			continue;
+		}
+
+		record_cid = wolfSSL_dtls_cid_parse(dtls_helper_buf, (unsigned int)len, cid_len);
+		if (record_cid != NULL && memcmp(record_cid, cid, cid_len) == 0) {
+			found = session_ctx;
+			break;
+		}
+	}
+
+	k_mutex_unlock(&dtls_helper_buf_lock);
+
+	return found;
+}
+
+static int dtls_server_switch_active_session_by_cid(struct tls_context *tls_ctx)
+{
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
+	struct tls_session_context *session_ctx;
+	struct net_sockaddr_storage addr;
+
+	session_ctx = dtls_server_find_session_by_cid(tls_ctx, &addr, &addrlen);
+	if (session_ctx == NULL) {
+		return -ENOENT;
+	}
+
+	if (wolfSSL_dtls_set_pending_peer(session_ctx->wssl, &addr,
+					  (unsigned int)addrlen) != WOLFSSL_SUCCESS) {
+		return -ENOMEM;
+	}
+
+	NET_DBG("Found matching session (CID) for [%s]:%d (was [%s]:%d)",
+		LOG_ADDR_PORT_HELPER(net_sad(&addr)),
+		LOG_ADDR_PORT_HELPER(net_sad(&session_ctx->dtls_peer_addr)));
+
+	memcpy(&session_ctx->dtls_cid_addr, &addr, addrlen);
+	session_ctx->dtls_cid_addrlen = addrlen;
+	session_ctx->dtls_cid_addr_used = false;
+	tls_ctx->active_session = session_ctx;
+
+	return 0;
 }
 #else
 #define dtls_server_switch_active_session_by_cid(...) (-ENOTSUP)
@@ -3992,6 +4209,40 @@ static int tls_wolfssl_apply_all_sessions(
 	return 0;
 }
 
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+static int tls_wolfssl_set_dtls_cid(struct tls_context *tls_ctx,
+				    struct tls_session_context *session_ctx, bool is_server)
+{
+	unsigned char cid[ZTLS_WOLFSSL_CID_LEN_MAX];
+	size_t cid_len = tls_ctx->options.dtls_cid.cid_len;
+
+	session_ctx->dtls_cid_addrlen = 0;
+	session_ctx->dtls_cid_addr_used = false;
+
+	if (tls_ctx->type != NET_SOCK_DGRAM || !tls_ctx->options.dtls_cid.enabled) {
+		return 0;
+	}
+
+	/* A server finds a moved peer by its CID, so every session needs its own */
+	if (is_server && cid_len != 0 && !tls_ctx->options.dtls_cid.cid_from_value) {
+		cid_len = DTLS_CID_OUT_LEN_MAX;
+		if (dtls_cid_random(cid, cid_len) != 0) {
+			return -EIO;
+		}
+	} else {
+		memcpy(cid, tls_ctx->options.dtls_cid.cid, cid_len);
+	}
+
+	if (wolfSSL_dtls_cid_use(session_ctx->wssl) != WOLFSSL_SUCCESS ||
+	    wolfSSL_dtls_cid_set(session_ctx->wssl, cid, (unsigned int)cid_len) !=
+		    WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
+
 static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 				     struct tls_context *tls_ctx, bool is_server)
 {
@@ -4064,6 +4315,13 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 	if (ret != 0) {
 		return ret;
 	}
+
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+	ret = tls_wolfssl_set_dtls_cid(tls_ctx, session_ctx, is_server);
+	if (ret != 0) {
+		return ret;
+	}
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
 
 	dtls_server_init_session_timeout(session_ctx);
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
@@ -5545,7 +5803,7 @@ static int tls_opt_dtls_handshake_timeout_set(struct tls_context *context,
 static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 					  const void *optval, net_socklen_t optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
 	int value;
 
 	if (optlen > 0 && optval == NULL) {
@@ -5562,23 +5820,23 @@ static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 	case ZSOCK_TLS_DTLS_CID_DISABLED:
 		context->options.dtls_cid.enabled = false;
 		context->options.dtls_cid.cid_len = 0;
+		context->options.dtls_cid.cid_from_value = false;
 		break;
 	case ZSOCK_TLS_DTLS_CID_SUPPORTED:
 		context->options.dtls_cid.enabled = true;
 		context->options.dtls_cid.cid_len = 0;
+		context->options.dtls_cid.cid_from_value = false;
 		break;
 	case ZSOCK_TLS_DTLS_CID_ENABLED:
 		context->options.dtls_cid.enabled = true;
 		if (context->options.dtls_cid.cid_len == 0) {
 			/* generate random self cid */
-#if defined(CONFIG_CSPRNG_ENABLED)
-			sys_csrand_get(context->options.dtls_cid.cid,
-				       MBEDTLS_SSL_CID_OUT_LEN_MAX);
-#else
-			sys_rand_get(context->options.dtls_cid.cid,
-				     MBEDTLS_SSL_CID_OUT_LEN_MAX);
-#endif
-			context->options.dtls_cid.cid_len = MBEDTLS_SSL_CID_OUT_LEN_MAX;
+			if (dtls_cid_random(context->options.dtls_cid.cid,
+					    DTLS_CID_OUT_LEN_MAX) != 0) {
+				return -EIO;
+			}
+			context->options.dtls_cid.cid_len = DTLS_CID_OUT_LEN_MAX;
+			context->options.dtls_cid.cid_from_value = false;
 		}
 		break;
 	default:
@@ -5588,35 +5846,54 @@ static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 	return 0;
 #else
 	return -ENOPROTOOPT;
-#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID */
+#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID || ZTLS_WOLFSSL_DTLS_CID */
 }
 
 static int tls_opt_dtls_connection_id_value_set(struct tls_context *context,
 						const void *optval,
 						net_socklen_t optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
 	if (optlen > 0 && optval == NULL) {
 		return -EINVAL;
 	}
 
-	if (optlen > MBEDTLS_SSL_CID_IN_LEN_MAX) {
+	if (optlen > DTLS_CID_IN_LEN_MAX) {
 		return -EINVAL;
 	}
 
 	context->options.dtls_cid.cid_len = optlen;
+	context->options.dtls_cid.cid_from_value = optlen != 0;
 	memcpy(context->options.dtls_cid.cid, optval, optlen);
 
 	return 0;
 #else
 	return -ENOPROTOOPT;
-#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID */
+#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID || ZTLS_WOLFSSL_DTLS_CID */
 }
 
 static int tls_opt_dtls_connection_id_value_get(struct tls_context *context,
 						void *optval, net_socklen_t *optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+	struct tls_session_context *session_ctx = get_latest_session(context);
+	unsigned int cid_len = 0;
+
+	/* Each server session draws its own CID unless one was set */
+	if (context->options.role == ZTLS_IS_SERVER && !context->options.dtls_cid.cid_from_value &&
+	    session_ctx != NULL && session_ctx->wssl != NULL &&
+	    wolfSSL_dtls_cid_get_rx_size(session_ctx->wssl, &cid_len) == WOLFSSL_SUCCESS &&
+	    cid_len != 0) {
+		if (*optlen < cid_len || wolfSSL_dtls_cid_get_rx(session_ctx->wssl, optval,
+								  *optlen) != WOLFSSL_SUCCESS) {
+			return -EINVAL;
+		}
+
+		*optlen = cid_len;
+		return 0;
+	}
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
 
 	if (*optlen < context->options.dtls_cid.cid_len) {
 		return -EINVAL;
@@ -5661,6 +5938,39 @@ static int tls_opt_dtls_peer_connection_id_value_get(struct tls_context *context
 		*optlen = 0;
 	}
 	return ret;
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+	struct tls_session_context *session_ctx;
+	unsigned int cid_len = 0;
+
+	if (!context->is_initialized) {
+		return -ENOTCONN;
+	}
+
+	session_ctx = get_latest_session(context);
+	if (session_ctx == NULL || session_ctx->wssl == NULL) {
+		return -ENOTCONN;
+	}
+
+	if (!wolfSSL_is_init_finished(session_ctx->wssl)) {
+		return -EAGAIN;
+	}
+
+	if (wolfSSL_dtls_cid_is_enabled(session_ctx->wssl) &&
+	    wolfSSL_dtls_cid_get_tx_size(session_ctx->wssl, &cid_len) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+
+	if (*optlen < cid_len) {
+		return -EINVAL;
+	}
+
+	if (cid_len > 0 &&
+	    wolfSSL_dtls_cid_get_tx(session_ctx->wssl, optval, *optlen) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+
+	*optlen = cid_len;
+	return 0;
 #else
 	return -ENOPROTOOPT;
 #endif
@@ -5709,6 +6019,48 @@ static int tls_opt_dtls_connection_id_status_get(struct tls_context *context,
 	} else if (have_self_cid) {
 		val = ZSOCK_TLS_DTLS_CID_STATUS_DOWNLINK;
 	} else if (have_peer_cid) {
+		val = ZSOCK_TLS_DTLS_CID_STATUS_UPLINK;
+	} else {
+		val = ZSOCK_TLS_DTLS_CID_STATUS_DISABLED;
+	}
+
+	*((int *)optval) = val;
+	return 0;
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+	struct tls_session_context *session_ctx;
+	unsigned int self_len = 0;
+	unsigned int peer_len = 0;
+	int val;
+
+	if (sizeof(int) != *optlen) {
+		return -EINVAL;
+	}
+
+	if (!context->is_initialized) {
+		return -ENOTCONN;
+	}
+
+	session_ctx = get_latest_session(context);
+	if (session_ctx == NULL || session_ctx->wssl == NULL) {
+		return -ENOTCONN;
+	}
+
+	if (!wolfSSL_is_init_finished(session_ctx->wssl)) {
+		return -EAGAIN;
+	}
+
+	/* wolfSSL drops the CID state when the peer did not negotiate it */
+	if (context->options.dtls_cid.enabled &&
+	    wolfSSL_dtls_cid_is_enabled(session_ctx->wssl)) {
+		(void)wolfSSL_dtls_cid_get_rx_size(session_ctx->wssl, &self_len);
+		(void)wolfSSL_dtls_cid_get_tx_size(session_ctx->wssl, &peer_len);
+	}
+
+	if (self_len != 0 && peer_len != 0) {
+		val = ZSOCK_TLS_DTLS_CID_STATUS_BIDIRECTIONAL;
+	} else if (self_len != 0) {
+		val = ZSOCK_TLS_DTLS_CID_STATUS_DOWNLINK;
+	} else if (peer_len != 0) {
 		val = ZSOCK_TLS_DTLS_CID_STATUS_UPLINK;
 	} else {
 		val = ZSOCK_TLS_DTLS_CID_STATUS_DISABLED;
@@ -7163,6 +7515,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 		retry = false;
 		ret = wolfSSL_read(ctx->active_session->wssl, buf,
 				   (int)MIN(max_len, (size_t)INT_MAX));
+		dtls_cid_peer_commit(ctx->active_session);
 		/* wolfSSL_read() returns 0 for a close_notify */
 		if (ret <= 0) {
 			int err;
@@ -7409,10 +7762,11 @@ static ssize_t recvfrom_dtls_server_wolfssl(struct tls_context *ctx, void *buf,
 			break;
 
 		case -EAGAIN:
-			if (peer_addrlen > 0 &&
-			    !dtls_is_peer_addr_valid(ctx->active_session, net_sad(&peer_addr),
-						     peer_addrlen)) {
-				/* Current peer changed, repeat the loop. */
+			if ((peer_addrlen > 0 &&
+			     !dtls_is_peer_addr_valid(ctx->active_session, net_sad(&peer_addr),
+						      peer_addrlen)) ||
+			    dtls_cid_addr_queued(ctx)) {
+				/* Current peer changed, or a CID matched it from a new address. */
 				repeat = true;
 			} else {
 				(void)dtls_server_check_expired_sessions(ctx);

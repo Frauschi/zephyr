@@ -4410,6 +4410,15 @@ ZTEST(net_socket_tls, test_v6_dtls_server_multi_client_sendto)
 	test_dtls_server_multi_client_sendto(NET_AF_INET6);
 }
 
+#if defined(CONFIG_WOLFSSL) && defined(WOLFSSL_DTLS_CID)
+#define TEST_DTLS_CID true
+/* wolfSSL finds a moved client by the server's own CID, so the server sends one */
+#define TEST_DTLS_CID_SERVER ZSOCK_TLS_DTLS_CID_ENABLED
+#else
+#define TEST_DTLS_CID IS_ENABLED(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#define TEST_DTLS_CID_SERVER ZSOCK_TLS_DTLS_CID_SUPPORTED
+#endif
+
 static void test_dtls_server_cid_matching_on_addr_change(net_sa_family_t family)
 {
 	struct net_sockaddr c_saddr_1;
@@ -4426,7 +4435,7 @@ static void test_dtls_server_cid_matching_on_addr_change(net_sa_family_t family)
 	uint8_t rx_buf;
 	int cid, ret;
 
-	if (!IS_ENABLED(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)) {
+	if (!TEST_DTLS_CID) {
 		ztest_test_skip();
 	}
 
@@ -4442,7 +4451,7 @@ static void test_dtls_server_cid_matching_on_addr_change(net_sa_family_t family)
 		   &cid, sizeof(cid)), "setsockopt failed (%d)", errno);
 
 	/* And enable CID processing for server */
-	cid = ZSOCK_TLS_DTLS_CID_SUPPORTED;
+	cid = TEST_DTLS_CID_SERVER;
 	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID,
 		   &cid, sizeof(cid)), "setsockopt failed (%d)", errno);
 
@@ -4568,6 +4577,313 @@ ZTEST(net_socket_tls, test_v4_dtls_server_cid_matching_on_addr_change)
 ZTEST(net_socket_tls, test_v6_dtls_server_cid_matching_on_addr_change)
 {
 	test_dtls_server_cid_matching_on_addr_change(NET_AF_INET6);
+}
+
+static void test_dtls_cid_connect_ex(int c_cid, int s_cid, const uint8_t *c_val,
+				     size_t c_val_len, const uint8_t *s_val, size_t s_val_len,
+				     struct net_sockaddr *c_saddr, struct net_sockaddr *s_saddr)
+{
+	struct timeval timeo_optval = { .tv_sec = 1 };
+	int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	struct connect_data test_data;
+	struct net_sockaddr recv_addr;
+	net_socklen_t recv_addrlen = sizeof(recv_addr);
+	uint8_t rx_buf;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct net_sockaddr_in *)c_saddr, NET_IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock,
+			     (struct net_sockaddr_in *)s_saddr, NET_IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	if (c_val_len != 0) {
+		zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_VALUE, c_val,
+					    c_val_len));
+	}
+	if (s_val_len != 0) {
+		zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_VALUE, s_val,
+					    s_val_len));
+	}
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID, &c_cid,
+				    sizeof(c_cid)));
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID, &s_cid,
+				    sizeof(s_cid)));
+	test_bind(c_sock, c_saddr, sizeof(struct net_sockaddr_in));
+	test_bind(s_sock, s_saddr, sizeof(struct net_sockaddr_in));
+
+	test_data.sock = c_sock;
+	test_data.peer_sock = &s_sock;
+	test_data.addr = s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+	test_work_wait(&test_data.work);
+}
+
+static void test_dtls_cid_connect(int c_cid, int s_cid, struct net_sockaddr *c_saddr,
+				  struct net_sockaddr *s_saddr)
+{
+	test_dtls_cid_connect_ex(c_cid, s_cid, NULL, 0, NULL, 0, c_saddr, s_saddr);
+}
+
+static void test_dtls_cid_connect_values(const uint8_t *c_val, size_t c_val_len,
+					 const uint8_t *s_val, size_t s_val_len,
+					 struct net_sockaddr *c_saddr, struct net_sockaddr *s_saddr)
+{
+	test_dtls_cid_connect_ex(ZSOCK_TLS_DTLS_CID_ENABLED, ZSOCK_TLS_DTLS_CID_ENABLED, c_val,
+				 c_val_len, s_val, s_val_len, c_saddr, s_saddr);
+}
+
+static void test_dtls_cid_status(int c_cid, int s_cid, int c_status, int s_status)
+{
+	struct net_sockaddr c_saddr, s_saddr;
+	uint8_t own[32], peer[32];
+	net_socklen_t own_len = sizeof(own);
+	net_socklen_t peer_len = sizeof(peer);
+	net_socklen_t len = sizeof(int);
+	int val;
+
+	if (!TEST_DTLS_CID) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect(c_cid, s_cid, &c_saddr, &s_saddr);
+
+	zassert_ok(zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_STATUS, &val, &len));
+	zassert_equal(val, c_status, "client CID status %d", val);
+	if (s_status >= 0) {
+		zassert_ok(zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_STATUS, &val,
+					    &len));
+		zassert_equal(val, s_status, "server CID status %d", val);
+	}
+
+	/* The server sends the client's own CID, if the client negotiated one */
+	zassert_ok(zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_VALUE, own,
+				    &own_len));
+	zassert_ok(zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_PEER_CID_VALUE, peer,
+				    &peer_len));
+	if (c_cid == ZSOCK_TLS_DTLS_CID_DISABLED) {
+		own_len = 0;
+	}
+	zassert_equal(peer_len, own_len, "peer CID length %d", peer_len);
+	zassert_mem_equal(peer, own, own_len);
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_bidirectional)
+{
+	test_dtls_cid_status(ZSOCK_TLS_DTLS_CID_ENABLED, ZSOCK_TLS_DTLS_CID_ENABLED,
+			     ZSOCK_TLS_DTLS_CID_STATUS_BIDIRECTIONAL,
+			     ZSOCK_TLS_DTLS_CID_STATUS_BIDIRECTIONAL);
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_client_only)
+{
+	test_dtls_cid_status(ZSOCK_TLS_DTLS_CID_ENABLED, ZSOCK_TLS_DTLS_CID_SUPPORTED,
+			     ZSOCK_TLS_DTLS_CID_STATUS_DOWNLINK, ZSOCK_TLS_DTLS_CID_STATUS_UPLINK);
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_server_only)
+{
+	test_dtls_cid_status(ZSOCK_TLS_DTLS_CID_SUPPORTED, ZSOCK_TLS_DTLS_CID_ENABLED,
+			     ZSOCK_TLS_DTLS_CID_STATUS_UPLINK, ZSOCK_TLS_DTLS_CID_STATUS_DOWNLINK);
+}
+
+/* mbedTLS reports the server's own CID even when the client did not negotiate one */
+ZTEST(net_socket_tls, test_dtls_cid_client_disabled)
+{
+	test_dtls_cid_status(ZSOCK_TLS_DTLS_CID_DISABLED, ZSOCK_TLS_DTLS_CID_ENABLED,
+			     ZSOCK_TLS_DTLS_CID_STATUS_DISABLED,
+			     IS_ENABLED(CONFIG_WOLFSSL) ? ZSOCK_TLS_DTLS_CID_STATUS_DISABLED : -1);
+}
+
+static void test_dtls_cid_rebind_exchange(struct net_sockaddr *c_saddr, uint16_t port,
+					  struct net_sockaddr *s_saddr)
+{
+	struct net_sockaddr recv_addr;
+	net_socklen_t recv_addrlen = sizeof(recv_addr);
+	uint8_t tx_buf = 0;
+	uint8_t rx_buf;
+	int ret;
+
+	net_sin(c_saddr)->sin_port = net_htons(port);
+	test_bind(c_sock, c_saddr, sizeof(struct net_sockaddr_in));
+	test_send(c_sock, &tx_buf, sizeof(tx_buf), 0);
+
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+	dtls_verify_address(&recv_addr, recv_addrlen, c_saddr);
+
+	test_sendto(s_sock, &tx_buf, sizeof(tx_buf), 0, c_saddr, sizeof(struct net_sockaddr_in));
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+}
+
+ZTEST(net_socket_tls, test_dtls_server_cid_client_moves_twice)
+{
+	struct net_sockaddr c_saddr, s_saddr, old_saddr;
+	uint8_t tx_buf = 0;
+	int ret;
+
+	if (!TEST_DTLS_CID) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect(ZSOCK_TLS_DTLS_CID_ENABLED, TEST_DTLS_CID_SERVER, &c_saddr,
+			      &s_saddr);
+	old_saddr = c_saddr;
+
+	test_dtls_cid_rebind_exchange(&c_saddr, CLIENT_2_PORT, &s_saddr);
+	test_dtls_cid_rebind_exchange(&c_saddr, CLIENT_3_PORT, &s_saddr);
+	zassert_equal(ztls_get_session_count(), 2, "server allocated a session for a move");
+
+	ret = zsock_sendto(s_sock, &tx_buf, sizeof(tx_buf), 0, &old_saddr,
+			   sizeof(struct net_sockaddr_in));
+	zassert_equal(ret, -1, "session still reachable at the first address");
+	zassert_equal(errno, ENOTCONN, "wrong errno %d", errno);
+}
+
+/* CIDs set through TLS_DTLS_CID_VALUE are the ones each side sends */
+ZTEST(net_socket_tls, test_dtls_cid_explicit_values)
+{
+	static const uint8_t c_cid[] = { 1, 2, 3, 4 };
+	static const uint8_t s_cid[] = { 5, 6, 7, 8, 9 };
+	struct net_sockaddr c_saddr, s_saddr;
+	uint8_t buf[32];
+	net_socklen_t len;
+
+	if (!TEST_DTLS_CID) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect_values(c_cid, sizeof(c_cid), s_cid, sizeof(s_cid), &c_saddr,
+				     &s_saddr);
+
+	len = sizeof(buf);
+	zassert_ok(zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_PEER_CID_VALUE, buf,
+				    &len));
+	zassert_equal(len, sizeof(s_cid), "client sees peer CID length %d", len);
+	zassert_mem_equal(buf, s_cid, sizeof(s_cid));
+
+	len = sizeof(buf);
+	zassert_ok(zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_PEER_CID_VALUE, buf,
+				    &len));
+	zassert_equal(len, sizeof(c_cid), "server sees peer CID length %d", len);
+	zassert_mem_equal(buf, c_cid, sizeof(c_cid));
+
+	len = sizeof(buf);
+	zassert_ok(zsock_getsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_CID_VALUE, buf, &len));
+	zassert_equal(len, sizeof(s_cid), "server CID length %d", len);
+	zassert_mem_equal(buf, s_cid, sizeof(s_cid));
+}
+
+/* A client that moves while a new peer is still in the cookie exchange keeps its session */
+ZTEST(net_socket_tls, test_dtls_server_cid_moves_during_stateless_hello)
+{
+	struct net_sockaddr c_saddr, s_saddr, h_saddr;
+	struct connect_data test_data;
+	int no_peer = -1;
+	struct timeval timeo_optval = { .tv_sec = 2 };
+	uint32_t timeout_min = 100;
+	uint32_t timeout_max = 200;
+	uint8_t hello[512];
+	uint8_t rx_buf;
+	int hello_len;
+	int ret;
+
+	if (!TEST_DTLS_CID || !IS_ENABLED(CONFIG_WOLFSSL)) {
+		ztest_test_skip();
+	}
+
+	/* Capture a ClientHello on a plain UDP socket */
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock,
+			     (struct net_sockaddr_in *)&c_saddr, NET_IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock);
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MIN,
+				    &timeout_min, sizeof(timeout_min)));
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	test_bind(c_sock, &c_saddr, sizeof(struct net_sockaddr_in));
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, (struct net_sockaddr_in *)&s_saddr);
+	test_bind(s_sock, &s_saddr, sizeof(struct net_sockaddr_in));
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	test_data.peer_sock = &no_peer;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_no_assert_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	hello_len = zsock_recv(s_sock, hello, sizeof(hello), 0);
+	zassert_true(hello_len > 0, "no ClientHello captured (%d)", errno);
+	test_work_wait(&test_data.work);
+	test_sockets_close();
+
+	test_dtls_cid_connect(ZSOCK_TLS_DTLS_CID_ENABLED, TEST_DTLS_CID_SERVER, &c_saddr,
+			      &s_saddr);
+
+	/* A new peer's ClientHello leaves the server with a stateless session */
+	prepare_sock_udp_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			    (struct net_sockaddr_in *)&h_saddr);
+	test_bind(c_sock_2, &h_saddr, sizeof(struct net_sockaddr_in));
+	test_sendto(c_sock_2, hello, hello_len, 0, &s_saddr, sizeof(struct net_sockaddr_in));
+	k_msleep(10);
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "ClientHello delivered data");
+	zassert_equal(errno, EAGAIN, "wrong errno %d", errno);
+
+	test_dtls_cid_rebind_exchange(&c_saddr, CLIENT_3_PORT, &s_saddr);
+}
+
+/* A record with the server's CID that does not authenticate must not move the session */
+ZTEST(net_socket_tls, test_dtls_server_cid_forged_record_keeps_peer)
+{
+	struct net_sockaddr c_saddr, s_saddr, f_saddr;
+	/* DTLS 1.2 tls12_cid record, epoch 1; the CID, length and payload follow */
+	uint8_t record[13 + 32 + 32] = { 25, 0xfe, 0xfd, 0x00, 0x01, 0, 0, 0, 0, 0, 0x40 };
+	net_socklen_t cid_len = 32;
+	uint8_t tx_buf = 0;
+	uint8_t rx_buf;
+	int ret;
+
+	if (!TEST_DTLS_CID || !IS_ENABLED(CONFIG_WOLFSSL)) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect(ZSOCK_TLS_DTLS_CID_ENABLED, ZSOCK_TLS_DTLS_CID_ENABLED, &c_saddr,
+			      &s_saddr);
+
+	zassert_ok(zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_PEER_CID_VALUE,
+				    &record[11], &cid_len));
+	zassert_true(cid_len > 0, "server sent no CID");
+	record[12 + cid_len] = 32;
+
+	prepare_sock_udp_v4(MY_IPV4_ADDR, CLIENT_3_PORT, &c_sock_2,
+			    (struct net_sockaddr_in *)&f_saddr);
+	test_bind(c_sock_2, &f_saddr, sizeof(struct net_sockaddr_in));
+	test_sendto(c_sock_2, record, 13 + cid_len + 32, 0, &s_saddr,
+		    sizeof(struct net_sockaddr_in));
+	k_msleep(10);
+
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "forged record delivered data");
+	zassert_equal(errno, EAGAIN, "wrong errno %d", errno);
+
+	ret = zsock_sendto(s_sock, &tx_buf, sizeof(tx_buf), 0, &f_saddr,
+			   sizeof(struct net_sockaddr_in));
+	zassert_equal(ret, -1, "session moved to the forged address");
+	zassert_equal(errno, ENOTCONN, "wrong errno %d", errno);
+
+	test_sendto(s_sock, &tx_buf, sizeof(tx_buf), 0, &c_saddr, sizeof(struct net_sockaddr_in));
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
 }
 
 /* Waits a bounded time for the peer's close_notify, which real targets deliver
