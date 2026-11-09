@@ -48,10 +48,13 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl_cache.h>
 
-#define ZTLS_IS_CLIENT         MBEDTLS_SSL_IS_CLIENT
-#define ZTLS_IS_SERVER         MBEDTLS_SSL_IS_SERVER
-#define ZTLS_ERROR_WANT_READ   MBEDTLS_ERR_SSL_WANT_READ
-#define ZTLS_ERROR_WANT_WRITE  MBEDTLS_ERR_SSL_WANT_WRITE
+#define ZTLS_IS_CLIENT        MBEDTLS_SSL_IS_CLIENT
+#define ZTLS_IS_SERVER        MBEDTLS_SSL_IS_SERVER
+#define ZTLS_ERROR_WANT_READ  MBEDTLS_ERR_SSL_WANT_READ
+#define ZTLS_ERROR_WANT_WRITE MBEDTLS_ERR_SSL_WANT_WRITE
+#define tls_backend_init      tls_mbedtls_init
+#define tls_backend_handshake tls_mbedtls_handshake
+#define tls_backend_reset     tls_mbedtls_reset
 
 #endif /* CONFIG_MBEDTLS */
 
@@ -147,6 +150,9 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #define ZTLS_IS_SERVER        1
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
 #define ZTLS_ERROR_WANT_WRITE WOLFSSL_ERROR_WANT_WRITE
+#define tls_backend_init      tls_wolfssl_init
+#define tls_backend_handshake tls_wolfssl_handshake
+#define tls_backend_reset     tls_wolfssl_reset
 
 /* DTLS retransmission timer range in milliseconds, from RFC 6347 4.2.4.1 */
 #define DTLS_TIMEOUT_DFL_MIN    1000
@@ -2792,8 +2798,8 @@ static int tls_wolfssl_reset(struct tls_context *context)
 	return 0;
 }
 
-static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
-				size_t len, int flags)
+static ssize_t send_tls(struct tls_context *ctx, const void *buf,
+			size_t len, int flags)
 {
 	const bool is_block = is_blocking(ctx->sock, flags);
 	int ret = 0;
@@ -2905,8 +2911,8 @@ static int tls_wolfssl_wait_rx(struct tls_context *ctx, bool is_block, k_timepoi
 	return ret;
 }
 
-static ssize_t recv_tls_wolfssl(struct tls_context *ctx, void *buf,
-				size_t max_len, int flags)
+static ssize_t recv_tls(struct tls_context *ctx, void *buf,
+			size_t max_len, int flags)
 {
 	size_t recv_len = 0;
 	const bool waitall = flags & ZSOCK_MSG_WAITALL;
@@ -3511,7 +3517,8 @@ static int tls_wolfssl_set_ciphersuites(struct tls_context *context)
 		return 0;
 	}
 
-	for (int i = 0; context->options.ciphersuites[i] != 0; i++) {
+	for (int i = 0; i < CONFIG_NET_SOCKETS_TLS_MAX_CIPHERSUITES &&
+			context->options.ciphersuites[i] != 0; i++) {
 		sys_put_be16((uint16_t)context->options.ciphersuites[i], &cs_bytes[cipher_cnt * 2]);
 		cipher_cnt++;
 	}
@@ -4382,8 +4389,8 @@ static int tls_opt_dtls_handshake_timeout_set(struct tls_context *context,
 		context->options.dtls_handshake_timeout_min = *val;
 	}
 
-	/* If mbedTLS context already inited, we need to
-	 * update mbedTLS config for it to take effect
+	/* If the TLS context is already initialized, we need to
+	 * update its config for it to take effect
 	 */
 #if defined(CONFIG_WOLFSSL)
 	if (context->wssl != NULL) {
@@ -5089,8 +5096,7 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 	    || (ctx->type == SOCK_DGRAM && ctx->options.dtls_handshake_on_connect)
 #endif
 	    ) {
-#if defined(CONFIG_WOLFSSL)
-		ret = tls_wolfssl_init(ctx, false);
+		ret = tls_backend_init(ctx, false);
 		if (ret < 0) {
 			goto error;
 		}
@@ -5103,31 +5109,7 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 		/* TODO For simplicity, TLS handshake blocks the socket
 		 * even for non-blocking socket.
 		 */
-		ret = tls_wolfssl_handshake(ctx, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
-		if (ret < 0) {
-			if ((ret == -EAGAIN) && !is_non_block) {
-				ret = -ETIMEDOUT;
-			}
-
-			goto error;
-		}
-
-		tls_session_store(ctx, addr, addrlen);
-#else
-		ret = tls_mbedtls_init(ctx, false);
-		if (ret < 0) {
-			goto error;
-		}
-
-		/* Do not use any socket flags during the handshake. */
-		ctx->flags = 0;
-
-		tls_session_restore(ctx, addr, addrlen);
-
-		/* TODO For simplicity, TLS handshake blocks the socket
-		 * even for non-blocking socket.
-		 */
-		ret = tls_mbedtls_handshake(
+		ret = tls_backend_handshake(
 			ctx, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
 		if (ret < 0) {
 			if ((ret == -EAGAIN) && !is_non_block) {
@@ -5138,7 +5120,6 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 		}
 
 		tls_session_store(ctx, addr, addrlen);
-#endif /* CONFIG_WOLFSSL */
 	}
 
 	return 0;
@@ -5179,33 +5160,15 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 
 	child->sock = sock;
 
-#if defined(CONFIG_WOLFSSL)
-#ifndef SINGLE_THREADED
+#if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
 	/* Without locking, wolfSSL cannot count references across threads */
 	ret = tls_wolfssl_ctx_share(parent, child);
 	if (ret < 0) {
 		goto error;
 	}
-#endif /* !SINGLE_THREADED */
+#endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
 
-	ret = tls_wolfssl_init(child, true);
-	if (ret < 0) {
-		goto error;
-	}
-
-	child->flags = 0;
-
-	/* TODO For simplicity, TLS handshake blocks the socket even for
-	 * non-blocking socket.
-	 */
-	ret = tls_wolfssl_handshake(child, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
-	if (ret < 0) {
-		goto error;
-	}
-
-	return fd;
-#else
-	ret = tls_mbedtls_init(child, true);
+	ret = tls_backend_init(child, true);
 	if (ret < 0) {
 		goto error;
 	}
@@ -5216,14 +5179,13 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 	/* TODO For simplicity, TLS handshake blocks the socket even for
 	 * non-blocking socket.
 	 */
-	ret = tls_mbedtls_handshake(
+	ret = tls_backend_handshake(
 		child, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
 	if (ret < 0) {
 		goto error;
 	}
 
 	return fd;
-#endif /* CONFIG_WOLFSSL */
 
 error:
 	if (child != NULL) {
@@ -5323,82 +5285,7 @@ static ssize_t send_tls(struct tls_context *ctx, const void *buf,
 }
 #endif /* CONFIG_MBEDTLS */
 
-#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-static ssize_t sendto_dtls_client_wolfssl(struct tls_context *ctx,
-					  const void *buf, size_t len,
-					  int flags,
-					  const struct sockaddr *dest_addr,
-					  socklen_t addrlen)
-{
-	int ret;
-
-	if (!dest_addr) {
-		/* No address provided, check if we have stored one,
-		 * otherwise return error.
-		 */
-		if (ctx->dtls_peer_addrlen == 0) {
-			ret = -EDESTADDRREQ;
-			goto error;
-		}
-	} else if (ctx->dtls_peer_addrlen == 0) {
-		/* Address provided and no peer address stored. */
-		dtls_peer_address_set(ctx, dest_addr, addrlen);
-	} else if (!dtls_is_peer_addr_valid(ctx, dest_addr, addrlen)) {
-		/* Address provided but it does not match stored one */
-		ret = -EISCONN;
-		goto error;
-	}
-
-	if (!ctx->is_initialized) {
-		ret = tls_wolfssl_init(ctx, false);
-		if (ret < 0) {
-			goto error;
-		}
-	}
-
-	if (!is_handshake_complete(ctx)) {
-		tls_session_restore(ctx, &ctx->dtls_peer_addr,
-				    ctx->dtls_peer_addrlen);
-
-		ret = tls_wolfssl_handshake(ctx, K_FOREVER);
-		if (ret < 0) {
-			goto error;
-		}
-
-		ctx->error = 0;
-
-		tls_session_store(ctx, &ctx->dtls_peer_addr,
-				  ctx->dtls_peer_addrlen);
-	}
-
-	return send_tls_wolfssl(ctx, buf, len, flags);
-
-error:
-	errno = -ret;
-	return -1;
-}
-
-static ssize_t sendto_dtls_server_wolfssl(struct tls_context *ctx,
-					  const void *buf, size_t len,
-					  int flags,
-					  const struct sockaddr *dest_addr,
-					  socklen_t addrlen)
-{
-	if (!is_handshake_complete(ctx)) {
-		errno = ENOTCONN;
-		return -1;
-	}
-
-	if (dest_addr && !dtls_is_peer_addr_valid(ctx, dest_addr, addrlen)) {
-		errno = EISCONN;
-		return -1;
-	}
-
-	return send_tls_wolfssl(ctx, buf, len, flags);
-}
-#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
-
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_MBEDTLS)
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 				  size_t len, int flags,
 				  const struct sockaddr *dest_addr,
@@ -5424,7 +5311,7 @@ static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 	}
 
 	if (!ctx->is_initialized) {
-		ret = tls_mbedtls_init(ctx, false);
+		ret = tls_backend_init(ctx, false);
 		if (ret < 0) {
 			goto error;
 		}
@@ -5437,10 +5324,10 @@ static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 		/* TODO For simplicity, TLS handshake blocks the socket even for
 		 * non-blocking socket.
 		 * DTLS handshake timeout/retransmissions are limited by
-		 * mbed TLS, so K_FOREVER is fine here, the function will not
+		 * the TLS library, so K_FOREVER is fine here, the function will not
 		 * block indefinitely.
 		 */
-		ret = tls_mbedtls_handshake(ctx, K_FOREVER);
+		ret = tls_backend_handshake(ctx, K_FOREVER);
 		if (ret < 0) {
 			goto error;
 		}
@@ -5490,31 +5377,13 @@ ssize_t ztls_sendto_ctx(struct tls_context *ctx, const void *buf, size_t len,
 	ctx->flags = flags;
 
 	/* TLS */
-#if defined(CONFIG_WOLFSSL)
-	if (ctx->type == SOCK_STREAM) {
-		return send_tls_wolfssl(ctx, buf, len, flags);
-	}
-
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	if (ctx->options.role == ZTLS_IS_SERVER) {
-		return sendto_dtls_server_wolfssl(ctx, buf, len, flags,
-						  dest_addr, addrlen);
-	}
-
-	return sendto_dtls_client_wolfssl(ctx, buf, len, flags,
-					  dest_addr, addrlen);
-#else
-	errno = ENOTSUP;
-	return -1;
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
-#else
 	if (ctx->type == SOCK_STREAM) {
 		return send_tls(ctx, buf, len, flags);
 	}
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* DTLS */
-	if (ctx->options.role == MBEDTLS_SSL_IS_SERVER) {
+	if (ctx->options.role == ZTLS_IS_SERVER) {
 		return sendto_dtls_server(ctx, buf, len, flags,
 					  dest_addr, addrlen);
 	}
@@ -5524,7 +5393,6 @@ ssize_t ztls_sendto_ctx(struct tls_context *ctx, const void *buf, size_t len,
 	errno = ENOTSUP;
 	return -1;
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
-#endif /* CONFIG_WOLFSSL */
 }
 
 static ssize_t dtls_sendmsg_merge_and_send(struct tls_context *ctx,
@@ -5733,10 +5601,10 @@ err:
 #endif /* CONFIG_MBEDTLS */
 
 #if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
-					    size_t max_len, int flags,
-					    struct sockaddr *src_addr,
-					    socklen_t *addrlen)
+static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
+				    size_t max_len, int flags,
+				    struct sockaddr *src_addr,
+				    socklen_t *addrlen)
 {
 	int ret;
 	bool is_block = is_blocking(ctx->sock, flags);
@@ -5843,10 +5711,10 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 	} while (true);
 }
 
-static ssize_t recvfrom_dtls_client_wolfssl(struct tls_context *ctx, void *buf,
-					    size_t max_len, int flags,
-					    struct sockaddr *src_addr,
-					    socklen_t *addrlen)
+static ssize_t recvfrom_dtls_client(struct tls_context *ctx, void *buf,
+				    size_t max_len, int flags,
+				    struct sockaddr *src_addr,
+				    socklen_t *addrlen)
 {
 	int ret;
 
@@ -5855,8 +5723,7 @@ static ssize_t recvfrom_dtls_client_wolfssl(struct tls_context *ctx, void *buf,
 		goto error;
 	}
 
-	ret = recvfrom_dtls_common_wolfssl(ctx, buf, max_len, flags,
-					   src_addr, addrlen);
+	ret = recvfrom_dtls_common(ctx, buf, max_len, flags, src_addr, addrlen);
 	if (ret >= 0) {
 		return ret;
 	}
@@ -5881,10 +5748,10 @@ error:
 	return -1;
 }
 
-static ssize_t recvfrom_dtls_server_wolfssl(struct tls_context *ctx, void *buf,
-					    size_t max_len, int flags,
-					    struct sockaddr *src_addr,
-					    socklen_t *addrlen)
+static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
+				    size_t max_len, int flags,
+				    struct sockaddr *src_addr,
+				    socklen_t *addrlen)
 {
 	int ret;
 	bool repeat;
@@ -5933,8 +5800,8 @@ static ssize_t recvfrom_dtls_server_wolfssl(struct tls_context *ctx, void *buf,
 			ctx->error = 0;
 		}
 
-		ret = recvfrom_dtls_common_wolfssl(ctx, buf, max_len, flags,
-						   src_addr, addrlen);
+		ret = recvfrom_dtls_common(ctx, buf, max_len, flags,
+					   src_addr, addrlen);
 		if (ret >= 0) {
 			return ret;
 		}
@@ -6261,25 +6128,6 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 
 	ctx->flags = flags;
 
-#if defined(CONFIG_WOLFSSL)
-	/* TLS */
-	if (ctx->type == SOCK_STREAM) {
-		return recv_tls_wolfssl(ctx, buf, max_len, flags);
-	}
-
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	if (ctx->options.role == ZTLS_IS_SERVER) {
-		return recvfrom_dtls_server_wolfssl(ctx, buf, max_len, flags,
-						    src_addr, addrlen);
-	}
-
-	return recvfrom_dtls_client_wolfssl(ctx, buf, max_len, flags,
-					    src_addr, addrlen);
-#else
-	errno = ENOTSUP;
-	return -1;
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
-#else
 	/* TLS */
 	if (ctx->type == SOCK_STREAM) {
 		return recv_tls(ctx, buf, max_len, flags);
@@ -6287,7 +6135,7 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* DTLS */
-	if (ctx->options.role == MBEDTLS_SSL_IS_SERVER) {
+	if (ctx->options.role == ZTLS_IS_SERVER) {
 		return recvfrom_dtls_server(ctx, buf, max_len, flags,
 					    src_addr, addrlen);
 	}
@@ -6298,7 +6146,6 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 	errno = ENOTSUP;
 	return -1;
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
-#endif /* CONFIG_WOLFSSL */
 }
 
 static size_t tls_bytes_avail(struct tls_context *ctx)
@@ -6312,7 +6159,7 @@ static size_t tls_bytes_avail(struct tls_context *ctx)
 
 static int ztls_poll_prepare_pollin(struct tls_context *ctx)
 {
-	/* If there already is mbedTLS data to read, there is no
+	/* If there already is TLS data to read, there is no
 	 * need to set the k_poll_event object. Return EALREADY
 	 * so we won't block in the k_poll.
 	 */
@@ -6388,7 +6235,6 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 {
 	int ret;
 
-#if defined(CONFIG_WOLFSSL)
 	if (ctx->type == SOCK_STREAM) {
 		if (!ctx->is_initialized) {
 			return -ENOTCONN;
@@ -6399,20 +6245,20 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 		if (!ctx->is_initialized) {
 			bool is_server = ctx->options.role == ZTLS_IS_SERVER;
 
-			ret = tls_wolfssl_init(ctx, is_server);
+			ret = tls_backend_init(ctx, is_server);
 			if (ret < 0) {
 				return -ENOMEM;
 			}
 		}
 
 		if (!is_handshake_complete(ctx)) {
-			ret = tls_wolfssl_handshake(ctx, K_NO_WAIT);
+			ret = tls_backend_handshake(ctx, K_NO_WAIT);
 			if (ret < 0) {
 				if (ret == -EAGAIN) {
 					return 0;
 				}
 
-				ret = tls_wolfssl_reset(ctx);
+				ret = tls_backend_reset(ctx);
 				if (ret != 0) {
 					return -ENOMEM;
 				}
@@ -6422,6 +6268,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 			/* Socket ready to use again. */
 			ctx->error = 0;
+
 			return 0;
 		}
 	}
@@ -6429,6 +6276,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 	ctx->flags = ZSOCK_MSG_DONTWAIT;
 
+#if defined(CONFIG_WOLFSSL)
 	/* wolfSSL_peek() returns 0 for a clean close and keeps the reason in ssl->error */
 	ret = tls_wolfssl_peek(ctx->wssl);
 	if (ret <= 0) {
@@ -6458,49 +6306,8 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 		return -ECONNABORTED;
 	}
 
-	return wolfSSL_pending(ctx->wssl);
+	return tls_bytes_avail(ctx);
 #else
-	if (ctx->type == SOCK_STREAM) {
-		if (!ctx->is_initialized) {
-			return -ENOTCONN;
-		}
-	}
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	else {
-		if (!ctx->is_initialized) {
-			bool is_server = ctx->options.role == MBEDTLS_SSL_IS_SERVER;
-
-			ret = tls_mbedtls_init(ctx, is_server);
-			if (ret < 0) {
-				return -ENOMEM;
-			}
-		}
-
-		if (!is_handshake_complete(ctx)) {
-			ret = tls_mbedtls_handshake(ctx, K_NO_WAIT);
-			if (ret < 0) {
-				if (ret == -EAGAIN) {
-					return 0;
-				}
-
-				ret = tls_mbedtls_reset(ctx);
-				if (ret != 0) {
-					return -ENOMEM;
-				}
-
-				return 0;
-			}
-
-			/* Socket ready to use again. */
-			ctx->error = 0;
-
-			return 0;
-		}
-	}
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
-
-	ctx->flags = ZSOCK_MSG_DONTWAIT;
-
 	ret = mbedtls_ssl_read(&ctx->ssl, NULL, 0);
 	if (ret < 0) {
 		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
