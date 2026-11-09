@@ -398,6 +398,9 @@ __net_socket struct tls_context {
 	bool cert_verify_ran;
 	bool psk_used;
 
+	/* An accepted chain certificate failed verification; wolfSSL may keep it as a CTX CA */
+	bool chain_error_overridden;
+
 	/* A TCP session kept after a fatal error, which sends no close_notify */
 	bool failed;
 
@@ -2782,8 +2785,26 @@ exit:
 
 #if defined(CONFIG_WOLFSSL)
 
+/* A shared CTX is only unloaded by accept(), which holds the listener's lock */
+static void tls_wolfssl_drop_chain_cas(struct tls_context *context, bool shared_ok)
+{
+	if (!context->chain_error_overridden || context->ctx == NULL ||
+	    (context->ctx_shared && !shared_ok)) {
+		return;
+	}
+
+	if (wolfSSL_CertManagerUnloadIntermediateCerts(wolfSSL_CTX_GetCertManager(context->ctx)) !=
+	    WOLFSSL_SUCCESS) {
+		NET_ERR("Failed to unload the peer's chain CAs");
+		return;
+	}
+
+	context->chain_error_overridden = false;
+}
+
 static void tls_wolfssl_clear_session_state(struct tls_context *context, bool failed)
 {
+	tls_wolfssl_drop_chain_cas(context, false);
 	context->verify_result_flags = 0;
 	context->resumed_verify_result = 0;
 	context->resumed_psk = false;
@@ -3135,6 +3156,11 @@ static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeou
 		}
 	}
 
+	/* A client keeps the chain CAs until its handshake ends, for a stapled OCSP response */
+	if (ret != -EAGAIN) {
+		tls_wolfssl_drop_chain_cas(context, false);
+	}
+
 	if (ret == WOLFSSL_SUCCESS) {
 		ret = 0;
 		k_sem_give(&context->tls_established);
@@ -3421,6 +3447,16 @@ static int tls_wolfssl_verify_record(struct tls_context *context, int preverify_
 	return effective_ok;
 }
 
+static int tls_wolfssl_note_chain_override(struct tls_context *context, int preverify_ok,
+					   WOLFSSL_X509_STORE_CTX *store, int ret)
+{
+	if (ret != 0 && !preverify_ok && store->error_depth > 0) {
+		context->chain_error_overridden = true;
+	}
+
+	return ret;
+}
+
 static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 					     WOLFSSL_X509_STORE_CTX *store)
 {
@@ -3442,7 +3478,7 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 				 "read TLS_CERT_VERIFY_RESULT before trusting the peer",
 				 context->verify_result_flags);
 		}
-		return 1;
+		return tls_wolfssl_note_chain_override(context, preverify_ok, store, 1);
 	}
 
 	return effective_ok;
@@ -3475,7 +3511,7 @@ static int tls_wolfssl_verify_cb_wrapper(int preverify_ok,
 	ret = user_cb(effective_ok, store);
 	store->userCtx = context;
 
-	return ret;
+	return tls_wolfssl_note_chain_override(context, preverify_ok, store, ret);
 }
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
 
@@ -4016,6 +4052,19 @@ err_cleanup:
 static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context *child)
 {
 	int ret;
+
+#if defined(HAVE_SECURE_RENEGOTIATION)
+	/* Renegotiation verifies chains outside accept(), where a shared CTX is unloaded */
+	if (parent->options.verify_level == TLS_PEER_VERIFY_OPTIONAL) {
+		return 0;
+	}
+
+#if defined(CONFIG_WOLFSSL_VERIFY_CALLBACK)
+	if (parent->options.cert_verify_wolfssl.cb != NULL) {
+		return 0;
+	}
+#endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
+#endif /* HAVE_SECURE_RENEGOTIATION */
 
 	/* A credential added or deleted since then must reach this connection */
 	if (parent->ctx != NULL && parent->ctx_cred_gen != credentials_generation()) {
@@ -5088,6 +5137,14 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 	int sock_flags;
 	bool is_non_block;
 
+#if defined(CONFIG_WOLFSSL)
+	/* An accepted socket runs handshakes on its listener's CTX only from accept() */
+	if (ctx->ctx_shared) {
+		errno = EISCONN;
+		return -1;
+	}
+#endif /* CONFIG_WOLFSSL */
+
 	sock_flags = zsock_fcntl(ctx->sock, F_GETFL, 0);
 	if (sock_flags < 0) {
 		return -EIO;
@@ -5204,6 +5261,9 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 	 */
 	ret = tls_backend_handshake(
 		child, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
+#if defined(CONFIG_WOLFSSL)
+	tls_wolfssl_drop_chain_cas(child, true);
+#endif /* CONFIG_WOLFSSL */
 	if (ret < 0) {
 		goto error;
 	}

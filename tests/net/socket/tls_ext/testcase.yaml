@@ -59,6 +59,18 @@ tests:
       - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING=y
       - CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE=y
       - CONFIG_ZTEST_VERIFY_RUN_ALL=n
+  net.socket.tls.ext.wolfssl.dtls:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_NET_UDP=y
+      - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
+      - CONFIG_NET_LOOPBACK_MTU=1500
+      - CONFIG_WOLFSSL_DTLS=y
   net.socket.tls.ext.wolfssl.verify_cb:
     platform_allow:
       - native_sim

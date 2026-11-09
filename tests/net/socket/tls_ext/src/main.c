@@ -83,6 +83,10 @@ enum tls_tag {
 	CLIENT_AUTH_TAG,
 	/** The PSK of the REQUIRED client resumption test */
 	EXT_PSK_TAG,
+	/** The clients of the untrusted chain CA tests and their shared key */
+	CHAIN_A_TAG,
+	CHAIN_B_TAG,
+	CHAIN_KEY_TAG,
 };
 
 /** @brief synchronization object for server & client threads */
@@ -162,6 +166,22 @@ static const unsigned char ocsp_good[] = {
 #include "ocsp_good.inc"
 };
 #endif
+
+#if defined(CONFIG_WOLFSSL)
+/* Client A's leaf and the untrusted self-signed CA that issued it */
+static const unsigned char chain_client_a[] = {
+#include "client_a_chain.inc"
+};
+
+/* Client B's leaf, issued by the same untrusted CA */
+static const unsigned char chain_client_b[] = {
+#include "client_b.inc"
+};
+
+static const unsigned char chain_client_key[] = {
+#include "client_key.inc"
+};
+#endif /* CONFIG_WOLFSSL */
 #else /* CONFIG_TLS_CREDENTIALS */
 #define ca NULL
 #define server NULL
@@ -928,6 +948,237 @@ ZTEST(net_socket_tls_api_extension, test_tls_required_psk_skips_unverified_sessi
 	}
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
+static int accepted_connect_ret;
+static int accepted_connect_errno;
+
+static void server_thread_connect_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	struct sockaddr_in sa = {
+		.sin_family = AF_INET,
+		.sin_port = htons(PORT),
+	};
+	char buf[16];
+	int client_fd;
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	client_fd = zsock_accept(server_fd, NULL, NULL);
+	zassert_not_equal(client_fd, -1, "accept() failed (%d)", errno);
+
+	(void)zsock_inet_pton(AF_INET, MY_IPV4_ADDR, &sa.sin_addr);
+	accepted_connect_ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	accepted_connect_errno = errno;
+
+	r = zsock_recv(client_fd, buf, sizeof(buf), 0);
+	zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	(void)zsock_close(client_fd);
+}
+#endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
+
+/* wolfSSL-only: connect() on an accepted socket fails and leaves its session working */
+ZTEST(net_socket_tls_api_extension, test_tls_connect_on_accepted_socket)
+{
+#if !defined(CONFIG_WOLFSSL) || defined(SINGLE_THREADED)
+	ztest_test_skip();
+#else
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd, r;
+
+	accepted_connect_ret = 0;
+	accepted_connect_errno = 0;
+
+	server_fd = test_configure_server_ex(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					     false, false, NULL, 0, false,
+					     server_thread_connect_fn);
+	client_fd = test_configure_client(&sa, false, "localhost");
+
+	r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+
+	zassert_equal(accepted_connect_ret, -1, "connect() on an accepted socket succeeded");
+	zassert_equal(accepted_connect_errno, EISCONN, "errno %d", accepted_connect_errno);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_TLS_CREDENTIALS)
+static const sec_tag_t chain_ca_client_tags[][3] = {
+	{ CA_CERTIFICATE_TAG, CHAIN_A_TAG, CHAIN_KEY_TAG },
+	{ CA_CERTIFICATE_TAG, CHAIN_B_TAG, CHAIN_KEY_TAG },
+};
+
+static void chain_ca_add_credentials(void)
+{
+	zassert_ok(tls_credential_add(CHAIN_A_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      chain_client_a, sizeof(chain_client_a)));
+	zassert_ok(tls_credential_add(CHAIN_B_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      chain_client_b, sizeof(chain_client_b)));
+	zassert_ok(tls_credential_add(CHAIN_KEY_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      chain_client_key, sizeof(chain_client_key)));
+}
+
+/* Client A sends its CA in its chain, then client B presents a leaf that CA signed */
+static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len)
+{
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd = -1, r;
+
+	chain_ca_add_credentials();
+
+	server_fd = test_configure_server_ex(&server_thread_id, peer_verify,
+					     ARRAY_SIZE(resumed_verify_result), false, NULL, 0,
+					     false, server_thread_resume_fn);
+	if (cb != NULL) {
+		r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CERT_VERIFY_CALLBACK_WOLFSSL, cb,
+				     cb_len);
+		zassert_ok(r, "failed to set the verify callback (%d)", errno);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(chain_ca_client_tags); i++) {
+		if (client_fd >= 0) {
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		}
+
+		client_fd = test_configure_client(&sa, false, "localhost");
+		r = zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST,
+				     chain_ca_client_tags[i], sizeof(chain_ca_client_tags[i]));
+		zassert_ok(r, "failed to set TLS_SEC_TAG_LIST (%d)", errno);
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+
+	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
+		      "client A: verify result 0x%x", resumed_verify_result[0]);
+	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
+		      "client B: verify result 0x%x", resumed_verify_result[1]);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_TLS_CREDENTIALS */
+
+/* wolfSSL-only: a CA that failed verification under OPTIONAL is not trusted afterwards */
+ZTEST(net_socket_tls_api_extension, test_tls_optional_chain_ca_not_learned)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS)
+	ztest_test_skip();
+#else
+	chain_ca_tcp_common(TLS_PEER_VERIFY_OPTIONAL, NULL, 0);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_TLS_CREDENTIALS) && \
+	defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Reads the verify result after the first record of each client */
+static void server_thread_dtls_verify_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	socklen_t optlen;
+	char buf[16];
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+		r = zsock_recv(server_fd, buf, sizeof(buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+
+		optlen = sizeof(resumed_verify_result[i]);
+		r = zsock_getsockopt(server_fd, SOL_TLS, TLS_CERT_VERIFY_RESULT,
+				     &resumed_verify_result[i], &optlen);
+		zassert_ok(r, "getsockopt failed (%d)", errno);
+	}
+}
+#endif
+
+/* wolfSSL-only: a DTLS server keeps its CTX for the next peer, which must not trust A's CA */
+ZTEST(net_socket_tls_api_extension, test_dtls_optional_chain_ca_not_learned)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS) || \
+	!defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	static const sec_tag_t server_tags[] = { CA_CERTIFICATE_TAG, SERVER_CERTIFICATE_TAG };
+	const int peer_verify = TLS_PEER_VERIFY_OPTIONAL;
+	const int role = TLS_DTLS_ROLE_SERVER;
+	const struct timeval timeo = { .tv_sec = 5 };
+	struct sockaddr_in sa;
+	int server_fd, client_fd, r;
+
+	chain_ca_add_credentials();
+	k_sem_init(&server_sem, 0, 1);
+
+	server_fd = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_DTLS_1_2);
+	zassert_not_equal(server_fd, -1, "failed to create server socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(server_fd, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(server_fd, SOL_TLS, TLS_PEER_VERIFY, &peer_verify,
+				    sizeof(peer_verify)));
+	zassert_ok(zsock_setsockopt(server_fd, SOL_TLS, TLS_SEC_TAG_LIST, server_tags,
+				    sizeof(server_tags)));
+	zassert_ok(zsock_setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &timeo, sizeof(timeo)));
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(PORT);
+	zassert_equal(zsock_inet_pton(AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+	zassert_ok(zsock_bind(server_fd, (struct sockaddr *)&sa, sizeof(sa)),
+		   "failed to bind (%d)", errno);
+
+	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_verify_fn,
+			INT_TO_POINTER(server_fd), NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	/* The server serves one peer at a time, so A's close_notify lets B in */
+	for (int i = 0; i < ARRAY_SIZE(chain_ca_client_tags); i++) {
+		client_fd = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_DTLS_1_2);
+		zassert_not_equal(client_fd, -1, "failed to create client socket (%d)", errno);
+		zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST,
+					    chain_ca_client_tags[i],
+					    sizeof(chain_ca_client_tags[i])));
+		zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, "localhost",
+					    sizeof("localhost")));
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		zassert_ok(r, "failed to connect (%d)", errno);
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	}
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+
+	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
+		      "client A: verify result 0x%x", resumed_verify_result[0]);
+	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
+		      "client B: verify result 0x%x", resumed_verify_result[1]);
 #endif
 }
 
@@ -1934,6 +2185,18 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 	k_yield();
 }
 
+/* A verify callback that accepts a failed chain CA does not make it trusted afterwards */
+ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_chain_ca_not_learned)
+{
+	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
+	const struct tls_cert_verify_cb_wolfssl cb = {
+		.cb = wolfssl_verify_cb,
+		.ctx = &accept_ctx,
+	};
+
+	chain_ca_tcp_common(TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb));
+}
+
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
 
 #if defined(CONFIG_WOLFSSL)
@@ -2151,6 +2414,9 @@ static void tls_ext_after(void *fixture)
 	(void)tls_credential_delete(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
 	(void)tls_credential_delete(EXT_PSK_TAG, TLS_CREDENTIAL_PSK);
 	(void)tls_credential_delete(EXT_PSK_TAG, TLS_CREDENTIAL_PSK_ID);
+	(void)tls_credential_delete(CHAIN_A_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	(void)tls_credential_delete(CHAIN_B_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	(void)tls_credential_delete(CHAIN_KEY_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
 }
 
 ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE,
