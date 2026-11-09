@@ -153,6 +153,12 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #define ZTLS_WOLFSSL_MAX_FRAGMENT
 #endif
 
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(WOLFSSL_DTLS_CID)
+#define ZTLS_WOLFSSL_DTLS_CID
+/* Size of the CID the socket options keep; wolfSSL may allow fewer bytes */
+#define ZTLS_WOLFSSL_CID_LEN_MAX 32
+#endif
+
 #define ZTLS_IS_CLIENT        0
 #define ZTLS_IS_SERVER        1
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
@@ -178,6 +184,14 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #else
 #define DTLS_SENDMSG_BUF_SIZE 0
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#define DTLS_CID_OUT_LEN_MAX MBEDTLS_SSL_CID_OUT_LEN_MAX
+#define DTLS_CID_IN_LEN_MAX MBEDTLS_SSL_CID_IN_LEN_MAX
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+#define DTLS_CID_OUT_LEN_MAX MIN(wolfSSL_dtls_cid_max_size(), ZTLS_WOLFSSL_CID_LEN_MAX)
+#define DTLS_CID_IN_LEN_MAX DTLS_CID_OUT_LEN_MAX
+#endif
 
 static const struct socket_op_vtable tls_sock_fd_op_vtable;
 
@@ -225,14 +239,19 @@ struct tls_session_cache {
 	size_t session_len;
 };
 
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_MBEDTLS)
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && \
+	(defined(CONFIG_MBEDTLS) || defined(ZTLS_WOLFSSL_DTLS_CID))
 struct tls_dtls_cid {
 	bool enabled;
+#if defined(CONFIG_MBEDTLS)
 	unsigned char cid[MAX(MBEDTLS_SSL_CID_OUT_LEN_MAX,
 			      MBEDTLS_SSL_CID_IN_LEN_MAX)];
+#else
+	unsigned char cid[ZTLS_WOLFSSL_CID_LEN_MAX];
+#endif
 	size_t cid_len;
 };
-#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && CONFIG_MBEDTLS */
+#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && (CONFIG_MBEDTLS || ZTLS_WOLFSSL_DTLS_CID) */
 
 /** TLS context information. */
 __net_socket struct tls_context {
@@ -330,7 +349,7 @@ __net_socket struct tls_context {
 		uint32_t dtls_handshake_timeout_min;
 		uint32_t dtls_handshake_timeout_max;
 
-#if defined(CONFIG_MBEDTLS)
+#if defined(CONFIG_MBEDTLS) || defined(ZTLS_WOLFSSL_DTLS_CID)
 		struct tls_dtls_cid dtls_cid;
 #endif
 
@@ -3833,6 +3852,16 @@ static int tls_wolfssl_set_options(struct tls_context *context)
 	}
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+	if (context->type == SOCK_DGRAM && context->options.dtls_cid.enabled &&
+	    (wolfSSL_dtls_cid_use(context->wssl) != WOLFSSL_SUCCESS ||
+	     wolfSSL_dtls_cid_set(context->wssl, context->options.dtls_cid.cid,
+				  (unsigned int)context->options.dtls_cid.cid_len) !=
+		     WOLFSSL_SUCCESS)) {
+		return -EINVAL;
+	}
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
+
 	return 0;
 }
 
@@ -4628,7 +4657,7 @@ static int tls_opt_dtls_handshake_timeout_set(struct tls_context *context,
 static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 					  const void *optval, socklen_t optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
 	int value;
 
 	if (optlen > 0 && optval == NULL) {
@@ -4656,12 +4685,12 @@ static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 			/* generate random self cid */
 #if defined(CONFIG_CSPRNG_ENABLED)
 			sys_csrand_get(context->options.dtls_cid.cid,
-				       MBEDTLS_SSL_CID_OUT_LEN_MAX);
+				       DTLS_CID_OUT_LEN_MAX);
 #else
 			sys_rand_get(context->options.dtls_cid.cid,
-				     MBEDTLS_SSL_CID_OUT_LEN_MAX);
+				     DTLS_CID_OUT_LEN_MAX);
 #endif
-			context->options.dtls_cid.cid_len = MBEDTLS_SSL_CID_OUT_LEN_MAX;
+			context->options.dtls_cid.cid_len = DTLS_CID_OUT_LEN_MAX;
 		}
 		break;
 	default:
@@ -4671,19 +4700,19 @@ static int tls_opt_dtls_connection_id_set(struct tls_context *context,
 	return 0;
 #else
 	return -ENOPROTOOPT;
-#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID */
+#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID || ZTLS_WOLFSSL_DTLS_CID */
 }
 
 static int tls_opt_dtls_connection_id_value_set(struct tls_context *context,
 						const void *optval,
 						socklen_t optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
 	if (optlen > 0 && optval == NULL) {
 		return -EINVAL;
 	}
 
-	if (optlen > MBEDTLS_SSL_CID_IN_LEN_MAX) {
+	if (optlen > DTLS_CID_IN_LEN_MAX) {
 		return -EINVAL;
 	}
 
@@ -4693,13 +4722,13 @@ static int tls_opt_dtls_connection_id_value_set(struct tls_context *context,
 	return 0;
 #else
 	return -ENOPROTOOPT;
-#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID */
+#endif /* CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID || ZTLS_WOLFSSL_DTLS_CID */
 }
 
 static int tls_opt_dtls_connection_id_value_get(struct tls_context *context,
 						void *optval, socklen_t *optlen)
 {
-#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) || defined(ZTLS_WOLFSSL_DTLS_CID)
 
 	if (*optlen < context->options.dtls_cid.cid_len) {
 		return -EINVAL;
@@ -4738,6 +4767,33 @@ static int tls_opt_dtls_peer_connection_id_value_get(struct tls_context *context
 		*optlen = 0;
 	}
 	return ret;
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+	unsigned int cid_len = 0;
+
+	if (!context->is_initialized || context->wssl == NULL) {
+		return -ENOTCONN;
+	}
+
+	if (!wolfSSL_is_init_finished(context->wssl)) {
+		return -EAGAIN;
+	}
+
+	if (wolfSSL_dtls_cid_is_enabled(context->wssl) &&
+	    wolfSSL_dtls_cid_get_tx_size(context->wssl, &cid_len) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+
+	if (*optlen < cid_len) {
+		return -EINVAL;
+	}
+
+	if (cid_len > 0 &&
+	    wolfSSL_dtls_cid_get_tx(context->wssl, optval, *optlen) != WOLFSSL_SUCCESS) {
+		return -EINVAL;
+	}
+
+	*optlen = cid_len;
+	return 0;
 #else
 	return -ENOPROTOOPT;
 #endif
@@ -4781,6 +4837,41 @@ static int tls_opt_dtls_connection_id_status_get(struct tls_context *context,
 	} else if (have_self_cid) {
 		val = TLS_DTLS_CID_STATUS_DOWNLINK;
 	} else if (have_peer_cid) {
+		val = TLS_DTLS_CID_STATUS_UPLINK;
+	} else {
+		val = TLS_DTLS_CID_STATUS_DISABLED;
+	}
+
+	*((int *)optval) = val;
+	return 0;
+#elif defined(ZTLS_WOLFSSL_DTLS_CID)
+	unsigned int self_len = 0;
+	unsigned int peer_len = 0;
+	int val;
+
+	if (sizeof(int) != *optlen) {
+		return -EINVAL;
+	}
+
+	if (!context->is_initialized || context->wssl == NULL) {
+		return -ENOTCONN;
+	}
+
+	if (!wolfSSL_is_init_finished(context->wssl)) {
+		return -EAGAIN;
+	}
+
+	/* wolfSSL drops the CID state when the peer did not negotiate it */
+	if (context->options.dtls_cid.enabled && wolfSSL_dtls_cid_is_enabled(context->wssl)) {
+		(void)wolfSSL_dtls_cid_get_rx_size(context->wssl, &self_len);
+		(void)wolfSSL_dtls_cid_get_tx_size(context->wssl, &peer_len);
+	}
+
+	if (self_len != 0 && peer_len != 0) {
+		val = TLS_DTLS_CID_STATUS_BIDIRECTIONAL;
+	} else if (self_len != 0) {
+		val = TLS_DTLS_CID_STATUS_DOWNLINK;
+	} else if (peer_len != 0) {
 		val = TLS_DTLS_CID_STATUS_UPLINK;
 	} else {
 		val = TLS_DTLS_CID_STATUS_DISABLED;

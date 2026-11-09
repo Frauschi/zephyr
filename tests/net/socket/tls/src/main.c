@@ -4096,4 +4096,126 @@ ZTEST(net_socket_tls, test_tls_psk_identity_max_len)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+#if defined(CONFIG_WOLFSSL) && defined(WOLFSSL_DTLS_CID)
+#define TEST_DTLS_CID true
+#else
+#define TEST_DTLS_CID IS_ENABLED(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
+#endif
+
+static void test_dtls_cid_connect(int c_cid, int s_cid, const uint8_t *c_val, size_t c_val_len,
+				  const uint8_t *s_val, size_t s_val_len)
+{
+	struct sockaddr c_saddr, s_saddr;
+	struct connect_data test_data;
+	int role = TLS_DTLS_ROLE_SERVER;
+	uint8_t rx_buf;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, (struct sockaddr_in *)&c_saddr,
+			     IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, ANY_PORT, &s_sock, (struct sockaddr_in *)&s_saddr,
+			     IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	if (c_val_len != 0) {
+		zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_CID_VALUE, c_val, c_val_len));
+	}
+	if (s_val_len != 0) {
+		zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_CID_VALUE, s_val, s_val_len));
+	}
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_CID, &c_cid, sizeof(c_cid)));
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_CID, &s_cid, sizeof(s_cid)));
+	test_bind(s_sock, &s_saddr, sizeof(struct sockaddr_in));
+
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	zassert_equal(zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0), sizeof(rx_buf),
+		      "recv() failed (%d)", errno);
+	test_work_wait(&test_data.work);
+}
+
+static void test_dtls_cid_status(int c_cid, int s_cid, int c_status, int s_status)
+{
+	uint8_t own[32], peer[32];
+	socklen_t own_len = sizeof(own);
+	socklen_t peer_len = sizeof(peer);
+	socklen_t len = sizeof(int);
+	int val;
+
+	if (!TEST_DTLS_CID) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect(c_cid, s_cid, NULL, 0, NULL, 0);
+
+	zassert_ok(zsock_getsockopt(c_sock, SOL_TLS, TLS_DTLS_CID_STATUS, &val, &len));
+	zassert_equal(val, c_status, "client CID status %d", val);
+	if (s_status >= 0) {
+		zassert_ok(zsock_getsockopt(s_sock, SOL_TLS, TLS_DTLS_CID_STATUS, &val, &len));
+		zassert_equal(val, s_status, "server CID status %d", val);
+	}
+
+	/* The server sends the client's own CID, if the client negotiated one */
+	zassert_ok(zsock_getsockopt(c_sock, SOL_TLS, TLS_DTLS_CID_VALUE, own, &own_len));
+	zassert_ok(zsock_getsockopt(s_sock, SOL_TLS, TLS_DTLS_PEER_CID_VALUE, peer, &peer_len));
+	if (c_cid == TLS_DTLS_CID_DISABLED) {
+		own_len = 0;
+	}
+	zassert_equal(peer_len, own_len, "peer CID length %d", peer_len);
+	zassert_mem_equal(peer, own, own_len);
+}
+
+/* CIDs set through TLS_DTLS_CID_VALUE are the ones each side sends */
+ZTEST(net_socket_tls, test_dtls_cid_explicit_values)
+{
+	static const uint8_t c_cid[] = { 1, 2, 3, 4 };
+	static const uint8_t s_cid[] = { 5, 6, 7, 8, 9 };
+	uint8_t buf[32];
+	socklen_t len;
+
+	if (!TEST_DTLS_CID) {
+		ztest_test_skip();
+	}
+
+	test_dtls_cid_connect(TLS_DTLS_CID_ENABLED, TLS_DTLS_CID_ENABLED, c_cid, sizeof(c_cid),
+			      s_cid, sizeof(s_cid));
+
+	len = sizeof(buf);
+	zassert_ok(zsock_getsockopt(c_sock, SOL_TLS, TLS_DTLS_PEER_CID_VALUE, buf, &len));
+	zassert_equal(len, sizeof(s_cid), "client sees peer CID length %d", len);
+	zassert_mem_equal(buf, s_cid, sizeof(s_cid));
+
+	len = sizeof(buf);
+	zassert_ok(zsock_getsockopt(s_sock, SOL_TLS, TLS_DTLS_PEER_CID_VALUE, buf, &len));
+	zassert_equal(len, sizeof(c_cid), "server sees peer CID length %d", len);
+	zassert_mem_equal(buf, c_cid, sizeof(c_cid));
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_bidirectional)
+{
+	test_dtls_cid_status(TLS_DTLS_CID_ENABLED, TLS_DTLS_CID_ENABLED,
+			     TLS_DTLS_CID_STATUS_BIDIRECTIONAL, TLS_DTLS_CID_STATUS_BIDIRECTIONAL);
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_client_only)
+{
+	test_dtls_cid_status(TLS_DTLS_CID_ENABLED, TLS_DTLS_CID_SUPPORTED,
+			     TLS_DTLS_CID_STATUS_DOWNLINK, TLS_DTLS_CID_STATUS_UPLINK);
+}
+
+ZTEST(net_socket_tls, test_dtls_cid_status_server_only)
+{
+	test_dtls_cid_status(TLS_DTLS_CID_SUPPORTED, TLS_DTLS_CID_ENABLED,
+			     TLS_DTLS_CID_STATUS_UPLINK, TLS_DTLS_CID_STATUS_DOWNLINK);
+}
+
+/* mbedTLS reports the server's own CID even when the client did not negotiate one */
+ZTEST(net_socket_tls, test_dtls_cid_client_disabled)
+{
+	test_dtls_cid_status(TLS_DTLS_CID_DISABLED, TLS_DTLS_CID_ENABLED,
+			     TLS_DTLS_CID_STATUS_DISABLED,
+			     IS_ENABLED(CONFIG_WOLFSSL) ? TLS_DTLS_CID_STATUS_DISABLED : -1);
+}
+
 ZTEST_SUITE(net_socket_tls, NULL, tls_tests_setup, NULL, tls_tests_after, NULL);
