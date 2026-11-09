@@ -406,8 +406,9 @@ config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	  for its certificate, so revocation is checked without contacting an
 	  OCSP responder. Under TLS_PEER_VERIFY_REQUIRED a revoked or invalid
 	  response fails the handshake; under OPTIONAL and NONE the handshake
-	  continues and TLS_CERT_VERIFY_RESULT reports it. Server sockets are
-	  not affected.
+	  continues and TLS_CERT_VERIFY_RESULT reports it, as
+	  MBEDTLS_X509_BADCERT_REVOKED for a revoked certificate. Server
+	  sockets are not affected.
 
 	  An OCSP response carries its own validity dates, so a target without
 	  a trusted clock needs CONFIG_WOLFSSL_NO_ASN_TIME_CHECK, which also
@@ -435,7 +436,8 @@ config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 
 	  The callback decides whether the handshake proceeds, and
 	  TLS_CERT_VERIFY_RESULT still reports the MBEDTLS_X509_BADCERT_*
-	  flags of chain errors seen during verification.
+	  flags of chain errors seen during verification. It can be enabled
+	  together with NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK.
 
 config NET_SOCKETS_OFFLOAD
 	bool "Offload Socket APIs"
