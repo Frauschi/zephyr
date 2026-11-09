@@ -45,6 +45,13 @@ if(${CONFIG_TLS_CREDENTIALS})
         ${gen_dir}/${f}.inc)
     endforeach()
   endif()
+
+  if(CONFIG_WOLFSSL)
+    foreach(f client_a_chain client_b client_key)
+      generate_inc_file_for_target(app ${CMAKE_CURRENT_SOURCE_DIR}/src/chain_ca/${f}.der
+        ${gen_dir}/${f}.inc)
+    endforeach()
+  endif()
 endif()
 
 FILE(GLOB app_sources src/*.c)
