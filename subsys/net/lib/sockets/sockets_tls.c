@@ -63,22 +63,6 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #endif
 
 #if defined(CONFIG_WOLFSSL)
-/* wolfSSL's settings.h maps these names to zsock_*, which would rename the vtable members below */
-#undef socket
-#undef bind
-#undef connect
-#undef listen
-#undef accept
-#undef send
-#undef recv
-#undef sendto
-#undef recvfrom
-#undef setsockopt
-#undef getsockopt
-#undef shutdown
-#undef getpeername
-#undef getsockname
-
 #ifndef WOLFSSL_USER_SETTINGS
 #include <user_settings.h>
 #endif /* !WOLFSSL_USER_SETTINGS */
@@ -89,6 +73,7 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <wolfssl/wolfcrypt/memory.h>
 #include <zephyr/net/tls_verify.h>
 
+/* wolfSSL's settings.h maps these names to zsock_*, which would rename the vtable members below */
 #undef socket
 #undef bind
 #undef connect
@@ -117,7 +102,6 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
        "CONFIG_WOLFSSL_DTLS"
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && !WOLFSSL_DTLS */
 
-/* WOLFCRYPT_ONLY compiles the wolfSSL TLS layer out, so nothing below would link */
 #if defined(WOLFCRYPT_ONLY)
 #error "Zephyr TLS sockets need the wolfSSL TLS layer: drop WOLFCRYPT_ONLY " \
        "from CONFIG_WOLFSSL_SETTINGS_FILE, or leave that unset and disable " \
@@ -159,11 +143,7 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #define ZTLS_ERROR_WANT_READ  WOLFSSL_ERROR_WANT_READ
 #define ZTLS_ERROR_WANT_WRITE WOLFSSL_ERROR_WANT_WRITE
 
-/* DTLS default timeout values, copied from mbedtls to replicate existing default behavior */
-/*
- * Default range for DTLS retransmission timer value, in milliseconds.
- * RFC 6347 4.2.4.1 says from 1 second to 60 seconds.
- */
+/* DTLS retransmission timer range in milliseconds, from RFC 6347 4.2.4.1 */
 #define DTLS_TIMEOUT_DFL_MIN    1000
 #define DTLS_TIMEOUT_DFL_MAX   60000
 #endif /* CONFIG_WOLFSSL */
@@ -260,7 +240,7 @@ struct tls_dtls_cid {
 	unsigned char cid[ZTLS_WOLFSSL_CID_LEN_MAX];
 #endif
 	size_t cid_len;
-	/* Set through TLS_DTLS_CID_VALUE rather than generated */
+	/* The CID came from TLS_DTLS_CID_VALUE */
 	bool cid_from_value;
 };
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS && (CONFIG_MBEDTLS || ZTLS_WOLFSSL_DTLS_CID) */
@@ -366,7 +346,7 @@ __net_socket struct tls_context {
 	bool is_listening : 1;
 
 #if defined(CONFIG_WOLFSSL)
-	/** The read side was shut down; unlike session_closed, send() still works. */
+	/** The read side was shut down; send() still works. */
 	bool recv_eof : 1;
 
 	/* TLS_HOSTNAME on a server socket warns once per socket */
@@ -569,8 +549,7 @@ static struct k_mutex context_lock;
 static int tls_release(struct tls_context *tls);
 #if defined(CONFIG_MBEDTLS)
 static int tls_mbedtls_reset_session(struct tls_context *context);
-#endif
-#if defined(CONFIG_WOLFSSL)
+#elif defined(CONFIG_WOLFSSL)
 static int tls_wolfssl_reset_session(struct tls_context *context);
 static word32 tls_der_chain_len(const byte *der, word32 der_len);
 #endif
@@ -596,7 +575,6 @@ static void tls_session_cache_reset(void)
 	k_mutex_lock(&session_cache_lock, K_FOREVER);
 	for (int i = 0; i < ARRAY_SIZE(client_cache); i++) {
 		if (client_cache[i].session != NULL) {
-			/* The serialized session holds the resumption secret */
 			wc_ForceZero(client_cache[i].session,
 				     client_cache[i].session_len);
 			XFREE(client_cache[i].session, NULL,
@@ -798,10 +776,8 @@ static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_soc
 
 	mbedtls_ssl_conf_max_frag_len(config, mfl_code);
 }
-#else
-#if defined(CONFIG_MBEDTLS)
+#elif defined(CONFIG_MBEDTLS)
 static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_sock_type type) {}
-#endif
 #endif
 
 static struct tls_session_context *tls_session_alloc(void)
@@ -819,7 +795,6 @@ static struct tls_session_context *tls_session_alloc(void)
 #if defined(CONFIG_MBEDTLS)
 	mbedtls_ssl_init(&session_ctx->ssl);
 #endif
-	/* wssl is created in tls_wolfssl_session_init, once the WOLFSSL_CTX exists */
 
 	return session_ctx;
 }
@@ -828,8 +803,7 @@ static void tls_session_free(struct tls_session_context *session_ctx)
 {
 #if defined(CONFIG_MBEDTLS)
 	mbedtls_ssl_free(&session_ctx->ssl);
-#endif
-#if defined(CONFIG_WOLFSSL)
+#elif defined(CONFIG_WOLFSSL)
 	if (session_ctx->wssl != NULL) {
 		/* wolfSSL_shutdown before the handshake completes can corrupt global state */
 		if (wolfSSL_is_init_finished(session_ctx->wssl) && !session_ctx->failed &&
@@ -938,19 +912,6 @@ static struct tls_context *tls_clone(struct tls_context *source_tls)
 	       sizeof(target_tls->options));
 
 #if defined(CONFIG_WOLFSSL)
-	if (target_tls->options.is_hostname_set && source_tls->host_name) {
-		target_tls->host_name = XMALLOC(source_tls->host_len + 1,
-						NULL, DYNAMIC_TYPE_TMP_BUFFER);
-		if (target_tls->host_name == NULL) {
-			tls_release(target_tls);
-			return NULL;
-		}
-
-		XMEMCPY(target_tls->host_name, source_tls->host_name,
-			 source_tls->host_len + 1);
-		target_tls->host_len = source_tls->host_len;
-	}
-
 #if defined(HAVE_ALPN)
 	if (source_tls->alpn_joined != NULL) {
 		size_t len = XSTRLEN(source_tls->alpn_joined) + 1;
@@ -1281,10 +1242,8 @@ static void tls_session_purge(void)
 	mbedtls_ssl_cache_init(&server_cache);
 #endif
 }
-#endif /* CONFIG_MBEDTLS */
-
-#if defined(CONFIG_WOLFSSL)
-/* Without a certificate check the result is SKIP_VERIFY or MISSING, as on mbedTLS */
+#elif defined(CONFIG_WOLFSSL)
+/* Without a certificate check the result is SKIP_VERIFY or MISSING */
 static uint32_t tls_wolfssl_verify_result(struct tls_context *context,
 					  struct tls_session_context *session_ctx)
 {
@@ -1344,7 +1303,6 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 	}
 
 	if (entry->session != NULL) {
-		/* Evicted blob holds session secret material; scrub it. */
 		wc_ForceZero(entry->session, entry->session_len);
 		XFREE(entry->session, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 		entry->session = NULL;
@@ -1353,9 +1311,7 @@ static struct tls_session_cache *tls_wolfssl_session_entry_reserve(
 
 	return entry;
 }
-#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
-#if defined(ZTLS_WOLFSSL_EXT_CACHE)
 /* VERIFY_NONE may skip the certificate callback, and a resumption keeps its cached flag */
 static bool tls_wolfssl_psk_authenticated(struct tls_context *context)
 {
@@ -1371,17 +1327,11 @@ static bool tls_wolfssl_psk_authenticated(struct tls_context *context)
 
 	return session_ctx->psk_used && !session_ctx->cert_verify_ran;
 }
-#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
 static void tls_session_store(struct tls_context *context,
 			      const struct net_sockaddr *addr,
 			      net_socklen_t addrlen)
 {
-#if !defined(ZTLS_WOLFSSL_EXT_CACHE)
-	ARG_UNUSED(context);
-	ARG_UNUSED(addr);
-	ARG_UNUSED(addrlen);
-#else
 	WOLFSSL_SESSION *session = NULL;
 	struct tls_session_cache *entry;
 	struct net_sockaddr_storage peer_addr = { 0 };
@@ -1407,7 +1357,6 @@ static void tls_session_store(struct tls_context *context,
 		return;
 	}
 
-	/* Query required buffer size. */
 	size = wolfSSL_i2d_SSL_SESSION(session, NULL);
 	if (size <= 0) {
 		NET_ERR("Failed to size session for %p", context);
@@ -1461,10 +1410,8 @@ exit:
 		XFREE(serialized, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	}
 	wolfSSL_SESSION_free(session);
-#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 }
 
-#if defined(ZTLS_WOLFSSL_EXT_CACHE)
 /* Under REQUIRED, only a session whose server was verified, or a PSK one, resumes */
 static bool tls_wolfssl_resume_allowed(struct tls_context *context, uint32_t verify_result,
 				       bool psk_session)
@@ -1473,17 +1420,11 @@ static bool tls_wolfssl_resume_allowed(struct tls_context *context, uint32_t ver
 	       (context->options.verify_level != ZSOCK_TLS_PEER_VERIFY_REQUIRED &&
 		context->options.verify_level != -1);
 }
-#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
 static void tls_session_restore(struct tls_context *context,
 				const struct net_sockaddr *addr,
 				net_socklen_t addrlen)
 {
-#if !defined(ZTLS_WOLFSSL_EXT_CACHE)
-	ARG_UNUSED(context);
-	ARG_UNUSED(addr);
-	ARG_UNUSED(addrlen);
-#else
 	struct tls_session_cache *entry = NULL;
 	WOLFSSL_SESSION *session = NULL;
 	struct net_sockaddr_storage peer_addr = { 0 };
@@ -1581,8 +1522,11 @@ static void tls_session_restore(struct tls_context *context,
 	wolfSSL_SESSION_free(session);
 	wc_ForceZero(serialized_copy, serialized_len);
 	XFREE(serialized_copy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 }
+#else
+#define tls_session_store(...)
+#define tls_session_restore(...)
+#endif /* ZTLS_WOLFSSL_EXT_CACHE */
 
 static void tls_session_purge(void)
 {
@@ -1679,7 +1623,7 @@ static void ctx_set_lock(struct tls_context *ctx, struct k_mutex *lock)
 }
 
 #if defined(CONFIG_WOLFSSL)
-/* Only a close_notify is a clean close; a bare FIN is a recv error, as on mbedTLS */
+/* Only a close_notify is a clean close; a bare FIN is a recv error */
 static bool tls_wolfssl_peer_closed(struct tls_session_context *session_ctx, int err)
 {
 	return err == WOLFSSL_ERROR_ZERO_RETURN &&
@@ -1793,182 +1737,6 @@ static void dtls_peer_address_get(struct tls_session_context *session_ctx,
 	*addrlen = len;
 }
 
-#if defined(CONFIG_WOLFSSL)
-static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
-{
-	struct tls_context *tls_ctx = ctx;
-	ssize_t sent;
-
-	if (tls_ctx->options.role == ZTLS_IS_SERVER) {
-		dtls_server_refresh_session_timeout(tls_ctx->active_session);
-	}
-
-	sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
-			    net_sad(&tls_ctx->active_session->dtls_peer_addr),
-			    tls_ctx->active_session->dtls_peer_addrlen);
-	if (sent < 0) {
-		if (errno == EAGAIN) {
-			return WOLFSSL_CBIO_ERR_WANT_WRITE;
-		}
-
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	tls_ctx->active_session->dtls_tx_count++;
-
-	return sent;
-}
-
-#if defined(ZTLS_WOLFSSL_DTLS_CID)
-static struct tls_session_context *dtls_server_find_session_by_cid(
-	struct tls_context *tls_ctx, struct net_sockaddr_storage *addr, net_socklen_t *addrlen);
-
-static bool dtls_server_has_cid_session(struct tls_context *tls_ctx)
-{
-	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
-	struct net_sockaddr_storage addr;
-
-	return dtls_server_find_session_by_cid(tls_ctx, &addr, &addrlen) != NULL;
-}
-#else
-#define dtls_server_has_cid_session(...) false
-#endif /* ZTLS_WOLFSSL_DTLS_CID */
-
-static bool dtls_server_has_session(struct tls_context *tls_ctx,
-				    const struct net_sockaddr *addr, net_socklen_t addrlen)
-{
-	struct tls_session_context *session_ctx;
-
-	SYS_SLIST_FOR_EACH_CONTAINER(&tls_ctx->sessions, session_ctx, node) {
-		if (dtls_is_peer_addr_valid(session_ctx, addr, addrlen)) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
-{
-	struct tls_context *tls_ctx = ctx;
-	net_socklen_t addrlen = sizeof(struct net_sockaddr);
-	struct net_sockaddr_storage addr = { 0 };
-	ssize_t received;
-	uint8_t tmp_buf;
-
-	/* wolfSSL has processed the previous record by now */
-	dtls_cid_peer_commit(tls_ctx->active_session);
-
-	/* Peek the packet first to check the peer address. */
-	received = zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
-				  ZSOCK_MSG_DONTWAIT | ZSOCK_MSG_PEEK,
-				  net_sad(&addr), &addrlen);
-	if (received < 0) {
-		if (errno == EAGAIN) {
-			return WOLFSSL_CBIO_ERR_WANT_READ;
-		}
-
-		NET_ERR("DTLS server RX: failure %d", errno);
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	if (received == 0) {
-		/* An empty datagram is EOF after a local read shutdown, and is dropped otherwise */
-		(void)zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
-				     ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
-		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
-					 : WOLFSSL_CBIO_ERR_WANT_READ;
-	}
-
-	/* Check if the peer address matches the current session. */
-	if (tls_ctx->active_session->dtls_peer_addrlen != 0 &&
-	    !dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen) &&
-	    !dtls_cid_addr_take(tls_ctx->active_session, net_sad(&addr), addrlen)) {
-		/* Peer address does not match the current session, exit now
-		 * and try to find the appropriate session or allocate a new one.
-		 */
-		if (wolfSSL_is_stateful(ssl) ||
-		    dtls_server_has_session(tls_ctx, net_sad(&addr), addrlen) ||
-		    dtls_server_has_cid_session(tls_ctx)) {
-			return WOLFSSL_CBIO_ERR_WANT_READ;
-		}
-
-		/* A session still answering statelessly holds no peer, so this one takes it */
-		tls_ctx->active_session->dtls_peer_addrlen = 0;
-	}
-
-	/* If the session matches, read the actual packet. */
-	received = zsock_recvfrom(tls_ctx->sock, buf, len,
-				  ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
-	if (received < 0) {
-		NET_ERR("DTLS server RX: failure %d", errno);
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	if (received == 0) {
-		/* An empty datagram can arrive between the peek and this read */
-		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
-					 : WOLFSSL_CBIO_ERR_WANT_READ;
-	}
-
-	if (!dtls_cid_addr_unverified(tls_ctx->active_session)) {
-		dtls_server_refresh_session_timeout(tls_ctx->active_session);
-	}
-
-	/* Only allow to store peer address for DTLS servers. */
-	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
-		dtls_peer_address_set(tls_ctx->active_session, net_sad(&addr), addrlen);
-
-		if (wolfSSL_dtls_set_peer(ssl, (void *)&addr,
-				(unsigned int)addrlen) != WOLFSSL_SUCCESS) {
-			/* Roll back the stored peer so a retry does not falsely match */
-			tls_ctx->active_session->dtls_peer_addrlen = 0;
-			return WOLFSSL_CBIO_ERR_GENERAL;
-		}
-	}
-
-	return received;
-}
-
-static int dtls_wolf_client_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
-{
-	struct tls_context *tls_ctx = ctx;
-	net_socklen_t addrlen = sizeof(struct net_sockaddr);
-	struct net_sockaddr_storage addr = { 0 };
-	ssize_t received;
-
-	received = zsock_recvfrom(tls_ctx->sock, buf, len,
-				  ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
-	if (received < 0) {
-		if (errno == EAGAIN) {
-			return WOLFSSL_CBIO_ERR_WANT_READ;
-		}
-
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	if (received == 0) {
-		/* EOF after a local read shutdown; an empty datagram from the network is dropped */
-		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
-					 : WOLFSSL_CBIO_ERR_WANT_READ;
-	}
-
-	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
-		/* For clients it's incorrect to receive when
-		 * no peer has been set up.
-		 */
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	if (!dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen)) {
-		/* Received packet from a different peer, drop and retry. */
-		return WOLFSSL_CBIO_ERR_WANT_READ;
-	}
-
-	return received;
-}
-#endif /* CONFIG_WOLFSSL */
-
 #if defined(CONFIG_MBEDTLS)
 static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
 {
@@ -2080,16 +1848,13 @@ static int dtls_client_rx(void *ctx, unsigned char *buf, size_t len)
 
 	return received;
 }
-#endif /* CONFIG_MBEDTLS */
 
-#if defined(CONFIG_MBEDTLS)
 static int tls_mbedtls_session_init(struct tls_session_context *session_ctx,
 				    struct tls_context *tls_ctx, bool is_server);
-#endif
-#if defined(CONFIG_WOLFSSL)
+#elif defined(CONFIG_WOLFSSL)
 static int tls_wolfssl_session_init(struct tls_session_context *session_ctx,
 				    struct tls_context *tls_ctx, bool is_server);
-#endif
+#endif /* CONFIG_MBEDTLS */
 
 /* Returns
  * - 0 when session was switched,
@@ -2325,6 +2090,174 @@ static int dtls_server_switch_active_session_by_cid(struct tls_context *tls_ctx)
 #define dtls_server_switch_active_session_by_cid(...) (-ENOTSUP)
 #endif /* defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID) */
 
+#if defined(CONFIG_WOLFSSL)
+static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
+{
+	struct tls_context *tls_ctx = ctx;
+	ssize_t sent;
+
+	if (tls_ctx->options.role == ZTLS_IS_SERVER) {
+		dtls_server_refresh_session_timeout(tls_ctx->active_session);
+	}
+
+	sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
+			    net_sad(&tls_ctx->active_session->dtls_peer_addr),
+			    tls_ctx->active_session->dtls_peer_addrlen);
+	if (sent < 0) {
+		if (errno == EAGAIN) {
+			return WOLFSSL_CBIO_ERR_WANT_WRITE;
+		}
+
+		return WOLFSSL_CBIO_ERR_GENERAL;
+	}
+
+	tls_ctx->active_session->dtls_tx_count++;
+
+	return sent;
+}
+
+#if defined(ZTLS_WOLFSSL_DTLS_CID)
+static bool dtls_server_has_cid_session(struct tls_context *tls_ctx)
+{
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
+	struct net_sockaddr_storage addr;
+
+	return dtls_server_find_session_by_cid(tls_ctx, &addr, &addrlen) != NULL;
+}
+#else
+#define dtls_server_has_cid_session(...) false
+#endif /* ZTLS_WOLFSSL_DTLS_CID */
+
+static bool dtls_server_has_session(struct tls_context *tls_ctx,
+				    const struct net_sockaddr *addr, net_socklen_t addrlen)
+{
+	struct tls_session_context *session_ctx;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&tls_ctx->sessions, session_ctx, node) {
+		if (dtls_is_peer_addr_valid(session_ctx, addr, addrlen)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static int dtls_wolf_server_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
+{
+	struct tls_context *tls_ctx = ctx;
+	net_socklen_t addrlen = sizeof(struct net_sockaddr);
+	struct net_sockaddr_storage addr = { 0 };
+	ssize_t received;
+	uint8_t tmp_buf;
+
+	/* wolfSSL has processed the previous record by now */
+	dtls_cid_peer_commit(tls_ctx->active_session);
+
+	/* Peek the packet first to check the peer address. */
+	received = zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
+				  ZSOCK_MSG_DONTWAIT | ZSOCK_MSG_PEEK,
+				  net_sad(&addr), &addrlen);
+	if (received < 0) {
+		if (errno == EAGAIN) {
+			return WOLFSSL_CBIO_ERR_WANT_READ;
+		}
+
+		NET_ERR("DTLS server RX: failure %d", errno);
+		return WOLFSSL_CBIO_ERR_GENERAL;
+	}
+
+	if (received == 0) {
+		/* An empty datagram is EOF after a local read shutdown, and is dropped otherwise */
+		(void)zsock_recvfrom(tls_ctx->sock, &tmp_buf, sizeof(tmp_buf),
+				     ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
+					 : WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	/* Check if the peer address matches the current session. */
+	if (tls_ctx->active_session->dtls_peer_addrlen != 0 &&
+	    !dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen) &&
+	    !dtls_cid_addr_take(tls_ctx->active_session, net_sad(&addr), addrlen)) {
+		if (wolfSSL_is_stateful(ssl) ||
+		    dtls_server_has_session(tls_ctx, net_sad(&addr), addrlen) ||
+		    dtls_server_has_cid_session(tls_ctx)) {
+			return WOLFSSL_CBIO_ERR_WANT_READ;
+		}
+
+		/* A session still answering statelessly holds no peer, so this one takes it */
+		tls_ctx->active_session->dtls_peer_addrlen = 0;
+	}
+
+	/* If the session matches, read the actual packet. */
+	received = zsock_recvfrom(tls_ctx->sock, buf, len,
+				  ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
+	if (received < 0) {
+		NET_ERR("DTLS server RX: failure %d", errno);
+		return WOLFSSL_CBIO_ERR_GENERAL;
+	}
+
+	if (received == 0) {
+		/* An empty datagram can arrive between the peek and this read */
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
+					 : WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	if (!dtls_cid_addr_unverified(tls_ctx->active_session)) {
+		dtls_server_refresh_session_timeout(tls_ctx->active_session);
+	}
+
+	/* Only allow to store peer address for DTLS servers. */
+	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
+		dtls_peer_address_set(tls_ctx->active_session, net_sad(&addr), addrlen);
+
+		if (wolfSSL_dtls_set_peer(ssl, (void *)&addr,
+				(unsigned int)addrlen) != WOLFSSL_SUCCESS) {
+			/* Roll back the stored peer so a retry does not falsely match */
+			tls_ctx->active_session->dtls_peer_addrlen = 0;
+			return WOLFSSL_CBIO_ERR_GENERAL;
+		}
+	}
+
+	return received;
+}
+
+static int dtls_wolf_client_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
+{
+	struct tls_context *tls_ctx = ctx;
+	net_socklen_t addrlen = sizeof(struct net_sockaddr);
+	struct net_sockaddr_storage addr = { 0 };
+	ssize_t received;
+
+	received = zsock_recvfrom(tls_ctx->sock, buf, len,
+				  ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
+	if (received < 0) {
+		if (errno == EAGAIN) {
+			return WOLFSSL_CBIO_ERR_WANT_READ;
+		}
+
+		return WOLFSSL_CBIO_ERR_GENERAL;
+	}
+
+	if (received == 0) {
+		/* EOF after a local read shutdown; an empty datagram from the network is dropped */
+		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
+					 : WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
+		/* For clients it's incorrect to receive when no peer has been set up. */
+		return WOLFSSL_CBIO_ERR_GENERAL;
+	}
+
+	if (!dtls_is_peer_addr_valid(tls_ctx->active_session, net_sad(&addr), addrlen)) {
+		/* Received packet from a different peer, drop and retry. */
+		return WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	return received;
+}
+#endif /* CONFIG_WOLFSSL */
+
 /* Returns
  * - 0 when session was switched or updated,
  * - 1 if session was already valid,
@@ -2464,9 +2397,7 @@ static int tls_rx(void *ctx, unsigned char *buf, size_t len)
 
 	return received;
 }
-#endif /* CONFIG_MBEDTLS */
-
-#if defined(CONFIG_WOLFSSL)
+#elif defined(CONFIG_WOLFSSL)
 static int tls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 {
 	struct tls_context *tls_ctx = ctx;
@@ -2614,7 +2545,6 @@ static int tls_add_own_cert(struct tls_context *tls,
 	} else {
 		len = tls_der_chain_len(own_cert->buf, own_cert->len);
 	}
-	/* Loads the intermediates too, as mbedtls_x509_crt_parse() does */
 	ret = wolfSSL_CTX_use_certificate_chain_buffer_format(tls->ctx,
 							      own_cert->buf,
 							      len,
@@ -3192,9 +3122,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 
 	return 0;
 }
-#endif /* CONFIG_MBEDTLS */
-
-#if defined(CONFIG_WOLFSSL)
+#elif defined(CONFIG_WOLFSSL)
 #ifndef NO_PSK
 static unsigned int tls_psk_server_cb(WOLFSSL *ssl, const char *identity,
 				      unsigned char *key,
@@ -3265,7 +3193,6 @@ static unsigned int tls_psk_client_cb(WOLFSSL *ssl, const char *hint,
 }
 
 #ifdef WOLFSSL_TLS13
-/* TLS 1.3 PSK callbacks */
 static unsigned int tls_psk_server_tls13_cb(WOLFSSL *ssl, const char *identity,
 					    unsigned char *key,
 					    unsigned int key_max_len,
@@ -3407,8 +3334,6 @@ static int tls_wolfssl_set_hostname(struct tls_context *context,
 	}
 #endif /* HAVE_SNI */
 
-	/* Without HAVE_SNI the name still drives the CN/SAN match. */
-
 #if !defined(OPENSSL_EXTRA) && !defined(OPENSSL_EXTRA_X509_SMALL)
 	/* No current_cert without the compat layer, so wolfSSL matches the name itself. */
 	if (context->host_name != NULL &&
@@ -3460,7 +3385,7 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_NONE) {
 		return;
 	}
-	/* No name set matches no certificate, like the empty name mbedTLS sets */
+	/* No name set matches no certificate */
 	if (!context->options.is_hostname_set) {
 		session_ctx->verify_result_flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
 		*effective_ok = 0;
@@ -3476,12 +3401,9 @@ static void tls_wolfssl_apply_leaf_hostname_check(struct tls_context *context,
 
 	session_ctx->verify_result_flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
 	*effective_ok = 0;
-#else
-	/* tls_wolfssl_set_hostname() armed wolfSSL's match; a mismatch arrives in store->error. */
 #endif /* OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL */
 }
 
-/* Map wolfSSL verify error to mbedTLS flag bits. */
 static uint32_t tls_wolfssl_error_to_mbedtls_flags(int error)
 {
 	switch (error) {
@@ -3550,7 +3472,6 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 
 	tls_wolfssl_apply_leaf_hostname_check(context, session_ctx, store, &effective_ok);
 
-	/* OPTIONAL continues; warn, since an unread TLS_CERT_VERIFY_RESULT hides a bad chain */
 	if (context->options.verify_level == ZSOCK_TLS_PEER_VERIFY_OPTIONAL) {
 		/* The leaf comes last, so this warns once per handshake */
 		if (store->error_depth == 0 && session_ctx->verify_result_flags != 0) {
@@ -3651,7 +3572,6 @@ static int tls_wolfssl_set_verify(struct tls_context *context,
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
 
 	if (verifyLevel == -1) {
-		/* Match mbedTLS defaults: required for clients, none for servers. */
 		if (context->options.role == ZTLS_IS_SERVER) {
 			verifyLevel = WOLFSSL_VERIFY_NONE;
 		} else {
@@ -3670,24 +3590,12 @@ static int tls_wolfssl_set_ciphersuites(struct tls_context *context,
 	byte cs_bytes[CONFIG_NET_SOCKETS_TLS_MAX_CIPHERSUITES * 2];
 	int cipher_cnt = 0;
 
-	/* Nothing to set */
 	if (context->options.ciphersuites[0] == 0) {
 		return 0;
 	}
 
 	for (int i = 0; context->options.ciphersuites[i] != 0; i++) {
-		int id = context->options.ciphersuites[i];
-
-		if (cipher_cnt >= CONFIG_NET_SOCKETS_TLS_MAX_CIPHERSUITES) {
-			return -EINVAL;
-		}
-
-		/* All ciphersuite IDs fit in 16 bits */
-		if (id < 0 || id > 0xFFFF) {
-			return -EINVAL;
-		}
-
-		sys_put_be16((uint16_t)id, &cs_bytes[cipher_cnt * 2]);
+		sys_put_be16((uint16_t)context->options.ciphersuites[i], &cs_bytes[cipher_cnt * 2]);
 		cipher_cnt++;
 	}
 
@@ -3722,7 +3630,7 @@ static int tls_wolfssl_alpn_join(const char * const *list, int cnt, char **joine
 
 	*joined = NULL;
 
-	/* Like Mbed TLS, the list ends at the first NULL */
+	/* The list ends at the first NULL */
 	for (i = 0; i < cnt && list[i] != NULL; i++) {
 		if (list[i][0] == '\0' || strchr(list[i], ',') != NULL) {
 			return -EINVAL;
@@ -3749,7 +3657,6 @@ static int tls_wolfssl_alpn_join(const char * const *list, int cnt, char **joine
 		*iter++ = ',';
 	}
 
-	/* The last comma becomes the terminator */
 	*(iter - 1) = '\0';
 
 	return 0;
@@ -3792,7 +3699,7 @@ static int tls_wolfssl_set_dtls_timeouts(struct tls_context *context,
 #endif
 
 /* Pushes a stored option into live sessions; one that refuses it does not fail setsockopt */
-static int tls_wolfssl_apply_all_sessions(
+static void tls_wolfssl_apply_all_sessions(
 	struct tls_context *context,
 	int (*setter)(struct tls_context *context,
 		      struct tls_session_context *session_ctx))
@@ -3812,8 +3719,6 @@ static int tls_wolfssl_apply_all_sessions(
 				 session_ctx, ret);
 		}
 	}
-
-	return 0;
 }
 
 #if defined(ZTLS_WOLFSSL_DTLS_CID)
@@ -3855,7 +3760,6 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 {
 	int ret;
 
-	/* The verify callbacks reach the session through this */
 	session_ctx->tls_ctx = tls_ctx;
 
 	if (wolfSSL_set_fd(session_ctx->wssl, tls_ctx->sock) != WOLFSSL_SUCCESS) {
@@ -3878,7 +3782,6 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 		return -EINVAL;
 	}
 
-	/* Set our TLS context as the read/write context since it contains the socket */
 	wolfSSL_SetIOReadCtx(session_ctx->wssl, (void *)tls_ctx);
 	wolfSSL_SetIOWriteCtx(session_ctx->wssl, (void *)tls_ctx);
 
@@ -3940,7 +3843,6 @@ static int tls_wolfssl_session_setup(struct tls_session_context *session_ctx,
 /* Round down to an RFC 6066 length; a full record needs no extension. */
 static inline int tls_wolfssl_mfl_code(struct tls_context *context)
 {
-	enum net_sock_type type = context->type;
 	size_t len;
 
 	/* ZSOCK_TLS_MFL_* and WOLFSSL_MFL_* both hold the RFC 6066 codes. */
@@ -3951,12 +3853,10 @@ static inline int tls_wolfssl_mfl_code(struct tls_context *context)
 	len = CONFIG_NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	if (type == NET_SOCK_DGRAM &&
+	if (context->type == NET_SOCK_DGRAM &&
 	    len > CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH) {
 		len = CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH;
 	}
-#else
-	ARG_UNUSED(type);
 #endif
 
 	if (len >= 16384) {
@@ -4056,11 +3956,6 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 	k_sem_reset(&session_ctx->tls_established);
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	/* Server role: reset the address so that a new
-	 *              client can connect w/o a need to reopen a socket
-	 * Client role: keep peer addr so socket can continue to be used
-	 *              even on handshake timeout
-	 */
 	if (context->options.role == ZTLS_IS_SERVER) {
 		(void)memset(&session_ctx->dtls_peer_addr, 0,
 			     sizeof(session_ctx->dtls_peer_addr));
@@ -4217,7 +4112,6 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	return ret;
 }
 
-/* A client-only wolfSSL build has no server methods */
 #ifdef NO_WOLFSSL_SERVER
 #define TLS_WOLFSSL_METHOD(is_server, ver) ((is_server) ? NULL : ver##_client_method())
 #else
@@ -4236,7 +4130,6 @@ static WOLFSSL_METHOD *tls_wolfssl_get_method(struct tls_context *context,
 #endif /* WOLFSSL_TLS13 */
 #ifndef WOLFSSL_NO_TLS12
 		case NET_IPPROTO_TLS_1_2:
-		/* mbedTLS 4 has no TLS 1.0 or 1.1 either, so these sockets run TLS 1.2. */
 		case NET_IPPROTO_TLS_1_1:
 		case NET_IPPROTO_TLS_1_0:
 			return TLS_WOLFSSL_METHOD(is_server, wolfTLSv1_2);
@@ -4461,11 +4354,8 @@ static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context 
 	return 0;
 }
 #endif /* !SINGLE_THREADED */
-#endif /* CONFIG_WOLFSSL */
 
-#if defined(CONFIG_WOLFSSL)
-/* Size of the DER object at buf including its header, or -EINVAL if it is not
- * a definite-length SEQUENCE fitting within len. */
+/* Stores in *out the length of the DER SEQUENCE at buf with its header, or returns -EINVAL */
 static int tls_der_object_len(const byte *buf, word32 len, word32 *out)
 {
 	word32 hdr, body, n, i;
@@ -4500,7 +4390,6 @@ static int tls_der_object_len(const byte *buf, word32 len, word32 *out)
 	return 0;
 }
 
-/* Validate every certificate concatenated in a DER buffer. */
 static int tls_check_der_chain(DecodedCert *dcert, const byte *der, word32 der_len)
 {
 	int ret;
@@ -4542,12 +4431,11 @@ static word32 tls_der_chain_len(const byte *der, word32 der_len)
 static int tls_check_cert(struct tls_credential *cert)
 {
 #if defined(CONFIG_WOLFSSL)
-	/* A malformed credential fails setsockopt() with EINVAL here, as on mbedTLS. */
 	DecodedCert *dcert;
 	byte *pem_der = NULL;
 	int ret;
 
-	/* Several KB, more than a socket thread's stack wants to carry. */
+	/* DecodedCert is several KB, too large for a socket thread's stack */
 	dcert = XMALLOC(sizeof(*dcert), NULL, DYNAMIC_TYPE_TMP_BUFFER);
 	if (dcert == NULL) {
 		return -ENOMEM;
@@ -4600,8 +4488,7 @@ static int tls_check_cert(struct tls_credential *cert)
 	}
 
 	return 0;
-#else
-#if defined(CONFIG_MBEDTLS_X509_CRT_PARSE_C)
+#elif defined(CONFIG_MBEDTLS_X509_CRT_PARSE_C)
 	mbedtls_x509_crt cert_ctx;
 	int err;
 
@@ -4632,11 +4519,10 @@ static int tls_check_cert(struct tls_credential *cert)
 
 	return -ENOTSUP;
 #endif /* CONFIG_MBEDTLS_X509_CRT_PARSE_C */
-#endif /* CONFIG_WOLFSSL */
 }
 
 #if defined(CONFIG_WOLFSSL)
-/* Returns 1 if a wolfCrypt decoder accepts the key, 0 if none does */
+/* Returns 1 if a wolfCrypt decoder accepts the key, 0 if none does, or -ENOMEM */
 static int tls_wolfssl_key_decodes(byte *der, word32 der_len)
 {
 	word32 start = 0;
@@ -4650,7 +4536,6 @@ static int tls_wolfssl_key_decodes(byte *der, word32 der_len)
 #endif /* HAVE_PKCS8 */
 
 #if defined(HAVE_ECC)
-	/* ECC first, since its key struct is the smaller allocation */
 	{
 		ecc_key *ecc = XMALLOC(sizeof(*ecc), NULL, DYNAMIC_TYPE_ECC);
 
@@ -4958,12 +4843,12 @@ static int tls_opt_hostname_set(struct tls_context *context,
 			context->host_name = NULL;
 			context->host_len = 0;
 		}
-		/* A NULL name turns the name check off, as on mbedTLS */
+		/* A NULL name turns the name check off */
 		context->options.is_hostname_set = true;
 		return 0;
 	}
 
-	/* Stop at the first NUL, as the mbedTLS backend reads optval as a C string. */
+	/* optval is a C string, so stop at the first NUL */
 	optlen = strnlen((const char *)optval, optlen);
 
 	/* An empty name matches no certificate and would turn the name check off */
@@ -4975,8 +4860,6 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	if (optlen > UINT16_MAX) {
 		return -EINVAL;
 	}
-
-	/* Keep the old name until the new one is stored, as mbedTLS does */
 
 	/* +1 for NUL - wolfSSL APIs require C strings. */
 	host_name = XMALLOC(optlen + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
@@ -4995,8 +4878,8 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	context->host_len = optlen;
 	context->options.is_hostname_set = true;
 
-	return tls_wolfssl_apply_all_sessions(context,
-					      tls_wolfssl_set_hostname);
+	tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_hostname);
+	return 0;
 #else
 	ARG_UNUSED(optlen);
 
@@ -5048,8 +4931,8 @@ static int tls_opt_ciphersuite_list_set(struct tls_context *context,
 	XMEMCPY(context->options.ciphersuites, optval, optlen);
 	context->options.ciphersuites[cipher_cnt] = 0;
 
-	return tls_wolfssl_apply_all_sessions(context,
-					      tls_wolfssl_set_ciphersuites);
+	tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_ciphersuites);
+	return 0;
 #else
 	memcpy(context->options.ciphersuites, optval, optlen);
 	context->options.ciphersuites[cipher_cnt] = 0;
@@ -5296,12 +5179,11 @@ static int tls_opt_dtls_handshake_timeout_set(struct tls_context *context,
 		context->options.dtls_handshake_timeout_min = *val;
 	}
 
-	/* If context already inited, we need to
-	 * update config for it to take effect
+	/* If mbedTLS context already inited, we need to
+	 * update mbedTLS config for it to take effect
 	 */
 #if defined(CONFIG_WOLFSSL)
-	return tls_wolfssl_apply_all_sessions(context,
-					      tls_wolfssl_set_dtls_timeouts);
+	tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_dtls_timeouts);
 #else
 	mbedtls_ssl_conf_handshake_timeout(&context->config,
 			context->options.dtls_handshake_timeout_min,
@@ -5715,7 +5597,7 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	ARG_UNUSED(optlen);
 
 #if defined(CONFIG_WOLFSSL) && !defined(NO_SESSION_CACHE)
-	/* The server-side session cache is global, so flush it too; the ctx argument is unused. */
+	/* wolfSSL's server-side session cache is global */
 	wolfSSL_CTX_flush_sessions(NULL, -1);
 #endif
 	tls_session_purge();
@@ -5827,9 +5709,7 @@ static int tls_opt_dtls_role_set(struct tls_context *context,
 	return 0;
 }
 
-#if defined(CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK)
 #if defined(CONFIG_WOLFSSL)
-/* wolfSSL consumers should use TLS_CERT_VERIFY_CALLBACK_WOLFSSL. */
 static int tls_opt_cert_verify_callback_set(struct tls_context *context,
 					    const void *optval,
 					    net_socklen_t optlen)
@@ -5843,7 +5723,7 @@ static int tls_opt_cert_verify_callback_set(struct tls_context *context,
 
 	return -ENOTSUP;
 }
-#else /* CONFIG_WOLFSSL (mbedTLS backend) */
+#elif defined(CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK)
 static int tls_opt_cert_verify_callback_set(struct tls_context *context,
 					    const void *optval,
 					    net_socklen_t optlen)
@@ -5867,30 +5747,18 @@ static int tls_opt_cert_verify_callback_set(struct tls_context *context,
 
 	return 0;
 }
-#endif /* CONFIG_WOLFSSL */
 #else /* CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK */
 static int tls_opt_cert_verify_callback_set(struct tls_context *context,
 					    const void *optval,
 					    net_socklen_t optlen)
 {
-	ARG_UNUSED(context);
-	ARG_UNUSED(optval);
-	ARG_UNUSED(optlen);
-
-#if defined(CONFIG_WOLFSSL)
-	NET_ERR("TLS_CERT_VERIFY_CALLBACK is not supported by the wolfSSL "
-		"backend; use TLS_CERT_VERIFY_CALLBACK_WOLFSSL");
-	return -ENOTSUP;
-#else
 	NET_ERR("TLS_CERT_VERIFY_CALLBACK option requires "
 		"CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK enabled");
 
 	return -ENOPROTOOPT;
-#endif
 }
 #endif /* CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK */
 
-#if defined(CONFIG_WOLFSSL)
 #if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK)
 static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
 						    const void *optval,
@@ -5913,21 +5781,10 @@ static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
 
 	context->options.cert_verify_wolfssl = *wolfssl_cb;
 
-	return tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_verify);
-}
-#else
-static int tls_opt_cert_verify_callback_wolfssl_set(struct tls_context *context,
-						    const void *optval,
-						    net_socklen_t optlen)
-{
-	ARG_UNUSED(context);
-	ARG_UNUSED(optval);
-	ARG_UNUSED(optlen);
-
-	return -ENOPROTOOPT;
+	tls_wolfssl_apply_all_sessions(context, tls_wolfssl_set_verify);
+	return 0;
 }
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
-#endif /* CONFIG_WOLFSSL */
 
 static int protocol_check(int family, int type, int *proto)
 {
@@ -6013,14 +5870,13 @@ int ztls_close_ctx(struct tls_context *ctx, int sock)
 	/* Try to send close notification. */
 	ctx->flags = 0;
 
-#if defined(CONFIG_WOLFSSL)
-	/* Close-notify is sent per session in tls_session_free, via tls_release */
-	ARG_UNUSED(session_ctx);
-#else
+#if defined(CONFIG_MBEDTLS)
 	SYS_SLIST_FOR_EACH_CONTAINER(&ctx->sessions, session_ctx, node) {
 		(void)mbedtls_ssl_close_notify(&session_ctx->ssl);
 	}
-#endif /* CONFIG_WOLFSSL */
+#else
+	ARG_UNUSED(session_ctx);
+#endif /* CONFIG_MBEDTLS */
 
 	err = tls_release(ctx);
 	ret = zsock_close(ctx->sock);
@@ -6272,7 +6128,7 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 
 	end = sys_timepoint_calc(timeout);
 
-	/* One record per call, so a short count reports what went out, as on mbedTLS */
+	/* One record per call, so a short count reports what went out */
 	if (ctx->type == NET_SOCK_STREAM) {
 		max_len = wolfSSL_GetMaxOutputSize(ctx->active_session->wssl);
 		if (max_len > 0) {
@@ -6288,7 +6144,7 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 
 		err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
-		/* A zero-length write is a no-op, as on mbedTLS */
+		/* A zero-length write is a no-op */
 		if (ret == 0 && err == WOLFSSL_ERROR_NONE) {
 			return 0;
 		}
@@ -6318,7 +6174,6 @@ static ssize_t send_tls_wolfssl(struct tls_context *ctx, const void *buf,
 			}
 		} else {
 			NET_ERR("TLS send error: %x", err);
-			/* As on mbedTLS, a failed reset leaves the session unusable */
 			if (tls_wolfssl_reset_session(ctx) != 0) {
 				ctx->error = ENOMEM;
 				errno = ENOMEM;
@@ -6848,7 +6703,7 @@ err:
 		}
 
 		if (ret == 0) {
-			/* A clean closure reads as 0; send() then fails as on mbedTLS */
+			/* A clean closure reads as 0 */
 			err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 			if ((err == WOLFSSL_ERROR_NONE && max_len == 0) || ctx->recv_eof) {
 				break;
@@ -6987,7 +6842,6 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 	k_timepoint_t end;
 	int remaining;
 	uint8_t zero_len_buf;
-	bool retry;
 
 	if (ctx->error != 0) {
 		return -ctx->error;
@@ -7012,7 +6866,6 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 	do {
 		int timeout_ms;
 
-		retry = false;
 		ret = wolfSSL_read(ctx->active_session->wssl, buf,
 				   (int)MIN(max_len, (size_t)INT_MAX));
 		dtls_cid_peer_commit(ctx->active_session);
@@ -7032,14 +6885,6 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 				if (is_server) {
 					int err2 = dtls_server_switch_session_on_rx(ctx);
 
-					/* If session swapping is successful, return early
-					 * so that recvfrom_dtls_server_wolfssl() can
-					 * proceed with another handshake. Otherwise, there
-					 * either really was no packet, or we've failed to
-					 * allocate a new session, so the packet was
-					 * dropped. In either case, just proceed as if
-					 * there were no packet.
-					 */
 					if (err2 == 0) {
 						return -EAGAIN;
 					}
@@ -7061,7 +6906,6 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 				k_mutex_lock(ctx->lock, K_FOREVER);
 
 				if (ret >= 0) {
-					retry = true;
 					continue;
 				}
 
@@ -7073,7 +6917,7 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 			}
 
 			if (ret == 0 && err == WOLFSSL_ERROR_NONE) {
-				/* An empty datagram is a 0-byte receive, as on mbedTLS */
+				/* An empty datagram is a 0-byte receive */
 				return 0;
 			}
 
@@ -7114,14 +6958,11 @@ static ssize_t recvfrom_dtls_common_wolfssl(struct tls_context *ctx, void *buf,
 				break;
 			}
 			remaining -= r;
-			/* Scrub the plaintext drained into the discard buffer */
 			wc_ForceZero(dummy, sizeof(dummy));
 		}
 
 		return ret;
-	} while (retry);
-
-	return -EAGAIN;
+	} while (true);
 }
 
 static ssize_t recvfrom_dtls_client_wolfssl(struct tls_context *ctx, void *buf,
@@ -7672,7 +7513,7 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 
 static int ztls_poll_prepare_pollin(struct tls_context *ctx)
 {
-	/* If there already is TLS data to read, there is no
+	/* If there already is mbedTLS data to read, there is no
 	 * need to set the k_poll_event object. Return EALREADY
 	 * so we won't block in the k_poll.
 	 */
@@ -7772,12 +7613,6 @@ static int tls_data_check(struct tls_context *ctx)
 			int err = wolfSSL_get_error(ctx->active_session->wssl, ret);
 
 			if (tls_wolfssl_peer_closed(ctx->active_session, err)) {
-				/* Don't reset the session for STREAM socket -
-				 * the application needs to reopen the socket
-				 * anyway, and resetting the session would
-				 * result in an error instead of 0 in a
-				 * consecutive recv() call.
-				 */
 				ctx->active_session->session_closed = true;
 
 				return -ENOTCONN;
@@ -8617,11 +8452,11 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 		break;
 #endif /* ZTLS_WOLFSSL_MAX_FRAGMENT */
 
-#if defined(CONFIG_WOLFSSL)
+#if defined(CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK)
 	case ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL:
 		err = tls_opt_cert_verify_callback_wolfssl_set(ctx, optval, optlen);
 		break;
-#endif /* CONFIG_WOLFSSL */
+#endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	case ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MIN:
@@ -8809,7 +8644,7 @@ static int tls_sock_shutdown_vmeth(void *obj, int how)
 
 	ret = zsock_shutdown(ctx->sock, how);
 #if defined(CONFIG_WOLFSSL)
-	/* Only a successful shutdown closes the read side; mbedTLS does not read recv_eof */
+	/* Only a successful shutdown closes the read side */
 	if (ret == 0 && (how == ZSOCK_SHUT_RD || how == ZSOCK_SHUT_RDWR)) {
 		ctx->recv_eof = true;
 	}

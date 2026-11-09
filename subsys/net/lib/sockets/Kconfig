@@ -160,8 +160,7 @@ choice NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_CIPHERSUITE_CHOICE
 	  TLS 1.3 PSK exchange binds a PSK to a single hash algorithm, but
 	  the Zephyr TLS_CREDENTIAL_PSK API doesn't carry that information.
 	  This choice fixes which ciphersuite the wolfSSL TLS 1.3 PSK
-	  callbacks return for any PSK presented. Enumerated rather than
-	  free-text so typos surface as a build-time Kconfig error.
+	  callbacks return for any PSK presented.
 
 config NET_SOCKETS_TLS_WOLFSSL_PSK_TLS13_AES128_GCM_SHA256
 	bool "TLS13-AES128-GCM-SHA256 (mandatory-to-implement)"
@@ -213,14 +212,14 @@ config NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH
 	  Configure the created TLS context so that Maximum Fragment Length (MFL)
 	  will be sent to peer using RFC 6066 max_fragment_length extension.
 
-	  For MbedTLS, Maximum Fragment Length (MFL) value is automatically
+	  For mbedTLS, Maximum Fragment Length (MFL) value is automatically
 	  chosen based on MBEDTLS_SSL_OUT_CONTENT_LEN and
 	  MBEDTLS_SSL_IN_CONTENT_LEN mbed TLS macros (which are configured by
 	  CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN in case of default mbed TLS config).
 	  With DTLS, MFL value may be further limited with
 	  NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH.
 
-	  For WolfSSL, the value is set by
+	  For wolfSSL, the value is set by
 	  NET_SOCKETS_TLS_WOLFSSL_MAX_FRAGMENT_LENGTH and the extension itself
 	  must be compiled in (HAVE_MAX_FRAGMENT).
 
@@ -353,18 +352,15 @@ config NET_SOCKETS_TLS_MAX_CLIENT_SESSION_COUNT
 	  used for TLS/DTLS session resumption.
 
 config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
-	bool "TLS certificate verification callback support (mbedTLS backend only)"
+	bool "TLS certificate verification callback support"
 	depends on NET_SOCKETS_SOCKOPT_TLS
 	help
-	  This option controls whether the TLS_CERT_VERIFY_CALLBACK TLS
-	  socket option is available to use. When set, applications can
-	  register a certificate verification callback that is invoked by
-	  the TLS backend during the handshake.
+	  This option controls whether TLS_CERT_VERIFY_CALLBACK TLS socket option
+	  is available to use. It allows to register a certificate verification
+	  callback, which is called by the TLS backend during the TLS handshake.
 
-	  This option is only honored by the mbedTLS backend. On the
-	  wolfSSL backend, setsockopt(TLS_CERT_VERIFY_CALLBACK) returns
-	  -ENOTSUP. wolfSSL users should use TLS_CERT_VERIFY_CALLBACK_WOLFSSL
-	  (CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK) instead.
+	  The wolfSSL backend rejects this option with ENOTSUP and takes a
+	  callback through TLS_CERT_VERIFY_CALLBACK_WOLFSSL instead.
 
 config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	bool "Request a stapled OCSP response (wolfSSL)"
@@ -372,37 +368,25 @@ config NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	select WOLFSSL_OCSP if !WOLFSSL_HAS_SETTINGS_FILE
 	select WOLFSSL_OCSP_STAPLING if !WOLFSSL_HAS_SETTINGS_FILE
 	help
-	  Make TLS client sockets send the certificate status request
-	  extension, so the server staples an OCSP response for its own
-	  certificate to the handshake and revocation is checked without the
-	  client reaching an OCSP responder itself. Under
-	  TLS_PEER_VERIFY_REQUIRED a revoked or invalid response fails the
-	  handshake; under OPTIONAL and NONE the handshake goes on and
-	  TLS_CERT_VERIFY_RESULT reports it, as MBEDTLS_X509_BADCERT_REVOKED
-	  for a revoked certificate.
+	  Make TLS client sockets ask the server to staple an OCSP response
+	  for its certificate, so revocation is checked without contacting an
+	  OCSP responder. Under TLS_PEER_VERIFY_REQUIRED a revoked or invalid
+	  response fails the handshake; under OPTIONAL and NONE the handshake
+	  continues and TLS_CERT_VERIFY_RESULT reports it. Server sockets are
+	  not affected.
 
-	  Server sockets are unaffected: they staple a response only if the
-	  application supplies one, which this option does not arrange.
-
-	  Note that an OCSP response carries its own validity dates, so a
-	  target without a trusted clock needs
-	  CONFIG_WOLFSSL_NO_ASN_TIME_CHECK - which also stops those dates
-	  being checked.
+	  An OCSP response carries its own validity dates, so a target without
+	  a trusted clock needs CONFIG_WOLFSSL_NO_ASN_TIME_CHECK, which also
+	  stops those dates being checked.
 
 config NET_SOCKETS_TLS_WOLFSSL_OCSP_MUST_STAPLE
 	bool "Require the peer to staple an OCSP response (wolfSSL)"
 	depends on NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING
 	help
-	  Fail the handshake when a server does not staple an OCSP response,
-	  instead of accepting the certificate unchecked. Without this option
-	  a server may acknowledge the certificate status request and staple
-	  nothing, which leaves revocation unverified.
-
-	  This needs no OCSP responder reachability: the client only insists
-	  on what the server was already asked for. A server that staples
-	  nothing fails the handshake with -ECONNABORTED. Only
-	  TLS_PEER_VERIFY_REQUIRED enforces it; OPTIONAL and NONE accept a
-	  server that staples nothing.
+	  Fail the handshake with -ECONNABORTED when the server staples no OCSP
+	  response, which otherwise leaves revocation unchecked. Only
+	  TLS_PEER_VERIFY_REQUIRED enforces this; OPTIONAL and NONE accept
+	  such a server.
 
 config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	bool "wolfSSL-style cert-verify callback"
@@ -410,22 +394,14 @@ config NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK
 	depends on NET_SOCKETS_SOCKOPT_TLS
 	select WOLFSSL_ALWAYS_VERIFY_CB if !WOLFSSL_HAS_SETTINGS_FILE
 	help
-	  Enable registration of wolfSSL-style VerifyCallback functions
-	  via the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option.
+	  Enable the TLS_CERT_VERIFY_CALLBACK_WOLFSSL socket option, which
+	  registers a wolfSSL verify callback:
 
-	  The wolfSSL-style callback receives the standard wolfSSL
-	  arguments:
 	    int callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *ctx)
 
-	  This option may be enabled alongside
-	  CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK; the mbedTLS-style
-	  TLS_CERT_VERIFY_CALLBACK setsockopt simply returns -ENOTSUP
-	  when the wolfSSL backend is active.
-
-	  When a wolfSSL-style callback is registered, TLS_CERT_VERIFY_RESULT
-	  still returns accumulated MBEDTLS_X509_BADCERT_* flags for chain
-	  errors observed during verification; the callback additionally
-	  controls whether the handshake proceeds.
+	  The callback decides whether the handshake proceeds, and
+	  TLS_CERT_VERIFY_RESULT still reports the MBEDTLS_X509_BADCERT_*
+	  flags of chain errors seen during verification.
 
 config NET_SOCKETS_OFFLOAD
 	bool "Offload Socket APIs"
