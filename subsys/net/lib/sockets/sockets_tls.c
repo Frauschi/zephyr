@@ -408,6 +408,8 @@ __net_socket struct tls_context {
 	k_timepoint_t dtls_rtx_end;
 	uint32_t dtls_rtx_tx_count;
 	bool dtls_rtx_armed;
+	/* A server drops its peer when no record arrives from it before this */
+	k_timepoint_t dtls_rx_expiry;
 #endif
 
 #ifndef NO_PSK
@@ -1540,34 +1542,44 @@ static int dtls_wolf_tx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 	return sent;
 }
 
+/* A pinned peer only changes while a server still answers statelessly */
+static bool dtls_wolf_rx_foreign(struct tls_context *tls_ctx, WOLFSSL *ssl,
+				 const struct sockaddr *addr, socklen_t addrlen)
+{
+	return tls_ctx->dtls_peer_addrlen != 0 &&
+	       !dtls_is_peer_addr_valid(tls_ctx, addr, addrlen) &&
+	       (tls_ctx->options.role != ZTLS_IS_SERVER || wolfSSL_is_stateful(ssl));
+}
+
 static int dtls_wolf_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 {
 	struct tls_context *tls_ctx = ctx;
-	socklen_t addrlen = sizeof(struct sockaddr);
+	socklen_t addrlen;
 	struct sockaddr addr;
 	ssize_t received;
 
-	received = zsock_recvfrom(tls_ctx->sock, buf, len,
-				  ZSOCK_MSG_DONTWAIT, &addr, &addrlen);
+	/* Dropped datagrams are read past, so a backlog does not hide the peer's records */
+	do {
+		addrlen = sizeof(struct sockaddr);
+		received = zsock_recvfrom(tls_ctx->sock, buf, len,
+					  ZSOCK_MSG_DONTWAIT, &addr, &addrlen);
 
-	if (received < 0) {
-		if (errno == EAGAIN) {
-			return WOLFSSL_CBIO_ERR_WANT_READ;
+		if (received < 0) {
+			if (errno == EAGAIN) {
+				return WOLFSSL_CBIO_ERR_WANT_READ;
+			}
+
+			return WOLFSSL_CBIO_ERR_GENERAL;
 		}
 
-		return WOLFSSL_CBIO_ERR_GENERAL;
-	}
-
-	if (received == 0) {
 		/* EOF after a local read shutdown; an empty datagram from the network is dropped */
-		return tls_ctx->recv_eof ? WOLFSSL_CBIO_ERR_CONN_CLOSE
-					 : WOLFSSL_CBIO_ERR_WANT_READ;
-	}
+		if (received == 0 && tls_ctx->recv_eof) {
+			return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+		}
+	} while (received == 0 || dtls_wolf_rx_foreign(tls_ctx, ssl, &addr, addrlen));
 
-	/* A server still answering statelessly holds no peer to stay pinned to */
 	if (tls_ctx->dtls_peer_addrlen == 0 ||
-	    (tls_ctx->options.role == ZTLS_IS_SERVER && !wolfSSL_is_stateful(ssl) &&
-	     !dtls_is_peer_addr_valid(tls_ctx, &addr, addrlen))) {
+	    !dtls_is_peer_addr_valid(tls_ctx, &addr, addrlen)) {
 		/* Only allow to store peer address for DTLS servers. */
 		if (tls_ctx->options.role == ZTLS_IS_SERVER) {
 			dtls_peer_address_set(tls_ctx, &addr, addrlen);
@@ -1582,11 +1594,22 @@ static int dtls_wolf_rx(WOLFSSL *ssl, char *buf, int len, void *ctx)
 			/* For clients it's incorrect to receive when no peer has been set up. */
 			return WOLFSSL_CBIO_ERR_GENERAL;
 		}
-	} else if (!dtls_is_peer_addr_valid(tls_ctx, &addr, addrlen)) {
-		return WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	if (tls_ctx->options.role == ZTLS_IS_SERVER) {
+		tls_ctx->dtls_rx_expiry = sys_timepoint_calc(
+			CONFIG_NET_SOCKETS_DTLS_TIMEOUT == 0 ?
+			K_FOREVER : K_MSEC(CONFIG_NET_SOCKETS_DTLS_TIMEOUT));
 	}
 
 	return received;
+}
+
+/* The read timeout mbedTLS applies to a DTLS server once its handshake is done */
+static bool dtls_wolf_peer_expired(struct tls_context *ctx)
+{
+	return ctx->type == SOCK_DGRAM && ctx->options.role == ZTLS_IS_SERVER &&
+	       is_handshake_complete(ctx) && sys_timepoint_expired(ctx->dtls_rx_expiry);
 }
 #else
 static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
@@ -5651,8 +5674,19 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 
 			if (err == WOLFSSL_ERROR_WANT_READ ||
 			    err == WOLFSSL_ERROR_WANT_WRITE) {
-				ret = tls_wolfssl_wait_rx(ctx, is_block, end, err);
-				if (ret >= 0) {
+				k_timepoint_t wait_end = end;
+
+				if (dtls_wolf_peer_expired(ctx)) {
+					return -ETIMEDOUT;
+				}
+
+				if (ctx->options.role == ZTLS_IS_SERVER &&
+				    sys_timepoint_cmp(ctx->dtls_rx_expiry, end) < 0) {
+					wait_end = ctx->dtls_rx_expiry;
+				}
+
+				ret = tls_wolfssl_wait_rx(ctx, is_block, wait_end, err);
+				if (ret >= 0 || (ret == -EAGAIN && !sys_timepoint_expired(end))) {
 					continue;
 				}
 
@@ -5806,7 +5840,11 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 			return ret;
 		}
 
-		if (ret == -ENOTCONN) {
+		if (ret == -ETIMEDOUT) {
+			(void)wolfSSL_shutdown(ctx->wssl);
+		}
+
+		if (ret == -ENOTCONN || ret == -ETIMEDOUT) {
 			ret = tls_wolfssl_reset(ctx);
 			if (ret == 0) {
 				repeat = true;
@@ -6235,6 +6273,13 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 {
 	int ret;
 
+#if defined(CONFIG_WOLFSSL)
+	/* A peek would read the EOF as an error, while recv() reports it as 0 */
+	if (ctx->recv_eof) {
+		return -ENOTCONN;
+	}
+#endif
+
 	if (ctx->type == SOCK_STREAM) {
 		if (!ctx->is_initialized) {
 			return -ENOTCONN;
@@ -6295,6 +6340,11 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 		if (err == WOLFSSL_ERROR_WANT_READ ||
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+			if (dtls_wolf_peer_expired(ctx)) {
+				return tls_wolfssl_reset(ctx) == 0 ? -ENOTCONN : -ENOMEM;
+			}
+#endif
 			return 0;
 		}
 

@@ -41,6 +41,17 @@ tests:
       - EXTRA_CONF_FILE=overlay-wolfssl.conf
     extra_configs:
       - CONFIG_WOLFSSL_DTLS_CID=y
+  net.socket.tls.wolfssl_dtls_no_timeout:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_NET_SOCKETS_DTLS_TIMEOUT=0
   net.socket.tls.wolfssl_ocsp_stapling:
     platform_allow:
       - native_sim

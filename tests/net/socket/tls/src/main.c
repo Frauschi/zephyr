@@ -2705,6 +2705,44 @@ ZTEST(net_socket_tls, test_poll_tls_pollhup)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+/* poll() after a read shutdown reports EOF and leaves the session usable for sending */
+ZTEST(net_socket_tls, test_poll_tls_pollin_after_shutdown_rd)
+{
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	struct zsock_pollfd fds[1];
+	int ret;
+
+	test_prepare_tls_connection(AF_INET6);
+
+	test_shutdown(c_sock, ZSOCK_SHUT_RD);
+
+	fds[0].fd = c_sock;
+	fds[0].events = ZSOCK_POLLIN;
+
+	ret = zsock_poll(fds, 1, 100);
+	zassert_equal(ret, 1, "poll() should've report event");
+	zassert_true(fds[0].revents & ZSOCK_POLLIN, "No POLLIN event");
+	zassert_false(fds[0].revents & ZSOCK_POLLERR, "Unexpected POLLERR event");
+
+	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, 0, "recv() did not report EOF (%d)", errno);
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed (%d)", errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	/* The peer reads a close_notify, not a bare FIN */
+	test_close(c_sock);
+	c_sock = -1;
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, 0, "recv() did not report a clean close (%d)", errno);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
 ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 {
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
@@ -2733,6 +2771,162 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 
 	/* Small delay for the final alert exchange */
 	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
+}
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Connects sock to the DTLS server and checks the server reads its byte from port */
+static void dtls_server_expect_client(int sock, struct sockaddr *s_saddr, uint16_t port)
+{
+	struct connect_data test_data = { .sock = sock, .addr = s_saddr };
+	struct zsock_pollfd fds[1] = { { .fd = s_sock, .events = ZSOCK_POLLIN } };
+	struct sockaddr addr;
+	socklen_t addrlen = sizeof(addr);
+	uint8_t rx_buf;
+	int ret;
+
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	ret = zsock_poll(fds, 1, 5000);
+	zassert_equal(ret, 1, "poll() did not report data ready");
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, &addr, &addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recvfrom() failed (%d)", errno);
+	zassert_equal(net_sin(&addr)->sin_port, htons(port), "Data from the wrong peer");
+
+	test_work_wait(&test_data.work);
+}
+
+/* Server on SERVER_PORT with an established client on CLIENT_1_PORT that then goes silent */
+static void dtls_prepare_silent_peer(struct sockaddr *s_saddr)
+{
+	struct sockaddr c_saddr;
+	int role = TLS_DTLS_ROLE_SERVER;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, (struct sockaddr_in *)s_saddr,
+			     IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_1_PORT, &c_sock, (struct sockaddr_in *)&c_saddr,
+			     IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	test_bind(s_sock, s_saddr, sizeof(struct sockaddr_in));
+	test_bind(c_sock, &c_saddr, sizeof(struct sockaddr_in));
+
+	dtls_server_expect_client(c_sock, s_saddr, CLIENT_1_PORT);
+}
+#endif
+
+/* poll() on a DTLS server reports POLLHUP once its peer is silent for the DTLS timeout */
+ZTEST(net_socket_tls, test_poll_dtls_server_drops_silent_peer)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && CONFIG_NET_SOCKETS_DTLS_TIMEOUT > 0
+	struct sockaddr s_saddr, c2_saddr;
+	struct zsock_pollfd fds[1];
+	uint8_t rx_buf;
+	int ret = 0;
+
+	dtls_prepare_silent_peer(&s_saddr);
+
+	fds[0].fd = s_sock;
+	fds[0].events = ZSOCK_POLLIN;
+
+	for (int i = 0; i < 3 * CONFIG_NET_SOCKETS_DTLS_TIMEOUT / 100 && ret == 0; i++) {
+		ret = zsock_poll(fds, 1, 100);
+	}
+	zassert_equal(ret, 1, "poll() did not report the silent peer gone");
+	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "No POLLHUP event");
+
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should report EAGAIN");
+	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			     (struct sockaddr_in *)&c2_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock_2);
+	test_bind(c_sock_2, &c2_saddr, sizeof(struct sockaddr_in));
+	dtls_server_expect_client(c_sock_2, &s_saddr, CLIENT_2_PORT);
+
+	test_sockets_close();
+#else
+	ztest_test_skip();
+#endif
+}
+
+/* A blocking recv() on a DTLS server ends a session whose peer is silent for the DTLS timeout */
+ZTEST(net_socket_tls, test_dtls_server_recv_drops_silent_peer)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && CONFIG_NET_SOCKETS_DTLS_TIMEOUT > 0
+	struct timeval timeo_optval = {
+		.tv_sec = CONFIG_NET_SOCKETS_DTLS_TIMEOUT / MSEC_PER_SEC + 1,
+		.tv_usec = CONFIG_NET_SOCKETS_DTLS_TIMEOUT % MSEC_PER_SEC * USEC_PER_MSEC,
+	};
+	struct sockaddr s_saddr, c2_saddr;
+	uint8_t rx_buf;
+	int ret;
+
+	dtls_prepare_silent_peer(&s_saddr);
+
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, -1, "recv() should report EAGAIN");
+	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	/* The server sent a close_notify when it gave up on the peer */
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should report ENOTCONN");
+	zassert_equal(errno, ENOTCONN, "Unexpected errno value: %d", errno);
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, CLIENT_2_PORT, &c_sock_2,
+			     (struct sockaddr_in *)&c2_saddr, IPPROTO_DTLS_1_2);
+	test_config_psk(-1, c_sock_2);
+	test_bind(c_sock_2, &c2_saddr, sizeof(struct sockaddr_in));
+	dtls_server_expect_client(c_sock_2, &s_saddr, CLIENT_2_PORT);
+
+	test_sockets_close();
+#else
+	ztest_test_skip();
+#endif
+}
+
+/* A DTLS server with the DTLS timeout set to 0 never drops a silent peer */
+ZTEST(net_socket_tls, test_dtls_server_no_timeout_keeps_silent_peer)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && CONFIG_NET_SOCKETS_DTLS_TIMEOUT == 0
+	struct timeval timeo_optval = { .tv_sec = 1 };
+	struct zsock_pollfd fds[1];
+	struct sockaddr s_saddr;
+	uint8_t rx_buf;
+	int ret = 0;
+
+	dtls_prepare_silent_peer(&s_saddr);
+
+	fds[0].fd = s_sock;
+	fds[0].events = ZSOCK_POLLIN;
+
+	for (int i = 0; i < 30 && ret == 0; i++) {
+		ret = zsock_poll(fds, 1, 100);
+	}
+	zassert_equal(ret, 0, "poll() reported an event (revents 0x%x)", fds[0].revents);
+
+	zassert_ok(zsock_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &timeo_optval,
+				    sizeof(timeo_optval)));
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, -1, "recv() should report EAGAIN");
+	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should report EAGAIN");
+	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	rx_buf = 0;
+	test_send(c_sock, &rx_buf, sizeof(rx_buf), 0);
+	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed (%d)", errno);
+
+	test_sockets_close();
 #else
 	ztest_test_skip();
 #endif
