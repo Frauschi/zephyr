@@ -37,6 +37,16 @@ tests:
       - EXTRA_CONF_FILE=overlay-wolfssl.conf
     extra_configs:
       - CONFIG_COMPILER_OPT="-DNO_WOLFSSL_SERVER"
+  net.socket.tls.ext.wolfssl.build.server_only:
+    build_only: true
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_COMPILER_OPT="-DNO_WOLFSSL_CLIENT"
   net.socket.tls.ext.wolfssl.ocsp_stapling:
     platform_allow:
       - native_sim

@@ -195,7 +195,8 @@ extern "C" {
  */
 #define TLS_SESSION_CACHE 12
 /** Write-only socket option to purge session cache immediately.
- *  This option accepts any value.
+ *  This option accepts any value. Under wolfSSL, a listening socket also stops
+ *  resuming the session tickets it issued so far.
  */
 #define TLS_SESSION_CACHE_PURGE 13
 /** Write-only socket option to control DTLS CID.
@@ -260,9 +261,9 @@ extern "C" {
  *  certificates and decide whether to proceed or abort the handshake.
  *
  *  The option is only available if CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
- *  Kconfig option is enabled AND the mbedTLS backend is in use. Under
- *  CONFIG_WOLFSSL, setsockopt(TLS_CERT_VERIFY_CALLBACK) returns -ENOTSUP;
- *  use TLS_CERT_VERIFY_CALLBACK_WOLFSSL instead.
+ *  Kconfig option is enabled and the mbedTLS backend is in use. Under
+ *  CONFIG_WOLFSSL, setsockopt(TLS_CERT_VERIFY_CALLBACK) fails with -1 and
+ *  errno ENOTSUP; use TLS_CERT_VERIFY_CALLBACK_WOLFSSL instead.
  */
 #define TLS_CERT_VERIFY_CALLBACK 20
 /** Write-only socket option to configure per-socket Max Fragment Length (MFL).
@@ -278,16 +279,17 @@ extern "C" {
  *  TLS_MFL_DEFAULT to revert a socket back to this default after a
  *  previous call has overridden it.
  *
- *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH and CONFIG_WOLFSSL;
- *  under the mbedTLS backend setsockopt returns -ENOPROTOOPT.
+ *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH, CONFIG_WOLFSSL and
+ *  wolfSSL's HAVE_MAX_FRAGMENT; otherwise setsockopt fails with -1 and errno
+ *  ENOPROTOOPT.
  */
 #define TLS_MAX_FRAGMENT_LENGTH 21
 /** Write-only socket option to register a wolfSSL-style cert-verify callback.
  *  The option accepts a pointer to a @ref tls_cert_verify_cb_wolfssl structure.
  *
  *  Only honored when CONFIG_WOLFSSL_VERIFY_CALLBACK is enabled and CONFIG_WOLFSSL
- *  is the active TLS backend; under the mbedTLS backend setsockopt returns
- *  -ENOPROTOOPT. The numeric value (22) is reserved unconditionally so the
+ *  is the active TLS backend; otherwise setsockopt fails with -1 and errno
+ *  ENOPROTOOPT. The numeric value (22) is reserved unconditionally so the
  *  socket option-number space stays stable across backends.
  */
 #define TLS_CERT_VERIFY_CALLBACK_WOLFSSL 22

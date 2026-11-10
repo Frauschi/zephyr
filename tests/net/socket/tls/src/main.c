@@ -1799,7 +1799,7 @@ ZTEST(net_socket_tls, test_send_while_recv)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-void tls_set_cs_cb(void)
+static void tls_set_cs_cb(void)
 {
 	int ret = zsock_setsockopt(s_sock, SOL_TLS, TLS_CIPHERSUITE_LIST,
 				   (void *)cipher_list_psk, sizeof(cipher_list_psk));
@@ -1809,7 +1809,7 @@ void tls_set_cs_cb(void)
 	zassert_equal(ret, 0, "Unable to set ciphersuites on client");
 }
 
-void tls_set_cs_mismatch_cb(void)
+static void tls_set_cs_mismatch_cb(void)
 {
 	/* Set mismatched ciphersuites, should not connect */
 	int ret = zsock_setsockopt(c_sock, SOL_TLS, TLS_CIPHERSUITE_LIST,
@@ -1906,7 +1906,7 @@ ZTEST(net_socket_tls, test_set_ciphersuites_err)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-void tls_set_hostname_cb(void)
+static void tls_set_hostname_cb(void)
 {
 	int ret = zsock_setsockopt(c_sock, SOL_TLS, TLS_HOSTNAME,
 				   (void *)MY_DEFLT_HOSTNAME, strlen(MY_DEFLT_HOSTNAME));
@@ -1938,7 +1938,7 @@ ZTEST(net_socket_tls, test_set_hostname)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-void tls_set_session_cache_cb(void)
+static void tls_set_session_cache_cb(void)
 {
 	int t = TLS_SESSION_CACHE_ENABLED;
 	int l = sizeof(int);
@@ -2138,6 +2138,42 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+#if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
+/* Accepts a new PSK client on s_sock into new_sock, closing the previous pair */
+static void accept_shares_ctx_connect(struct sockaddr_in *s_saddr)
+{
+	sec_tag_t sec_tag_list[] = { PSK_TAG };
+	struct sockaddr_in c_saddr;
+	struct sockaddr addr;
+	socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+
+	if (c_sock >= 0) {
+		test_close(c_sock);
+		c_sock = -1;
+	}
+	if (new_sock >= 0) {
+		test_close(new_sock);
+		new_sock = -1;
+	}
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, IPPROTO_TLS_1_2);
+	/* Re-adding the PSK would change the credentials and so the listener's CTX */
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_SEC_TAG_LIST, sec_tag_list,
+				    sizeof(sec_tag_list)));
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_CIPHERSUITE_LIST, cipher_list_psk,
+				    sizeof(cipher_list_psk)));
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct sockaddr *)s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+}
+#endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
+
 /* Sockets accepted from one listener share its CTX, so the credentials load once */
 ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 {
@@ -2149,7 +2185,7 @@ ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 	struct sockaddr addr;
 	socklen_t addrlen = sizeof(addr);
 	struct connect_data test_data;
-	sec_tag_t sec_tag_list[] = { PSK_TAG };
+	const int verify_none = TLS_PEER_VERIFY_NONE;
 	int first_sock;
 	int reuse = 1;
 
@@ -2182,29 +2218,38 @@ ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
 			  "accepted sockets use different CTXs");
 
-	/* The cipher list picks the CTX method, so the next accept() builds a new CTX */
-	test_close(new_sock);
-	new_sock = -1;
 	test_close(c_sock_2);
 	c_sock_2 = -1;
+
+	/* A per-session option keeps the listener's CTX */
 	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_CIPHERSUITE_LIST, cipher_list_psk,
 				    sizeof(cipher_list_psk)));
-	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, IPPROTO_TLS_1_2);
-	/* Re-adding the PSK would change the credentials and so the listener's CTX */
-	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_SEC_TAG_LIST, sec_tag_list,
-				    sizeof(sec_tag_list)));
-	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_CIPHERSUITE_LIST, cipher_list_psk,
-				    sizeof(cipher_list_psk)));
-	test_data.sock = c_sock;
-	test_work_reschedule(&test_data.work, K_NO_WAIT);
-	test_accept(s_sock, &new_sock, &addr, &addrlen);
-	test_work_wait(&test_data.work);
+	accept_shares_ctx_connect(&s_saddr);
+	zassert_equal_ptr(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "TLS_CIPHERSUITE_LIST rebuilt the listener's CTX");
 
+	/* An option the CTX holds rebuilds it */
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_PEER_VERIFY, &verify_none,
+				    sizeof(verify_none)));
+	accept_shares_ctx_connect(&s_saddr);
 	zassert_not_equal(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
 			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
-			  "TLS_CIPHERSUITE_LIST kept the listener's CTX");
-
+			  "TLS_PEER_VERIFY kept the listener's CTX");
 	test_close(first_sock);
+
+#if defined(HAVE_SESSION_TICKET)
+	/* A new CTX drops the ticket key of the old one */
+	first_sock = new_sock;
+	new_sock = -1;
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_SESSION_CACHE_PURGE, NULL, 0));
+	accept_shares_ctx_connect(&s_saddr);
+	zassert_not_equal(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "TLS_SESSION_CACHE_PURGE kept the listener's CTX");
+	test_close(first_sock);
+#endif /* HAVE_SESSION_TICKET */
+
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 #endif
@@ -2451,7 +2496,7 @@ const char *alpn_list[] = {
 	"http/1.1"
 };
 
-void tls_set_alpn_cb(void)
+static void tls_set_alpn_cb(void)
 {
 	socklen_t len = sizeof(alpn_list);
 	int ret = zsock_setsockopt(s_sock, SOL_TLS, TLS_ALPN_LIST,

@@ -595,6 +595,35 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_none)
 	test_tls_cert_verify_result_common(TLS_PEER_VERIFY_NONE, 0);
 }
 
+/* A failed handshake keeps the verify result that failed it */
+ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_required_bad_cn)
+{
+	const int required = TLS_PEER_VERIFY_REQUIRED;
+	int server_fd, client_fd, ret;
+	k_tid_t server_thread_id;
+	struct sockaddr_in sa;
+	uint32_t optval;
+	socklen_t optlen = sizeof(optval);
+
+	server_fd = test_configure_server(&server_thread_id, TLS_PEER_VERIFY_NONE,
+					  false, true);
+	client_fd = test_configure_client(&sa, false, "dummy");
+
+	ret = zsock_setsockopt(client_fd, SOL_TLS, TLS_PEER_VERIFY, &required,
+			       sizeof(required));
+	zassert_ok(ret, "failed to set TLS_PEER_VERIFY (%d)", errno);
+
+	ret = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+	zassert_equal(ret, -1, "connect() should've failed");
+
+	ret = zsock_getsockopt(client_fd, SOL_TLS, TLS_CERT_VERIFY_RESULT,
+			       &optval, &optlen);
+	zassert_ok(ret, "getsockopt failed (%d)", errno);
+	zassert_true(optval & MBEDTLS_X509_BADCERT_CN_MISMATCH, "verify result 0x%x", optval);
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+}
+
 static uint32_t resumed_verify_result[2];
 
 /* arg1 is the number of connections to accept */
@@ -1477,6 +1506,98 @@ ZTEST(net_socket_tls_api_extension, test_tls_hostname_ip_san)
 	(void)tls_credential_delete(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE);
 	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Runs the handshake of each DTLS server until its first record or its timeout */
+static void server_thread_dtls_recv_each_fn(void *arg0, void *arg1, void *arg2)
+{
+	char buf[16];
+
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+	(void)zsock_recv(POINTER_TO_INT(arg0), buf, sizeof(buf), 0);
+	(void)zsock_recv(POINTER_TO_INT(arg1), buf, sizeof(buf), 0);
+}
+
+static int dtls_server_socket(uint16_t port)
+{
+	static const sec_tag_t server_tags[] = { SERVER_CERTIFICATE_TAG };
+	const int role = TLS_DTLS_ROLE_SERVER;
+	const struct timeval timeo = { .tv_sec = 1 };
+	struct sockaddr_in sa = {
+		.sin_family = AF_INET,
+		.sin_port = htons(port),
+	};
+	int fd;
+
+	fd = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_DTLS_1_2);
+	zassert_not_equal(fd, -1, "failed to create server socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(fd, SOL_TLS, TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(fd, SOL_TLS, TLS_SEC_TAG_LIST, server_tags,
+				    sizeof(server_tags)));
+	zassert_ok(zsock_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeo, sizeof(timeo)));
+	zassert_equal(zsock_inet_pton(AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+	zassert_ok(zsock_bind(fd, (struct sockaddr *)&sa, sizeof(sa)),
+		   "failed to bind (%d)", errno);
+
+	return fd;
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
+/* wolfSSL-only: a DTLS client that changes TLS_SEC_TAG_LIST stops trusting the old CA */
+ZTEST(net_socket_tls_api_extension, test_dtls_client_sec_tag_change)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	static const sec_tag_t client_tags[][1] = { { CA_CERTIFICATE_TAG }, { IP_SAN_CA_TAG } };
+	int server_fd[ARRAY_SIZE(client_tags)];
+	struct sockaddr_in sa = { .sin_family = AF_INET };
+	int client_fd, r;
+
+	/* Added first, so that only the sec tag change can rebuild the client's CTX */
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	k_sem_init(&server_sem, 0, 1);
+
+	for (int i = 0; i < ARRAY_SIZE(server_fd); i++) {
+		server_fd[i] = dtls_server_socket(PORT + i);
+	}
+
+	k_thread_create(&server_thread, server_stack, STACK_SIZE,
+			server_thread_dtls_recv_each_fn, INT_TO_POINTER(server_fd[0]),
+			INT_TO_POINTER(server_fd[1]), NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	client_fd = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_DTLS_1_2);
+	zassert_not_equal(client_fd, -1, "failed to create client socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_HOSTNAME, "localhost",
+				    sizeof("localhost")));
+	zassert_equal(zsock_inet_pton(AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+
+	for (int i = 0; i < ARRAY_SIZE(client_tags); i++) {
+		zassert_ok(zsock_setsockopt(client_fd, SOL_TLS, TLS_SEC_TAG_LIST,
+					    client_tags[i], sizeof(client_tags[i])));
+		sa.sin_port = htons(PORT + i);
+
+		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
+		if (i == 0) {
+			zassert_ok(r, "failed to connect (%d)", errno);
+			r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+			zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		} else {
+			zassert_equal(r, -1, "the old sec tag list's CA verified the server");
+		}
+	}
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	for (int i = 0; i < ARRAY_SIZE(server_fd); i++) {
+		zassert_ok(zsock_close(server_fd[i]), "close() failed (%d)", errno);
+	}
+#endif
 }
 #endif /* CONFIG_TLS_CREDENTIALS */
 
@@ -2417,6 +2538,9 @@ static void tls_ext_after(void *fixture)
 	(void)tls_credential_delete(CHAIN_A_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(CHAIN_B_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(CHAIN_KEY_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
+	(void)tls_credential_delete(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE);
+	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
+	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
 }
 
 ZTEST_SUITE(net_socket_tls_api_extension, tls_ext_predicate, setup, TLS_EXT_BEFORE,
