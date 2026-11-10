@@ -263,9 +263,6 @@ __net_socket struct tls_context {
 	/** The read side was shut down; send() still works. */
 	bool recv_eof : 1;
 
-	/* Set when the application chose TLS_DTLS_ROLE; tls_wolfssl_init() derives it otherwise */
-	bool role_set : 1;
-
 	/* ctx is a reference to the listening socket's CTX */
 	bool ctx_shared : 1;
 
@@ -513,6 +510,7 @@ static struct k_mutex context_lock;
 static int tls_release(struct tls_context *tls);
 #if defined(CONFIG_WOLFSSL)
 static int tls_wolfssl_session_init(struct tls_context *context, bool is_server);
+static int tls_wolfssl_ctx_get(struct tls_context *context, bool is_server);
 static word32 tls_der_chain_len(const byte *der, word32 der_len);
 #endif
 
@@ -2794,7 +2792,7 @@ exit:
 
 #if defined(CONFIG_WOLFSSL)
 
-/* A shared CTX is only unloaded by accept(), which passes the listener and holds its lock */
+/* Only accept() unloads a shared CTX, under the listener lock */
 static void tls_wolfssl_drop_chain_cas(struct tls_context *context, struct tls_context *listener)
 {
 	struct tls_context *owner = context->ctx_shared ? listener : context;
@@ -2824,36 +2822,46 @@ static void tls_wolfssl_clear_session_state(struct tls_context *context, bool fa
 	context->failed = failed;
 }
 
+/* A server forgets its peer so that a new client can connect; a client keeps it */
+static void dtls_peer_address_clear(struct tls_context *context)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	if (context->options.role == ZTLS_IS_SERVER) {
+		(void)memset(&context->dtls_peer_addr, 0, sizeof(context->dtls_peer_addr));
+		context->dtls_peer_addrlen = 0;
+	}
+#else
+	ARG_UNUSED(context);
+#endif
+}
+
 static int tls_wolfssl_reset(struct tls_context *context)
 {
+	int ret = 0;
+
 	if (context->type == SOCK_STREAM) {
 		/* A failed TCP session is never used again, and keeps its verify result */
 		tls_wolfssl_drop_chain_cas(context, NULL);
 		context->failed = true;
-	} else if (context->ctx != NULL) {
+	} else if (context->wssl != NULL) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
-		int ret;
 
 		/* wolfSSL_clear() keeps extensions such as ALPN and MFL, so start a new object */
 		ret = tls_wolfssl_session_init(context, is_server);
 		if (ret != 0) {
-			return ret;
+			/* The old object finished its handshake, so the socket sets up again */
+			wolfSSL_free(context->wssl);
+			context->wssl = NULL;
+			context->is_initialized = false;
 		}
 	} else {
 		tls_wolfssl_clear_session_state(context, false);
 	}
 
 	k_sem_reset(&context->tls_established);
+	dtls_peer_address_clear(context);
 
-#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	if (context->options.role == ZTLS_IS_SERVER) {
-		(void)memset(&context->dtls_peer_addr, 0,
-			     sizeof(context->dtls_peer_addr));
-		context->dtls_peer_addrlen = 0;
-	}
-#endif
-
-	return 0;
+	return ret;
 }
 
 static ssize_t send_tls(struct tls_context *ctx, const void *buf,
@@ -2930,9 +2938,10 @@ static ssize_t send_tls(struct tls_context *ctx, const void *buf,
 			}
 		} else {
 			NET_ERR("TLS send error: %x", err);
-			if (tls_wolfssl_reset(ctx) != 0) {
-				ctx->error = ENOMEM;
-				errno = ENOMEM;
+			err = tls_wolfssl_reset(ctx);
+			if (err != 0) {
+				ctx->error = -err;
+				errno = -err;
 			} else {
 				ctx->error = ECONNABORTED;
 				errno = ECONNABORTED;
@@ -3795,6 +3804,17 @@ static int tls_wolfssl_session_init(struct tls_context *context, bool is_server)
 	int mfl;
 #endif
 
+	/* Drops the old session's chain CAs while its CTX is still reachable */
+	tls_wolfssl_drop_chain_cas(context, NULL);
+
+	/* A DTLS socket keeps its CTX from peer to peer, so it is rebuilt here when out of date */
+	if (context->type == SOCK_DGRAM) {
+		ret = tls_wolfssl_ctx_get(context, is_server);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
 	if (context->wssl != NULL) {
 		wolfSSL_free(context->wssl);
 	}
@@ -3933,12 +3953,10 @@ static int tls_wolfssl_ocsp_status_cb(WOLFSSL *ssl, int err, byte *resp, word32 
 }
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_OCSP_STAPLING */
 
+/* connect() handshakes as a client, also on a socket set up as a DTLS server */
 static void tls_wolfssl_role_set(struct tls_context *context, bool is_server)
 {
-	/* connect() must not demote a socket configured as a DTLS server */
-	if (!context->role_set) {
-		context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
-	}
+	context->options.role = is_server ? ZTLS_IS_SERVER : ZTLS_IS_CLIENT;
 }
 
 /* Builds the CTX, which accept() children share with their listening socket */
@@ -4062,7 +4080,8 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 	wolfSSL_Debugging_ON();
 #endif /* CONFIG_WOLFSSL_DEBUG */
 
-	if (!context->ctx_shared) {
+	/* A DTLS socket gets its CTX in tls_wolfssl_session_init() */
+	if (!context->ctx_shared && context->type != SOCK_DGRAM) {
 		ret = tls_wolfssl_ctx_get(context, is_server);
 		if (ret != 0) {
 			goto err_cleanup;
@@ -4102,6 +4121,18 @@ err_cleanup:
 static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context *child)
 {
 	int ret;
+
+#if defined(HAVE_SECURE_RENEGOTIATION) && !defined(WOLFSSL_NO_TLS12)
+	/* A child renegotiates outside the listener lock, while accept() unloads a shared CTX */
+	bool overrides = parent->options.verify_level == TLS_PEER_VERIFY_OPTIONAL;
+
+#if defined(CONFIG_WOLFSSL_VERIFY_CALLBACK)
+	overrides = overrides || parent->options.cert_verify_wolfssl.cb != NULL;
+#endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
+	if (overrides && parent->tls_version != IPPROTO_TLS_1_3) {
+		return 0;
+	}
+#endif /* HAVE_SECURE_RENEGOTIATION && !WOLFSSL_NO_TLS12 */
 
 	tls_wolfssl_role_set(parent, true);
 	ret = tls_wolfssl_ctx_get(parent, true);
@@ -4865,6 +4896,7 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	static atomic_t wolfssl_ready;
 #endif
 
+	ARG_UNUSED(context);
 	ARG_UNUSED(optval);
 	ARG_UNUSED(optlen);
 
@@ -4987,7 +5019,6 @@ static int tls_opt_dtls_role_set(struct tls_context *context,
 
 	context->options.role = *role;
 #if defined(CONFIG_WOLFSSL)
-	context->role_set = true;
 	context->ctx_stale = true;
 #endif
 
@@ -5192,6 +5223,16 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 		errno = EISCONN;
 		return -1;
 	}
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	/* connect() would retarget or orphan the session of a server serving a peer */
+	if (ctx->type == SOCK_DGRAM && ctx->options.role == ZTLS_IS_SERVER &&
+	    ctx->dtls_peer_addrlen != 0 && ctx->wssl != NULL &&
+	    wolfSSL_is_stateful(ctx->wssl)) {
+		errno = EISCONN;
+		return -1;
+	}
+#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 #endif /* CONFIG_WOLFSSL */
 
 	sock_flags = zsock_fcntl(ctx->sock, F_GETFL, 0);
@@ -5793,7 +5834,7 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 					return -ETIMEDOUT;
 				}
 
-				if (ctx->options.role == ZTLS_IS_SERVER &&
+				if (ctx->options.role == ZTLS_IS_SERVER && is_handshake_complete(ctx) &&
 				    sys_timepoint_cmp(ctx->dtls_rx_expiry, end) < 0) {
 					wait_end = ctx->dtls_rx_expiry;
 				}
@@ -5864,6 +5905,7 @@ static ssize_t recvfrom_dtls_client(struct tls_context *ctx, void *buf,
 				    socklen_t *addrlen)
 {
 	int ret;
+	int err;
 
 	if (!is_handshake_complete(ctx)) {
 		ret = -ENOTCONN;
@@ -5884,8 +5926,9 @@ static ssize_t recvfrom_dtls_client(struct tls_context *ctx, void *buf,
 		ret = -ECONNABORTED;
 	}
 
-	if (tls_wolfssl_reset(ctx) != 0) {
-		ret = -ENOMEM;
+	err = tls_wolfssl_reset(ctx);
+	if (err != 0) {
+		ret = err;
 	}
 
 	ctx->error = -ret;
@@ -5936,8 +5979,6 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 				ret = tls_wolfssl_reset(ctx);
 				if (ret == 0) {
 					repeat = true;
-				} else {
-					ret = -ENOMEM;
 				}
 
 				continue;
@@ -5962,8 +6003,7 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 			if (ret == 0) {
 				repeat = true;
 			} else {
-				ctx->error = ENOMEM;
-				ret = -ENOMEM;
+				ctx->error = -ret;
 			}
 			continue;
 		}
@@ -5973,13 +6013,11 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 
 		NET_ERR("DTLS server recv error: %d", ret);
 
-		if (tls_wolfssl_reset(ctx) != 0) {
-			ctx->error = ENOMEM;
-			ret = -ENOMEM;
-		} else {
-			ctx->error = ECONNABORTED;
+		ret = tls_wolfssl_reset(ctx);
+		if (ret == 0) {
 			ret = -ECONNABORTED;
 		}
+		ctx->error = -ret;
 		break;
 	} while (repeat);
 
@@ -6405,7 +6443,11 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 			ret = tls_backend_init(ctx, is_server);
 			if (ret < 0) {
+#if defined(CONFIG_WOLFSSL)
+				return ret;
+#else
 				return -ENOMEM;
+#endif
 			}
 		}
 
@@ -6418,7 +6460,11 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 				ret = tls_backend_reset(ctx);
 				if (ret != 0) {
+#if defined(CONFIG_WOLFSSL)
+					return ret;
+#else
 					return -ENOMEM;
+#endif
 				}
 
 				return 0;
@@ -6442,8 +6488,9 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 		if (tls_wolfssl_peer_closed(ctx, err)) {
 			if (ctx->type == SOCK_DGRAM) {
-				if (tls_wolfssl_reset(ctx) != 0) {
-					return -ENOMEM;
+				ret = tls_wolfssl_reset(ctx);
+				if (ret != 0) {
+					return ret;
 				}
 			} else {
 				ctx->session_closed = true;
@@ -6455,15 +6502,17 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 		    err == WOLFSSL_ERROR_WANT_WRITE) {
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 			if (dtls_wolf_peer_expired(ctx)) {
-				return tls_wolfssl_reset(ctx) == 0 ? -ENOTCONN : -ENOMEM;
+				ret = tls_wolfssl_reset(ctx);
+				return ret == 0 ? -ENOTCONN : ret;
 			}
 #endif
 			return 0;
 		}
 
 		NET_ERR("TLS data check error: %d", err);
-		if (tls_wolfssl_reset(ctx) != 0) {
-			return -ENOMEM;
+		ret = tls_wolfssl_reset(ctx);
+		if (ret != 0) {
+			return ret;
 		}
 
 		return -ECONNABORTED;
