@@ -271,6 +271,12 @@ __net_socket struct tls_context {
 
 	/* An option that ctx was built from has changed since */
 	bool ctx_stale : 1;
+
+	/* ctx was built for the server role */
+	bool ctx_server : 1;
+
+	/* Returned by accept() */
+	bool accepted : 1;
 #endif /* CONFIG_WOLFSSL */
 
 	/** Socket type. */
@@ -2788,17 +2794,19 @@ exit:
 
 #if defined(CONFIG_WOLFSSL)
 
-/* A shared CTX is only unloaded by accept(), which holds the listener's lock */
-static void tls_wolfssl_drop_chain_cas(struct tls_context *context, bool shared_ok)
+/* A shared CTX is only unloaded by accept(), which passes the listener and holds its lock */
+static void tls_wolfssl_drop_chain_cas(struct tls_context *context, struct tls_context *listener)
 {
-	if (!context->chain_error_overridden || context->ctx == NULL ||
-	    (context->ctx_shared && !shared_ok)) {
+	struct tls_context *owner = context->ctx_shared ? listener : context;
+
+	if (!context->chain_error_overridden || context->ctx == NULL || owner == NULL) {
 		return;
 	}
 
 	if (wolfSSL_CertManagerUnloadIntermediateCerts(wolfSSL_CTX_GetCertManager(context->ctx)) !=
 	    WOLFSSL_SUCCESS) {
 		NET_ERR("Failed to unload the peer's chain CAs");
+		owner->ctx_stale = true;
 		return;
 	}
 
@@ -2807,7 +2815,7 @@ static void tls_wolfssl_drop_chain_cas(struct tls_context *context, bool shared_
 
 static void tls_wolfssl_clear_session_state(struct tls_context *context, bool failed)
 {
-	tls_wolfssl_drop_chain_cas(context, false);
+	tls_wolfssl_drop_chain_cas(context, NULL);
 	context->verify_result_flags = 0;
 	context->resumed_verify_result = 0;
 	context->resumed_psk = false;
@@ -2820,7 +2828,7 @@ static int tls_wolfssl_reset(struct tls_context *context)
 {
 	if (context->type == SOCK_STREAM) {
 		/* A failed TCP session is never used again, and keeps its verify result */
-		tls_wolfssl_drop_chain_cas(context, false);
+		tls_wolfssl_drop_chain_cas(context, NULL);
 		context->failed = true;
 	} else if (context->ctx != NULL) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
@@ -3164,7 +3172,7 @@ static int tls_wolfssl_handshake(struct tls_context *context, k_timeout_t timeou
 
 	/* A client keeps the chain CAs until its handshake ends, for a stapled OCSP response */
 	if (ret != -EAGAIN) {
-		tls_wolfssl_drop_chain_cas(context, false);
+		tls_wolfssl_drop_chain_cas(context, NULL);
 	}
 
 	if (ret == WOLFSSL_SUCCESS) {
@@ -3453,12 +3461,21 @@ static int tls_wolfssl_verify_record(struct tls_context *context, int preverify_
 	return effective_ok;
 }
 
-static int tls_wolfssl_note_chain_override(struct tls_context *context, int preverify_ok,
-					   WOLFSSL_X509_STORE_CTX *store, int ret)
+static int tls_wolfssl_chain_override(struct tls_context *context, int preverify_ok,
+				      WOLFSSL_X509_STORE_CTX *store, int ret)
 {
-	if (ret != 0 && !preverify_ok && store->error_depth > 0) {
-		context->chain_error_overridden = true;
+	if (ret == 0 || preverify_ok || store->error_depth == 0) {
+		return ret;
 	}
+
+#if defined(HAVE_SECURE_RENEGOTIATION)
+	/* A renegotiation runs outside the paths that unload the CAs an override lets in */
+	if (wolfSSL_SSL_renegotiate_pending(context->wssl)) {
+		return preverify_ok;
+	}
+#endif /* HAVE_SECURE_RENEGOTIATION */
+
+	context->chain_error_overridden = true;
 
 	return ret;
 }
@@ -3484,7 +3501,7 @@ static int tls_wolfssl_verify_accumulate_cb(int preverify_ok,
 				 "read TLS_CERT_VERIFY_RESULT before trusting the peer",
 				 context->verify_result_flags);
 		}
-		return tls_wolfssl_note_chain_override(context, preverify_ok, store, 1);
+		return tls_wolfssl_chain_override(context, preverify_ok, store, 1);
 	}
 
 	return effective_ok;
@@ -3517,7 +3534,7 @@ static int tls_wolfssl_verify_cb_wrapper(int preverify_ok,
 	ret = user_cb(effective_ok, store);
 	store->userCtx = context;
 
-	return tls_wolfssl_note_chain_override(context, preverify_ok, store, ret);
+	return tls_wolfssl_chain_override(context, preverify_ok, store, ret);
 }
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
 
@@ -3942,6 +3959,7 @@ static int tls_wolfssl_ctx_setup(struct tls_context *context, bool is_server)
 
 	context->ctx_cred_gen = credentials_generation();
 	context->ctx_stale = false;
+	context->ctx_server = is_server;
 
 	if (context->type == SOCK_STREAM) {
 		wolfSSL_CTX_SetIORecv(context->ctx, tls_wolf_rx);
@@ -4011,13 +4029,14 @@ static int tls_wolfssl_ctx_setup(struct tls_context *context, bool is_server)
 	return tls_wolfssl_set_session_cache_mode(context);
 }
 
-/* Keeps ctx only while the options and credentials it was built from are unchanged */
+/* Keeps ctx only while the role, options and credentials it was built from are unchanged */
 static int tls_wolfssl_ctx_get(struct tls_context *context, bool is_server)
 {
 	int ret;
 
 	if (context->ctx != NULL &&
-	    (context->ctx_stale || context->ctx_cred_gen != credentials_generation())) {
+	    (context->ctx_stale || context->ctx_server != is_server ||
+	     context->ctx_cred_gen != credentials_generation())) {
 		tls_wolfssl_ctx_release(context);
 	}
 
@@ -4083,19 +4102,6 @@ err_cleanup:
 static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context *child)
 {
 	int ret;
-
-#if defined(HAVE_SECURE_RENEGOTIATION)
-	/* Renegotiation verifies chains outside accept(), where a shared CTX is unloaded */
-	if (parent->options.verify_level == TLS_PEER_VERIFY_OPTIONAL) {
-		return 0;
-	}
-
-#if defined(CONFIG_WOLFSSL_VERIFY_CALLBACK)
-	if (parent->options.cert_verify_wolfssl.cb != NULL) {
-		return 0;
-	}
-#endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */
-#endif /* HAVE_SECURE_RENEGOTIATION */
 
 	tls_wolfssl_role_set(parent, true);
 	ret = tls_wolfssl_ctx_get(parent, true);
@@ -4855,14 +4861,21 @@ static int tls_opt_cert_verify_result_get(struct tls_context *context,
 static int tls_opt_session_cache_purge_set(struct tls_context *context,
 					   const void *optval, socklen_t optlen)
 {
-	ARG_UNUSED(context);
+#if defined(CONFIG_WOLFSSL) && !defined(NO_SESSION_CACHE)
+	static atomic_t wolfssl_ready;
+#endif
+
 	ARG_UNUSED(optval);
 	ARG_UNUSED(optlen);
 
 #if defined(CONFIG_WOLFSSL) && !defined(NO_SESSION_CACHE)
 	/* wolfSSL's server-side session cache is global; its lock needs wolfSSL_Init() */
-	(void)wolfSSL_Init();
-	wolfSSL_CTX_flush_sessions(NULL, -1);
+	if (atomic_get(&wolfssl_ready) == 0 && wolfSSL_Init() == WOLFSSL_SUCCESS) {
+		atomic_set(&wolfssl_ready, 1);
+	}
+	if (atomic_get(&wolfssl_ready) != 0) {
+		wolfSSL_CTX_flush_sessions(NULL, -1);
+	}
 #endif
 #if defined(CONFIG_WOLFSSL) && defined(HAVE_SESSION_TICKET)
 	/* A new CTX has a new ticket key, so tickets the old one issued no longer resume */
@@ -5175,8 +5188,7 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 	bool is_non_block;
 
 #if defined(CONFIG_WOLFSSL)
-	/* An accepted socket runs handshakes on its listener's CTX only from accept() */
-	if (ctx->ctx_shared) {
+	if (ctx->accepted) {
 		errno = EISCONN;
 		return -1;
 	}
@@ -5277,6 +5289,10 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 
 	child->sock = sock;
 
+#if defined(CONFIG_WOLFSSL)
+	child->accepted = true;
+#endif /* CONFIG_WOLFSSL */
+
 #if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
 	/* Without locking, wolfSSL cannot count references across threads */
 	ret = tls_wolfssl_ctx_share(parent, child);
@@ -5299,7 +5315,7 @@ int ztls_accept_ctx(struct tls_context *parent, struct sockaddr *addr,
 	ret = tls_backend_handshake(
 		child, K_MSEC(CONFIG_NET_SOCKETS_CONNECT_TIMEOUT));
 #if defined(CONFIG_WOLFSSL)
-	tls_wolfssl_drop_chain_cas(child, true);
+	tls_wolfssl_drop_chain_cas(child, parent);
 #endif /* CONFIG_WOLFSSL */
 	if (ret < 0) {
 		goto error;

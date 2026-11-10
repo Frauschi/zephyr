@@ -1064,19 +1064,89 @@ static void chain_ca_add_credentials(void)
 				      chain_client_key, sizeof(chain_client_key)));
 }
 
-/* Client A sends its CA in its chain, then client B presents a leaf that CA signed */
-static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len)
+#if defined(HAVE_SECURE_RENEGOTIATION)
+/* Like server_thread_resume_fn, but lets a renegotiation fail the first recv() */
+static void server_thread_reneg_fn(void *arg0, void *arg1, void *arg2)
 {
+	const int server_fd = POINTER_TO_INT(arg0);
+	socklen_t optlen;
+	char buf[16];
+	int client_fd;
+	int r;
+
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	for (int i = 0; i < POINTER_TO_INT(arg1); i++) {
+		client_fd = zsock_accept(server_fd, NULL, NULL);
+		zassert_not_equal(client_fd, -1, "accept() failed (%d)", errno);
+
+		optlen = sizeof(resumed_verify_result[i]);
+		r = zsock_getsockopt(client_fd, SOL_TLS, TLS_CERT_VERIFY_RESULT,
+				     &resumed_verify_result[i], &optlen);
+		zassert_ok(r, "getsockopt failed (%d)", errno);
+
+		r = zsock_recv(client_fd, buf, sizeof(buf), 0);
+		if (r == SECRET_SIZE) {
+			r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+			zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		}
+		(void)zsock_close(client_fd);
+	}
+}
+
+/* Returns whether the client's renegotiation completed */
+static bool chain_ca_renegotiate(int client_fd)
+{
+	WOLFSSL *ssl = ztls_get_wolfssl_context(client_fd);
+	int ret = wolfSSL_Rehandshake(ssl);
+	int err;
+
+	for (int i = 0; ret != WOLFSSL_SUCCESS && i < 100; i++) {
+		err = wolfSSL_get_error(ssl, ret);
+		if (err != WOLFSSL_ERROR_WANT_READ && err != WOLFSSL_ERROR_WANT_WRITE) {
+			break;
+		}
+
+		k_msleep(10);
+		ret = wolfSSL_negotiate(ssl);
+	}
+
+	return ret == WOLFSSL_SUCCESS;
+}
+#endif /* HAVE_SECURE_RENEGOTIATION */
+
+/* Client A sends its CA, also in a renegotiation if asked; client B's leaf is signed by it */
+static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len,
+				bool renegotiate)
+{
+	k_thread_entry_t entry = server_thread_resume_fn;
 	k_tid_t server_thread_id;
 	struct sockaddr_in sa;
 	uint8_t rx_buf[16];
+	bool reneg_done = false;
 	int server_fd, client_fd = -1, r;
 
 	chain_ca_add_credentials();
 
+#if defined(HAVE_SECURE_RENEGOTIATION)
+	if (renegotiate) {
+		entry = server_thread_reneg_fn;
+	}
+#endif /* HAVE_SECURE_RENEGOTIATION */
+
 	server_fd = test_configure_server_ex(&server_thread_id, peer_verify,
 					     ARRAY_SIZE(resumed_verify_result), false, NULL, 0,
-					     false, server_thread_resume_fn);
+					     false, entry);
+	if (renegotiate) {
+		/* TLS 1.3 has no renegotiation */
+		const int tls12_suite = 0xC02F;
+
+		r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CIPHERSUITE_LIST, &tls12_suite,
+				     sizeof(tls12_suite));
+		zassert_ok(r, "failed to set TLS_CIPHERSUITE_LIST (%d)", errno);
+	}
 	if (cb != NULL) {
 		r = zsock_setsockopt(server_fd, SOL_TLS, TLS_CERT_VERIFY_CALLBACK_WOLFSSL, cb,
 				     cb_len);
@@ -1095,6 +1165,14 @@ static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len)
 
 		r = zsock_connect(client_fd, (struct sockaddr *)&sa, sizeof(sa));
 		zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+#if defined(HAVE_SECURE_RENEGOTIATION)
+		if (i == 0 && renegotiate) {
+			reneg_done = chain_ca_renegotiate(client_fd);
+			if (!reneg_done) {
+				continue;
+			}
+		}
+#endif /* HAVE_SECURE_RENEGOTIATION */
 		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
 		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
 		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
@@ -1103,6 +1181,7 @@ static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len)
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 
+	zassert_false(reneg_done, "the server renegotiated with a failed chain CA");
 	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
 		      "client A: verify result 0x%x", resumed_verify_result[0]);
 	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
@@ -1116,7 +1195,18 @@ ZTEST(net_socket_tls_api_extension, test_tls_optional_chain_ca_not_learned)
 #if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS)
 	ztest_test_skip();
 #else
-	chain_ca_tcp_common(TLS_PEER_VERIFY_OPTIONAL, NULL, 0);
+	chain_ca_tcp_common(TLS_PEER_VERIFY_OPTIONAL, NULL, 0, false);
+#endif
+}
+
+/* wolfSSL-only: a renegotiation does not let a failed chain CA into the listener's CTX */
+ZTEST(net_socket_tls_api_extension, test_tls_optional_reneg_chain_ca_not_learned)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS) || \
+	!defined(HAVE_SECURE_RENEGOTIATION) || defined(WOLFSSL_NO_TLS12)
+	ztest_test_skip();
+#else
+	chain_ca_tcp_common(TLS_PEER_VERIFY_OPTIONAL, NULL, 0, true);
 #endif
 }
 
@@ -2315,7 +2405,23 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_chain_ca_not_learned)
 		.ctx = &accept_ctx,
 	};
 
-	chain_ca_tcp_common(TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb));
+	chain_ca_tcp_common(TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), false);
+}
+
+/* A verify callback cannot accept a failed chain CA in a renegotiation */
+ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_reneg_chain_ca_not_learned)
+{
+#if !defined(HAVE_SECURE_RENEGOTIATION) || defined(WOLFSSL_NO_TLS12)
+	ztest_test_skip();
+#else
+	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
+	const struct tls_cert_verify_cb_wolfssl cb = {
+		.cb = wolfssl_verify_cb,
+		.ctx = &accept_ctx,
+	};
+
+	chain_ca_tcp_common(TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), true);
+#endif
 }
 
 #endif /* CONFIG_WOLFSSL_VERIFY_CALLBACK */

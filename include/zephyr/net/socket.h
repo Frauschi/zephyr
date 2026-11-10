@@ -280,7 +280,8 @@ extern "C" {
  *  previous call has overridden it.
  *
  *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH, CONFIG_WOLFSSL and
- *  wolfSSL's HAVE_MAX_FRAGMENT; otherwise setsockopt fails with -1 and errno
+ *  a wolfSSL build with HAVE_MAX_FRAGMENT and client support (no
+ *  NO_WOLFSSL_CLIENT); otherwise setsockopt fails with -1 and errno
  *  ENOPROTOOPT.
  */
 #define TLS_MAX_FRAGMENT_LENGTH 21
