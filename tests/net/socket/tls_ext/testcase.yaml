@@ -81,6 +81,15 @@ tests:
       - CONFIG_NET_SOCKETS_ENABLE_DTLS=y
       - CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS=4
       - CONFIG_WOLFSSL_DTLS=y
+  net.socket.tls.ext.wolfssl.renegotiation:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl-verify-cb.conf
+    extra_configs:
+      - CONFIG_COMPILER_OPT="-DHAVE_SECURE_RENEGOTIATION"
   net.socket.tls.ext.wolfssl.verify_cb:
     platform_allow:
       - native_sim

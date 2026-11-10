@@ -2967,10 +2967,11 @@ ZTEST(net_socket_tls, test_poll_tls_pollin_after_shutdown_rd)
 	fds[0].fd = c_sock;
 	fds[0].events = ZSOCK_POLLIN;
 
+	/* The underlying TCP socket reports POLLHUP once its read side is shut down */
 	ret = zsock_poll(fds, 1, 100);
 	zassert_equal(ret, 1, "poll() should've report event");
-	zassert_true(fds[0].revents & ZSOCK_POLLIN, "No POLLIN event");
-	zassert_false(fds[0].revents & ZSOCK_POLLERR, "Unexpected POLLERR event");
+	zassert_equal(fds[0].revents, ZSOCK_POLLIN | ZSOCK_POLLHUP, "revents 0x%x",
+		      fds[0].revents);
 
 	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
 	zassert_equal(ret, 0, "recv() did not report EOF (%d)", errno);
@@ -3043,7 +3044,7 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup_after_shutdown_rd)
 
 	ret = zsock_poll(fds, 1, 100);
 	zassert_equal(ret, 1, "poll() should've report event");
-	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "No POLLHUP event");
+	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "revents 0x%x", fds[0].revents);
 
 	/* Fails if poll() reset the session */
 	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED, &cs, &cs_len);
@@ -3053,6 +3054,57 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup_after_shutdown_rd)
 	ret = zsock_recv(s_sock, rx_buf, sizeof(rx_buf), 0);
 	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed (%d)", errno);
 	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	test_sockets_close();
+
+	/* Small delay for the final alert exchange */
+	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
+}
+
+/* wolfSSL-only: connect() after recv() as a DTLS server handshakes as a client */
+ZTEST(net_socket_tls, test_dtls_connect_after_server_recv)
+{
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	struct net_sockaddr_in c_saddr;
+	struct net_sockaddr_in s_saddr;
+	struct connect_data test_data;
+	int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	net_socklen_t cs_len = sizeof(int);
+	struct zsock_pollfd fds[1];
+	uint8_t rx_buf;
+	int cs;
+	int ret;
+
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, NET_IPPROTO_DTLS_1_2);
+	prepare_sock_dtls_v4(MY_IPV4_ADDR, ANY_PORT, &s_sock, &s_saddr, NET_IPPROTO_DTLS_1_2);
+	test_config_psk(s_sock, c_sock);
+
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr));
+
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
+				    sizeof(role)));
+	test_bind(c_sock, (struct net_sockaddr *)&c_saddr, sizeof(c_saddr));
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should've failed");
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct net_sockaddr *)&s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	/* The server's handshake runs inside poll() */
+	fds[0].fd = s_sock;
+	fds[0].events = ZSOCK_POLLIN;
+	(void)zsock_poll(fds, 1, 1000);
+	test_work_wait(&test_data.work);
+
+	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED, &cs, &cs_len);
+	zassert_ok(ret, "No session after connect() (%d)", errno);
 
 	test_sockets_close();
 
