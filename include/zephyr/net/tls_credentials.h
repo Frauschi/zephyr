@@ -69,7 +69,21 @@ enum tls_credential_type {
 	 *  with a corresponding public certificate, in place of
 	 *  @ref TLS_CREDENTIAL_PRIVATE_KEY.
 	 */
-	TLS_CREDENTIAL_PRIVATE_KEY_PSA
+	TLS_CREDENTIAL_PRIVATE_KEY_PSA,
+
+	/** Reference to a private key held by a cryptographic device, in
+	 *  whatever form that device's driver expects. Register it instead of
+	 *  TLS_CREDENTIAL_PRIVATE_KEY, together with the matching
+	 *  TLS_CREDENTIAL_PUBLIC_CERTIFICATE, when the key itself must not
+	 *  leave the device. The device is the one the crypto backend's build
+	 *  nominates as its default, and the reference is passed through
+	 *  uninterpreted. It is at most 32 bytes long.
+	 *
+	 *  Only supported on the wolfSSL backend with crypto callbacks
+	 *  (CONFIG_WOLFSSL_CRYPTO_CB); otherwise a sec tag list that holds it
+	 *  is refused with ENOTSUP.
+	 */
+	TLS_CREDENTIAL_PRIVATE_KEY_ID
 };
 
 /** Secure tag, a reference to TLS credential

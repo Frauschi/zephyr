@@ -17,6 +17,25 @@ tests:
     extra_args:
       - EXTRA_CONF_FILE=overlay-wolfssl.conf
 
+  net.socket.tls.ext.wolfssl.key_id:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_WOLFSSL_CRYPTO_CB=y
+  net.socket.tls.ext.wolfssl.key_id_offload:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    tags: wolfssl
+    extra_args:
+      - EXTRA_CONF_FILE=overlay-wolfssl.conf
+    extra_configs:
+      - CONFIG_WOLFSSL_CRYPTO_CB=y
+      - CONFIG_COMPILER_OPT="-DWC_USE_DEVID=7"
   net.socket.tls.ext.wolfssl.tls13_only:
     platform_allow:
       - native_sim
