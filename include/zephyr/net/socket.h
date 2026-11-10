@@ -142,6 +142,9 @@ extern "C" {
  *
  *  If not set, socket will use Mbed TLS defaults (none for servers, required
  *  for clients).
+ *
+ *  Under wolfSSL, an error on a certificate above the peer's own fails a
+ *  renegotiation even with optional.
  */
 #define ZSOCK_TLS_PEER_VERIFY 5
 /** Write-only socket option to set role for DTLS connection. This option
@@ -151,6 +154,10 @@ extern "C" {
  *  Mbed TLS values:
  *    - 0 - client
  *    - 1 - server
+ *
+ *  Under wolfSSL, a connect() that runs the handshake makes the socket a
+ *  client, and connect() fails with EISCONN while a server socket is serving
+ *  a peer.
  */
 #define ZSOCK_TLS_DTLS_ROLE 6
 /** Socket option for setting the supported Application Layer Protocols.
@@ -198,11 +205,16 @@ extern "C" {
  *  needs to receive from or poll the socket for the ticket to be processed
  *  and cached. The latest received ticket replaces the cache entry for the
  *  peer.
+ *
+ *  Under wolfSSL with secure renegotiation, a listening socket that allows
+ *  TLS 1.2 and verifies optionally or with a wolfSSL verify callback gives
+ *  each accepted socket its own context, so its session tickets do not resume.
  */
 #define ZSOCK_TLS_SESSION_CACHE 12
 /** Write-only socket option to purge session cache immediately.
- *  This option accepts any value. Under wolfSSL, a listening socket also stops
- *  resuming the session tickets it issued so far.
+ *  This option accepts any value. Under wolfSSL, the listening or DTLS server
+ *  socket it is set on also stops resuming the session tickets it issued so
+ *  far; a DTLS server from its next peer on.
  */
 #define ZSOCK_TLS_SESSION_CACHE_PURGE 13
 /** Write-only socket option to control DTLS CID.
@@ -297,6 +309,9 @@ extern "C" {
  *  is the active TLS backend; otherwise setsockopt fails with -1 and errno
  *  ENOPROTOOPT. The numeric value (22) is reserved unconditionally so the
  *  socket option-number space stays stable across backends.
+ *
+ *  In a renegotiation, an error on a certificate above the peer's own fails
+ *  the handshake whatever the callback returns.
  */
 #define ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL 22
 
