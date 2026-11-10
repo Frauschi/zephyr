@@ -39,7 +39,7 @@ mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd);
 
 uint32_t ztls_get_session_count(void);
 
-/* The SO_RCVBUF tests depend on the record overhead of this one mbedTLS suite */
+/* The server's suites in test_set_ciphersuites() */
 static const int cipher_list_psk[] = {
 	TEST_TLS_PSK_WITH_AES_256_CBC_SHA384,
 	TEST_TLS_PSK_WITH_AES_128_GCM_SHA256
@@ -1849,7 +1849,7 @@ ZTEST(net_socket_tls, test_send_while_recv)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-void tls_set_cs_cb(void)
+static void tls_set_cs_cb(void)
 {
 	int ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
 				   (void *)cipher_list_psk, sizeof(cipher_list_psk));
@@ -1859,7 +1859,7 @@ void tls_set_cs_cb(void)
 	zassert_equal(ret, 0, "Unable to set ciphersuites on client");
 }
 
-void tls_set_cs_mismatch_cb(void)
+static void tls_set_cs_mismatch_cb(void)
 {
 	/* Set mismatched ciphersuites, should not connect */
 	int ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST,
@@ -1956,7 +1956,7 @@ ZTEST(net_socket_tls, test_set_ciphersuites_err)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
-void tls_set_hostname_cb(void)
+static void tls_set_hostname_cb(void)
 {
 	int ret = zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME,
 				   (void *)MY_DEFLT_HOSTNAME, strlen(MY_DEFLT_HOSTNAME));
@@ -2136,7 +2136,7 @@ ZTEST(net_socket_tls, test_dtls_server_empty_datagram)
 #endif
 }
 
-void tls_set_session_cache_cb(void)
+static void tls_set_session_cache_cb(void)
 {
 	int t = ZSOCK_TLS_SESSION_CACHE_ENABLED;
 	int l = sizeof(int);
@@ -2336,6 +2336,43 @@ ZTEST(net_socket_tls, test_session_cache_client_resume)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+#if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
+/* Accepts a new PSK client on s_sock into new_sock, closing the previous pair */
+static void accept_shares_ctx_connect(struct net_sockaddr_in *s_saddr)
+{
+	const int psk_suite[] = { TEST_TLS_PSK_WITH_AES_256_CBC_SHA384 };
+	sec_tag_t sec_tag_list[] = { PSK_TAG };
+	struct net_sockaddr_in c_saddr;
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	struct connect_data test_data;
+
+	if (c_sock >= 0) {
+		test_close(c_sock);
+		c_sock = -1;
+	}
+	if (new_sock >= 0) {
+		test_close(new_sock);
+		new_sock = -1;
+	}
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+
+	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, NET_IPPROTO_TLS_1_2);
+	/* Re-adding the PSK would change the credentials and so the listener's CTX */
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, sec_tag_list,
+				    sizeof(sec_tag_list)));
+	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST, psk_suite,
+				    sizeof(psk_suite)));
+
+	test_data.sock = c_sock;
+	test_data.addr = (struct net_sockaddr *)s_saddr;
+	k_work_init_delayable(&test_data.work, client_connect_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	test_work_wait(&test_data.work);
+}
+#endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
+
 /* Sockets accepted from one listener share its CTX, so the credentials load once */
 ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 {
@@ -2348,7 +2385,7 @@ ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 	net_socklen_t addrlen = sizeof(addr);
 	struct connect_data test_data;
 	const int psk_suite[] = { TEST_TLS_PSK_WITH_AES_256_CBC_SHA384 };
-	sec_tag_t sec_tag_list[] = { PSK_TAG };
+	int verify_none = ZSOCK_TLS_PEER_VERIFY_NONE;
 	int first_sock;
 	int reuse = 1;
 
@@ -2381,29 +2418,38 @@ ZTEST(net_socket_tls, test_tls_accept_shares_ctx)
 			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
 			  "accepted sockets use different CTXs");
 
-	/* The cipher list picks the CTX method, so the next accept() builds a new CTX */
-	test_close(new_sock);
-	new_sock = -1;
 	test_close(c_sock_2);
 	c_sock_2 = -1;
+
+	/* A per-session option keeps the listener's CTX */
 	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST, psk_suite,
 				    sizeof(psk_suite)));
-	prepare_sock_tls_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr, NET_IPPROTO_TLS_1_2);
-	/* Re-adding the PSK would change the credentials and so the listener's CTX */
-	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, sec_tag_list,
-				    sizeof(sec_tag_list)));
-	zassert_ok(zsock_setsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_LIST, psk_suite,
-				    sizeof(psk_suite)));
-	test_data.sock = c_sock;
-	test_work_reschedule(&test_data.work, K_NO_WAIT);
-	test_accept(s_sock, &new_sock, &addr, &addrlen);
-	test_work_wait(&test_data.work);
+	accept_shares_ctx_connect(&s_saddr);
+	zassert_equal_ptr(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "TLS_CIPHERSUITE_LIST rebuilt the listener's CTX");
 
+	/* An option the CTX holds makes the next accept() build a new CTX */
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY, &verify_none,
+				    sizeof(verify_none)));
+	accept_shares_ctx_connect(&s_saddr);
 	zassert_not_equal(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
 			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
-			  "TLS_CIPHERSUITE_LIST kept the listener's CTX");
-
+			  "TLS_PEER_VERIFY kept the listener's CTX");
 	test_close(first_sock);
+
+#if defined(HAVE_SESSION_TICKET)
+	/* A new CTX drops the ticket key of the old one */
+	first_sock = new_sock;
+	new_sock = -1;
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_SESSION_CACHE_PURGE, NULL, 0));
+	accept_shares_ctx_connect(&s_saddr);
+	zassert_not_equal(wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(first_sock)),
+			  wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(new_sock)),
+			  "TLS_SESSION_CACHE_PURGE kept the listener's CTX");
+	test_close(first_sock);
+#endif /* HAVE_SESSION_TICKET */
+
 	test_sockets_close();
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 #endif
@@ -2653,7 +2699,7 @@ const char *alpn_list[] = {
 	"http/1.1"
 };
 
-void tls_set_alpn_cb(void)
+static void tls_set_alpn_cb(void)
 {
 	net_socklen_t len = sizeof(alpn_list);
 	int ret = zsock_setsockopt(s_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_ALPN_LIST,
@@ -2907,6 +2953,44 @@ ZTEST(net_socket_tls, test_poll_tls_pollhup)
 	k_sleep(TCP_TEARDOWN_TIMEOUT);
 }
 
+/* poll() after a read shutdown reports EOF and leaves the session usable for sending */
+ZTEST(net_socket_tls, test_poll_tls_pollin_after_shutdown_rd)
+{
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	struct zsock_pollfd fds[1];
+	int ret;
+
+	test_prepare_tls_connection(NET_AF_INET6);
+
+	test_shutdown(c_sock, ZSOCK_SHUT_RD);
+
+	fds[0].fd = c_sock;
+	fds[0].events = ZSOCK_POLLIN;
+
+	ret = zsock_poll(fds, 1, 100);
+	zassert_equal(ret, 1, "poll() should've report event");
+	zassert_true(fds[0].revents & ZSOCK_POLLIN, "No POLLIN event");
+	zassert_false(fds[0].revents & ZSOCK_POLLERR, "Unexpected POLLERR event");
+
+	ret = zsock_recv(c_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, 0, "recv() did not report EOF (%d)", errno);
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed (%d)", errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
+
+	/* The peer reads a close_notify, not a bare FIN */
+	test_close(c_sock);
+	c_sock = -1;
+	ret = zsock_recv(new_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, 0, "recv() did not report a clean close (%d)", errno);
+
+	test_sockets_close();
+
+	k_sleep(TCP_TEARDOWN_TIMEOUT);
+}
+
 ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 {
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
@@ -2930,6 +3014,45 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup)
 	ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
 	zassert_equal(ret, -1, "zsock_recv() should report EAGAIN");
 	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	test_sockets_close();
+
+	/* Small delay for the final alert exchange */
+	k_msleep(10);
+#else
+	ztest_test_skip();
+#endif
+}
+
+/* poll() after a read shutdown reports POLLHUP and leaves the session usable for sending */
+ZTEST(net_socket_tls, test_poll_dtls_pollhup_after_shutdown_rd)
+{
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	uint8_t rx_buf[sizeof(TEST_STR_SMALL) - 1];
+	struct zsock_pollfd fds[1];
+	net_socklen_t cs_len = sizeof(int);
+	int cs;
+	int ret;
+
+	test_prepare_dtls_connection(NET_AF_INET6);
+
+	test_shutdown(c_sock, ZSOCK_SHUT_RD);
+
+	fds[0].fd = c_sock;
+	fds[0].events = ZSOCK_POLLIN;
+
+	ret = zsock_poll(fds, 1, 100);
+	zassert_equal(ret, 1, "poll() should've report event");
+	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "No POLLHUP event");
+
+	/* Fails if poll() reset the session */
+	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED, &cs, &cs_len);
+	zassert_ok(ret, "The session did not survive poll() (%d)", errno);
+
+	test_send(c_sock, TEST_STR_SMALL, sizeof(TEST_STR_SMALL) - 1, 0);
+	ret = zsock_recv(s_sock, rx_buf, sizeof(rx_buf), 0);
+	zassert_equal(ret, sizeof(TEST_STR_SMALL) - 1, "recv() failed (%d)", errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, ret, "Invalid data received");
 
 	test_sockets_close();
 

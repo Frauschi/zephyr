@@ -366,6 +366,9 @@ __net_socket struct tls_context {
 
 	/* ctx is a reference to the listening socket's CTX */
 	bool ctx_shared : 1;
+
+	/* An option that ctx was built from has changed since */
+	bool ctx_stale : 1;
 #endif /* CONFIG_WOLFSSL */
 
 	/* TLS sessions associated with this socket. In most cases there will
@@ -477,7 +480,7 @@ __net_socket struct tls_context {
 	char *alpn_joined;
 #endif /* HAVE_ALPN */
 
-	/* credentials_generation() when a listening socket built its CTX */
+	/* credentials_generation() when ctx was built */
 	uint32_t ctx_cred_gen;
 
 #ifndef NO_PSK
@@ -925,6 +928,8 @@ static struct tls_context *tls_clone(struct tls_context *source_tls)
 	       sizeof(target_tls->options));
 
 #if defined(CONFIG_WOLFSSL)
+	target_tls->server_hostname_warned = source_tls->server_hostname_warned;
+
 #if defined(HAVE_ALPN)
 	if (source_tls->alpn_joined != NULL) {
 		size_t len = XSTRLEN(source_tls->alpn_joined) + 1;
@@ -3860,8 +3865,11 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 {
 	struct tls_session_context *session_ctx = context->active_session;
 
-	/* A failed TCP session is never used again, so only DTLS needs a new object */
-	if (context->ctx != NULL && context->type != NET_SOCK_STREAM) {
+	if (context->type == NET_SOCK_STREAM) {
+		/* A failed TCP session is never used again, and keeps its verify result */
+		tls_wolfssl_drop_chain_cas(session_ctx, false);
+		session_ctx->failed = true;
+	} else if (context->ctx != NULL) {
 		bool is_server = context->options.role == ZTLS_IS_SERVER;
 		int ret;
 
@@ -3870,10 +3878,11 @@ static int tls_wolfssl_reset_session(struct tls_context *context)
 		if (ret != 0) {
 			return ret;
 		}
+	} else {
+		tls_wolfssl_clear_session_state(session_ctx, false);
 	}
 
 	session_ctx->handshake_timestamp = 0;
-	tls_wolfssl_clear_session_state(session_ctx, context->type == NET_SOCK_STREAM);
 
 	k_sem_reset(&session_ctx->tls_established);
 
@@ -4044,8 +4053,10 @@ static int tls_wolfssl_handshake(struct tls_context *context,
 	return ret;
 }
 
-#ifdef NO_WOLFSSL_SERVER
+#if defined(NO_WOLFSSL_SERVER)
 #define TLS_WOLFSSL_METHOD(is_server, ver) ((is_server) ? NULL : ver##_client_method())
+#elif defined(NO_WOLFSSL_CLIENT)
+#define TLS_WOLFSSL_METHOD(is_server, ver) ((is_server) ? ver##_server_method() : NULL)
 #else
 #define TLS_WOLFSSL_METHOD(is_server, ver) \
 	((is_server) ? ver##_server_method() : ver##_client_method())
@@ -4125,23 +4136,24 @@ static void tls_wolfssl_role_set(struct tls_context *context, bool is_server)
 	}
 }
 
-/* Everything set on the CTX, which accept() children share with their listening socket */
+/* Builds the CTX, which accept() children share with their listening socket */
 static int tls_wolfssl_ctx_setup(struct tls_context *context, bool is_server)
 {
 	WOLFSSL_METHOD *method;
 	int ret;
 
-	if (context->ctx == NULL) {
-		method = tls_wolfssl_get_method(context, is_server);
-		if (method == NULL) {
-			return -ENOTSUP;
-		}
-
-		context->ctx = wolfSSL_CTX_new(method);
-		if (context->ctx == NULL) {
-			return -ENOMEM;
-		}
+	method = tls_wolfssl_get_method(context, is_server);
+	if (method == NULL) {
+		return -ENOTSUP;
 	}
+
+	context->ctx = wolfSSL_CTX_new(method);
+	if (context->ctx == NULL) {
+		return -ENOMEM;
+	}
+
+	context->ctx_cred_gen = credentials_generation();
+	context->ctx_stale = false;
 
 	ret = tls_set_credentials(context);
 	if (ret != 0) {
@@ -4196,6 +4208,28 @@ static int tls_wolfssl_ctx_setup(struct tls_context *context, bool is_server)
 	return tls_wolfssl_set_session_cache_mode(context);
 }
 
+/* Keeps ctx only while the options and credentials it was built from are unchanged */
+static int tls_wolfssl_ctx_get(struct tls_context *context, bool is_server)
+{
+	int ret;
+
+	if (context->ctx != NULL &&
+	    (context->ctx_stale || context->ctx_cred_gen != credentials_generation())) {
+		tls_wolfssl_ctx_release(context);
+	}
+
+	if (context->ctx != NULL) {
+		return 0;
+	}
+
+	ret = tls_wolfssl_ctx_setup(context, is_server);
+	if (ret != 0) {
+		tls_wolfssl_ctx_release(context);
+	}
+
+	return ret;
+}
+
 static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 {
 	struct tls_session_context *session_ctx;
@@ -4208,7 +4242,7 @@ static int tls_wolfssl_init(struct tls_context *context, bool is_server)
 #endif /* CONFIG_WOLFSSL_DEBUG */
 
 	if (!context->ctx_shared) {
-		ret = tls_wolfssl_ctx_setup(context, is_server);
+		ret = tls_wolfssl_ctx_get(context, is_server);
 		if (ret != 0) {
 			goto err_cleanup;
 		}
@@ -4262,19 +4296,10 @@ static int tls_wolfssl_ctx_share(struct tls_context *parent, struct tls_context 
 #endif /* CONFIG_NET_SOCKETS_TLS_WOLFSSL_VERIFY_CALLBACK */
 #endif /* HAVE_SECURE_RENEGOTIATION */
 
-	/* A credential added or deleted since then must reach this connection */
-	if (parent->ctx != NULL && parent->ctx_cred_gen != credentials_generation()) {
-		tls_wolfssl_ctx_release(parent);
-	}
-
-	if (parent->ctx == NULL) {
-		parent->ctx_cred_gen = credentials_generation();
-		tls_wolfssl_role_set(parent, true);
-		ret = tls_wolfssl_ctx_setup(parent, true);
-		if (ret != 0) {
-			tls_wolfssl_ctx_release(parent);
-			return ret;
-		}
+	tls_wolfssl_role_set(parent, true);
+	ret = tls_wolfssl_ctx_get(parent, true);
+	if (ret != 0) {
+		return ret;
 	}
 
 #ifndef NO_PSK
@@ -4740,6 +4765,9 @@ static int tls_opt_sec_tag_list_set(struct tls_context *context,
 
 	memcpy(context->options.sec_tag_list.sec_tags, optval, optlen);
 	context->options.sec_tag_list.sec_tag_count = sec_tag_cnt;
+#if defined(CONFIG_WOLFSSL)
+	context->ctx_stale = true;
+#endif
 
 	return 0;
 }
@@ -5457,6 +5485,9 @@ static int tls_opt_session_cache_set(struct tls_context *context,
 	}
 
 	context->options.cache_enabled = (*val == ZSOCK_TLS_SESSION_CACHE_ENABLED);
+#if defined(CONFIG_WOLFSSL)
+	context->ctx_stale = true;
+#endif
 
 	return 0;
 }
@@ -5512,8 +5543,13 @@ static int tls_opt_session_cache_purge_set(struct tls_context *context,
 	ARG_UNUSED(optlen);
 
 #if defined(CONFIG_WOLFSSL) && !defined(NO_SESSION_CACHE)
-	/* wolfSSL's server-side session cache is global */
+	/* wolfSSL's server-side session cache is global; its lock needs wolfSSL_Init() */
+	(void)wolfSSL_Init();
 	wolfSSL_CTX_flush_sessions(NULL, -1);
+#endif
+#if defined(CONFIG_WOLFSSL) && defined(HAVE_SESSION_TICKET)
+	/* A new CTX has a new ticket key, so tickets the old one issued no longer resume */
+	context->ctx_stale = true;
 #endif
 	tls_session_purge();
 
@@ -5542,6 +5578,9 @@ static int tls_opt_peer_verify_set(struct tls_context *context,
 	}
 
 	context->options.verify_level = *peer_verify;
+#if defined(CONFIG_WOLFSSL)
+	context->ctx_stale = true;
+#endif
 
 	return 0;
 }
@@ -5619,6 +5658,7 @@ static int tls_opt_dtls_role_set(struct tls_context *context,
 	context->options.role = *role;
 #if defined(CONFIG_WOLFSSL)
 	context->role_set = true;
+	context->ctx_stale = true;
 #endif
 
 	return 0;
@@ -5931,6 +5971,9 @@ int ztls_accept_ctx(struct tls_context *parent, struct net_sockaddr *addr,
 #endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
 
 	ret = tls_backend_init(child, true);
+#if defined(CONFIG_WOLFSSL)
+	parent->server_hostname_warned = child->server_hostname_warned;
+#endif /* CONFIG_WOLFSSL */
 	if (ret < 0) {
 		goto error;
 	}
@@ -7307,6 +7350,11 @@ static int tls_data_check(struct tls_context *ctx)
 	ctx->flags = ZSOCK_MSG_DONTWAIT;
 
 #if defined(CONFIG_WOLFSSL)
+	/* recv() reports end of file here, while a peek would read an error */
+	if (ctx->recv_eof) {
+		return -ENOTCONN;
+	}
+
 	/* wolfSSL_peek() returns 0 for a clean close and keeps the reason in ssl->error */
 	ret = tls_wolfssl_peek(ctx->active_session->wssl);
 	if (ret <= 0) {
@@ -7427,6 +7475,13 @@ static int dtls_data_check(struct tls_context *ctx)
 {
 	bool is_server = ctx->options.role == ZTLS_IS_SERVER;
 	int ret;
+
+#if defined(CONFIG_WOLFSSL)
+	/* recv() reports end of file here, while a peek would read an error */
+	if (ctx->recv_eof) {
+		return -ENOTCONN;
+	}
+#endif /* CONFIG_WOLFSSL */
 
 	if (!ctx->is_initialized) {
 		ret = tls_backend_init(ctx, is_server);
@@ -8115,13 +8170,6 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 		err = -ENOPROTOOPT;
 		break;
 	}
-
-#if defined(CONFIG_WOLFSSL)
-	/* The next accept() builds a new CTX; accepted sockets keep the old one */
-	if (err == 0 && ctx->is_listening) {
-		tls_wolfssl_ctx_release(ctx);
-	}
-#endif /* CONFIG_WOLFSSL */
 
 out:
 	if (err < 0) {
