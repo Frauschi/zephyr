@@ -283,9 +283,10 @@ extern "C" {
  *  Pass ZSOCK_TLS_MFL_DEFAULT to revert a socket back to this default after
  *  a previous call has overridden it.
  *
- *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH, and wolfSSL's
- *  HAVE_MAX_FRAGMENT under CONFIG_WOLFSSL; otherwise setsockopt fails with -1
- *  and errno ENOPROTOOPT.
+ *  Requires CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH, and under
+ *  CONFIG_WOLFSSL a wolfSSL build with HAVE_MAX_FRAGMENT and client support
+ *  (no NO_WOLFSSL_CLIENT); otherwise setsockopt fails with -1 and errno
+ *  ENOPROTOOPT.
  */
 #define ZSOCK_TLS_MAX_FRAGMENT_LENGTH 21
 /** Write-only socket option to register a wolfSSL-style cert-verify callback.
