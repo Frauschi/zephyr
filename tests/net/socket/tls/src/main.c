@@ -3064,7 +3064,7 @@ ZTEST(net_socket_tls, test_poll_dtls_pollhup_after_shutdown_rd)
 #endif
 }
 
-/* wolfSSL-only: connect() after recv() as a DTLS server handshakes as a client */
+/* wolfSSL-only: connect() after recv() as a DTLS server makes the socket a client */
 ZTEST(net_socket_tls, test_dtls_connect_after_server_recv)
 {
 #if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
@@ -3105,6 +3105,12 @@ ZTEST(net_socket_tls, test_dtls_connect_after_server_recv)
 
 	ret = zsock_getsockopt(c_sock, ZSOCK_SOL_TLS, ZSOCK_TLS_CIPHERSUITE_USED, &cs, &cs_len);
 	zassert_ok(ret, "No session after connect() (%d)", errno);
+
+	/* The connected session refuses another destination */
+	ret = zsock_sendto(c_sock, "x", 1, 0, (struct net_sockaddr *)&c_saddr,
+			   sizeof(c_saddr));
+	zassert_equal(ret, -1, "sendto() to another peer succeeded");
+	zassert_equal(errno, EISCONN, "unexpected errno %d", errno);
 
 	test_sockets_close();
 

@@ -87,6 +87,8 @@ enum tls_tag {
 	CHAIN_A_TAG,
 	CHAIN_B_TAG,
 	CHAIN_KEY_TAG,
+	/** Client A's CA, trusted by the controls of the untrusted chain CA tests */
+	CHAIN_CA_TAG,
 };
 
 /** @brief synchronization object for server & client threads */
@@ -259,6 +261,8 @@ static void server_thread_fn(void *arg0, void *arg1, void *arg2)
 	zassert_not_equal(r, -1, "close() failed on the server fd (%d)", errno);
 }
 
+static int tls_proto = NET_IPPROTO_TLS_1_2;
+
 static int test_configure_server_ex(k_tid_t *server_thread_id, int peer_verify,
 				    int echo, int expect_failure, const sec_tag_t *tags,
 				    size_t tags_size, bool cache, k_thread_entry_t entry)
@@ -284,7 +288,7 @@ static int test_configure_server_ex(k_tid_t *server_thread_id, int peer_verify,
 	k_sem_init(&server_sem, 0, 1);
 
 	NET_DBG("Creating server socket");
-	r = zsock_socket(NET_PF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+	r = zsock_socket(NET_PF_INET, NET_SOCK_STREAM, tls_proto);
 	zassert_not_equal(r, -1, "failed to create server socket (%d)", errno);
 	server_fd = r;
 
@@ -396,7 +400,7 @@ static int test_configure_client(struct net_sockaddr_in *sa, bool own_cert,
 	k_thread_name_set(k_current_get(), "client");
 
 	NET_DBG("Creating client socket");
-	r = zsock_socket(NET_PF_INET, NET_SOCK_STREAM, NET_IPPROTO_TLS_1_2);
+	r = zsock_socket(NET_PF_INET, NET_SOCK_STREAM, tls_proto);
 	zassert_not_equal(r, -1, "failed to create client socket (%d)", errno);
 	client_fd = r;
 
@@ -597,7 +601,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_none_skipped)
 					   MBEDTLS_X509_BADCERT_SKIP_VERIFY);
 }
 
-/* A failed handshake keeps the verify result that failed it */
+/* wolfSSL keeps the verify result of a failed handshake; mbedTLS has none after its reset */
 ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_required_bad_cn)
 {
 	const int required = ZSOCK_TLS_PEER_VERIFY_REQUIRED;
@@ -621,7 +625,11 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_required_bad_cn)
 	ret = zsock_getsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_CERT_VERIFY_RESULT,
 			       &optval, &optlen);
 	zassert_ok(ret, "getsockopt failed (%d)", errno);
-	zassert_true(optval & MBEDTLS_X509_BADCERT_CN_MISMATCH, "verify result 0x%x", optval);
+#if defined(CONFIG_WOLFSSL)
+	zassert_equal(optval, MBEDTLS_X509_BADCERT_CN_MISMATCH, "verify result 0x%x", optval);
+#else
+	zassert_equal(optval, UINT32_MAX, "verify result 0x%x", optval);
+#endif
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 }
@@ -666,6 +674,11 @@ ZTEST(net_socket_tls_api_extension, test_tls_cert_verify_result_server_resumed)
 	struct net_sockaddr_in sa;
 	uint8_t rx_buf[16];
 	int server_fd, client_fd, r;
+
+#if defined(CONFIG_WOLFSSL) && defined(HAVE_SECURE_RENEGOTIATION) && !defined(WOLFSSL_NO_TLS12)
+	/* The children of an OPTIONAL listener have their own CTX, so its tickets do not resume */
+	ztest_test_skip();
+#endif
 
 	server_fd = test_configure_server_ex(&server_thread_id, ZSOCK_TLS_PEER_VERIFY_OPTIONAL,
 					     2, false, NULL, 0, true,
@@ -1066,6 +1079,17 @@ static void chain_ca_add_credentials(void)
 				      chain_client_key, sizeof(chain_client_key)));
 }
 
+/* Client A's chain is its leaf, with a two-byte DER length, followed by the CA */
+static void chain_ca_add_trusted_ca(void)
+{
+	size_t leaf_len = 4 + ((chain_client_a[2] << 8) | chain_client_a[3]);
+
+	zassert_equal(chain_client_a[1], 0x82, "unexpected leaf length encoding");
+	zassert_ok(tls_credential_add(CHAIN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      chain_client_a + leaf_len,
+				      sizeof(chain_client_a) - leaf_len));
+}
+
 #if defined(HAVE_SECURE_RENEGOTIATION)
 /* Like server_thread_resume_fn, but lets a renegotiation fail the first recv() */
 static void server_thread_reneg_fn(void *arg0, void *arg1, void *arg2)
@@ -1120,10 +1144,15 @@ static bool chain_ca_renegotiate(int client_fd)
 }
 #endif /* HAVE_SECURE_RENEGOTIATION */
 
-/* Client A sends its CA, also in a renegotiation if asked; client B's leaf is signed by it */
+/* Client A sends its CA, also in a renegotiation if asked; client B's leaf is signed by it.
+ * With trusted set, the server trusts that CA.
+ */
 static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len,
-				bool renegotiate)
+				bool renegotiate, bool trusted)
 {
+	static const sec_tag_t trusted_tags[] = {
+		CA_CERTIFICATE_TAG, SERVER_CERTIFICATE_TAG, CHAIN_CA_TAG
+	};
 	k_thread_entry_t entry = server_thread_resume_fn;
 	k_tid_t server_thread_id;
 	struct net_sockaddr_in sa;
@@ -1132,6 +1161,9 @@ static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len,
 	int server_fd, client_fd = -1, r;
 
 	chain_ca_add_credentials();
+	if (trusted) {
+		chain_ca_add_trusted_ca();
+	}
 
 #if defined(HAVE_SECURE_RENEGOTIATION)
 	if (renegotiate) {
@@ -1140,8 +1172,9 @@ static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len,
 #endif /* HAVE_SECURE_RENEGOTIATION */
 
 	server_fd = test_configure_server_ex(&server_thread_id, peer_verify,
-					     ARRAY_SIZE(resumed_verify_result), false, NULL, 0,
-					     false, entry);
+					     ARRAY_SIZE(resumed_verify_result), false,
+					     trusted ? trusted_tags : NULL,
+					     trusted ? sizeof(trusted_tags) : 0, false, entry);
 	if (renegotiate) {
 		/* TLS 1.3 has no renegotiation */
 		const int tls12_suite = 0xC02F;
@@ -1184,6 +1217,15 @@ static void chain_ca_tcp_common(int peer_verify, const void *cb, size_t cb_len,
 
 	test_shutdown(client_fd, server_fd, server_thread_id);
 
+	if (trusted) {
+		zassert_equal(reneg_done, renegotiate, "the trusted renegotiation failed");
+		zassert_equal(resumed_verify_result[0], 0, "client A: verify result 0x%x",
+			      resumed_verify_result[0]);
+		zassert_equal(resumed_verify_result[1], 0, "client B: verify result 0x%x",
+			      resumed_verify_result[1]);
+		return;
+	}
+
 	zassert_false(reneg_done, "the server renegotiated with a failed chain CA");
 	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
 		      "client A: verify result 0x%x", resumed_verify_result[0]);
@@ -1198,7 +1240,7 @@ ZTEST(net_socket_tls_api_extension, test_tls_optional_chain_ca_not_learned)
 #if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS)
 	ztest_test_skip();
 #else
-	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, false);
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, false, false);
 #endif
 }
 
@@ -1209,18 +1251,32 @@ ZTEST(net_socket_tls_api_extension, test_tls_optional_reneg_chain_ca_not_learned
 	!defined(HAVE_SECURE_RENEGOTIATION) || defined(WOLFSSL_NO_TLS12)
 	ztest_test_skip();
 #else
-	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, true);
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, true, false);
 #endif
 }
 
-#if defined(CONFIG_WOLFSSL) && defined(CONFIG_TLS_CREDENTIALS) && \
-	defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-/* Reads the verify result after the first record of each client */
-static void server_thread_dtls_verify_fn(void *arg0, void *arg1, void *arg2)
+/* wolfSSL-only: the control for the test above, with client A's CA trusted */
+ZTEST(net_socket_tls_api_extension, test_tls_optional_reneg_trusted_chain)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS) || \
+	!defined(HAVE_SECURE_RENEGOTIATION) || defined(WOLFSSL_NO_TLS12)
+	ztest_test_skip();
+#else
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, true, true);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && !defined(SINGLE_THREADED)
+static int accepted_ctx_shared;
+
+/* Compares the CTX of two accepted children; a reference keeps the first one's address unused */
+static void server_thread_two_children_fn(void *arg0, void *arg1, void *arg2)
 {
 	const int server_fd = POINTER_TO_INT(arg0);
-	net_socklen_t optlen;
+	WOLFSSL_CTX *first = NULL;
+	WOLFSSL_CTX *ctx;
 	char buf[16];
+	int child_fd;
 	int r;
 
 	ARG_UNUSED(arg1);
@@ -1228,7 +1284,111 @@ static void server_thread_dtls_verify_fn(void *arg0, void *arg1, void *arg2)
 
 	k_sem_give(&server_sem);
 
-	for (int i = 0; i < ARRAY_SIZE(resumed_verify_result); i++) {
+	for (int i = 0; i < 2; i++) {
+		child_fd = zsock_accept(server_fd, NULL, NULL);
+		zassert_not_equal(child_fd, -1, "accept() failed (%d)", errno);
+
+		ctx = wolfSSL_get_SSL_CTX(ztls_get_wolfssl_context(child_fd));
+		if (first == NULL) {
+			first = ctx;
+			zassert_equal(wolfSSL_CTX_up_ref(first), WOLFSSL_SUCCESS);
+		} else {
+			accepted_ctx_shared = ctx == first;
+		}
+
+		r = zsock_recv(child_fd, buf, sizeof(buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+		r = zsock_send(child_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		(void)zsock_close(child_fd);
+	}
+
+	wolfSSL_CTX_free(first);
+}
+
+/* Returns whether two children of a listener set up this way shared its CTX */
+static bool listener_ctx_shared(int peer_verify, const void *cb, size_t cb_len, bool own_cert)
+{
+	k_tid_t server_thread_id;
+	struct net_sockaddr_in sa;
+	uint8_t rx_buf[16];
+	int server_fd, client_fd = -1, r;
+
+	accepted_ctx_shared = -1;
+	server_fd = test_configure_server_ex(&server_thread_id, peer_verify, false, false, NULL,
+					     0, false, server_thread_two_children_fn);
+	if (cb != NULL) {
+		r = zsock_setsockopt(server_fd, ZSOCK_SOL_TLS,
+				     ZSOCK_TLS_CERT_VERIFY_CALLBACK_WOLFSSL, cb, cb_len);
+		zassert_ok(r, "failed to set the verify callback (%d)", errno);
+	}
+
+	for (int i = 0; i < 2; i++) {
+		if (client_fd >= 0) {
+			zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+		}
+
+		client_fd = test_configure_client(&sa, own_cert, "localhost");
+		r = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+		zassert_not_equal(r, -1, "failed to connect (%d)", errno);
+		r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+		zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+		r = zsock_recv(client_fd, rx_buf, sizeof(rx_buf), 0);
+		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+	}
+
+	test_shutdown(client_fd, server_fd, server_thread_id);
+	zassert_not_equal(accepted_ctx_shared, -1, "the server never accepted a second child");
+
+	return accepted_ctx_shared == 1;
+}
+
+#if defined(HAVE_SECURE_RENEGOTIATION) && !defined(WOLFSSL_NO_TLS12)
+#define RENEGOTIATION_UNSHARES true
+#else
+#define RENEGOTIATION_UNSHARES false
+#endif
+#endif /* CONFIG_WOLFSSL && !SINGLE_THREADED */
+
+/* wolfSSL-only: children of an OPTIONAL listener share its CTX only without renegotiation */
+ZTEST(net_socket_tls_api_extension, test_tls_optional_listener_ctx_sharing)
+{
+#if !defined(CONFIG_WOLFSSL) || defined(SINGLE_THREADED)
+	ztest_test_skip();
+#else
+	zassert_equal(listener_ctx_shared(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, false),
+		      !RENEGOTIATION_UNSHARES, "unexpected CTX sharing");
+#endif
+}
+
+/* wolfSSL-only: a TLS 1.3 listener cannot renegotiate, so its children always share */
+ZTEST(net_socket_tls_api_extension, test_tls_optional_tls13_listener_ctx_shared)
+{
+#if !defined(CONFIG_WOLFSSL) || defined(SINGLE_THREADED) || !defined(WOLFSSL_TLS13)
+	ztest_test_skip();
+#else
+	tls_proto = NET_IPPROTO_TLS_1_3;
+	zassert_true(listener_ctx_shared(ZSOCK_TLS_PEER_VERIFY_OPTIONAL, NULL, 0, false),
+		     "the children of a TLS 1.3 listener do not share its CTX");
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_TLS_CREDENTIALS) && \
+	defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Reads the verify result after the first record of each of arg1 clients */
+static void server_thread_dtls_verify_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	const int clients = POINTER_TO_INT(arg1);
+	net_socklen_t optlen;
+	char buf[16];
+	int r;
+
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+
+	for (int i = 0; i < clients; i++) {
 		r = zsock_recv(server_fd, buf, sizeof(buf), 0);
 		zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
 
@@ -1237,6 +1397,98 @@ static void server_thread_dtls_verify_fn(void *arg0, void *arg1, void *arg2)
 				     &resumed_verify_result[i], &optlen);
 		zassert_ok(r, "getsockopt failed (%d)", errno);
 	}
+}
+
+static int dtls_optional_server_socket(struct net_sockaddr_in *sa)
+{
+	static const sec_tag_t server_tags[] = { CA_CERTIFICATE_TAG, SERVER_CERTIFICATE_TAG };
+	const int peer_verify = ZSOCK_TLS_PEER_VERIFY_OPTIONAL;
+	const int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
+	const struct timeval timeo = { .tv_sec = 5 };
+	int fd;
+
+	fd = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_DTLS_1_2);
+	zassert_not_equal(fd, -1, "failed to create server socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role, sizeof(role)));
+	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY, &peer_verify,
+				    sizeof(peer_verify)));
+	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, server_tags,
+				    sizeof(server_tags)));
+	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo,
+				    sizeof(timeo)));
+
+	memset(sa, 0, sizeof(*sa));
+	sa->sin_family = NET_AF_INET;
+	sa->sin_port = net_htons(PORT);
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa->sin_addr), 1);
+	zassert_ok(zsock_bind(fd, (struct net_sockaddr *)sa, sizeof(*sa)), "failed to bind (%d)",
+		   errno);
+
+	return fd;
+}
+
+#define DTLS_HDR_LEN 13
+#define DTLS_TYPE_HANDSHAKE 22
+#define DTLS_HS_CLIENT_HELLO 1
+#define DTLS_HS_CERTIFICATE 11
+#define DTLS_HS_CLIENT_KEY_EXCHANGE 16
+
+static int stalled_client_sock;
+static bool stalled_client_cert_sent;
+static bool stalled_client_kx_held;
+
+/* Passes on only the ClientHello and Certificate records, so the server waits for the rest */
+static int stalled_client_send(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+{
+	int len;
+
+	ARG_UNUSED(ssl);
+	ARG_UNUSED(ctx);
+
+	for (int off = 0; off + DTLS_HDR_LEN < sz; off += DTLS_HDR_LEN + len) {
+		len = ((uint8_t)buf[off + 11] << 8) | (uint8_t)buf[off + 12];
+		if (len > sz - off - DTLS_HDR_LEN) {
+			break;
+		}
+
+		/* An encrypted record of epoch 1 has no readable message type */
+		if (buf[off] != DTLS_TYPE_HANDSHAKE || buf[off + 3] != 0 || buf[off + 4] != 0) {
+			continue;
+		}
+
+		if (buf[off + DTLS_HDR_LEN] == DTLS_HS_CLIENT_KEY_EXCHANGE) {
+			stalled_client_kx_held = true;
+		}
+
+		if (buf[off + DTLS_HDR_LEN] != DTLS_HS_CLIENT_HELLO &&
+		    buf[off + DTLS_HDR_LEN] != DTLS_HS_CERTIFICATE) {
+			continue;
+		}
+
+		(void)zsock_send(stalled_client_sock, buf + off, DTLS_HDR_LEN + len, 0);
+		if (buf[off + DTLS_HDR_LEN] == DTLS_HS_CERTIFICATE) {
+			stalled_client_cert_sent = true;
+		}
+	}
+
+	return sz;
+}
+
+static int stalled_client_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+{
+	struct zsock_pollfd fds = { .fd = stalled_client_sock, .events = ZSOCK_POLLIN };
+	int r;
+
+	ARG_UNUSED(ssl);
+	ARG_UNUSED(ctx);
+
+	if (zsock_poll(&fds, 1, 100) <= 0) {
+		return WOLFSSL_CBIO_ERR_WANT_READ;
+	}
+
+	r = zsock_recv(stalled_client_sock, buf, sz, 0);
+
+	return r < 0 ? WOLFSSL_CBIO_ERR_GENERAL : r;
 }
 #endif
 
@@ -1247,37 +1499,17 @@ ZTEST(net_socket_tls_api_extension, test_dtls_optional_chain_ca_not_learned)
 	!defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	ztest_test_skip();
 #else
-	static const sec_tag_t server_tags[] = { CA_CERTIFICATE_TAG, SERVER_CERTIFICATE_TAG };
-	const int peer_verify = ZSOCK_TLS_PEER_VERIFY_OPTIONAL;
-	const int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
-	const struct timeval timeo = { .tv_sec = 5 };
 	int client_fd[ARRAY_SIZE(chain_ca_client_tags)];
 	struct net_sockaddr_in sa;
 	int server_fd, r;
 
 	chain_ca_add_credentials();
 	k_sem_init(&server_sem, 0, 1);
-
-	server_fd = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_DTLS_1_2);
-	zassert_not_equal(server_fd, -1, "failed to create server socket (%d)", errno);
-	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role,
-				    sizeof(role)));
-	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_PEER_VERIFY,
-				    &peer_verify, sizeof(peer_verify)));
-	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST,
-				    server_tags, sizeof(server_tags)));
-	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo,
-				    sizeof(timeo)));
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = NET_AF_INET;
-	sa.sin_port = net_htons(PORT);
-	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
-	zassert_ok(zsock_bind(server_fd, (struct net_sockaddr *)&sa, sizeof(sa)),
-		   "failed to bind (%d)", errno);
+	server_fd = dtls_optional_server_socket(&sa);
 
 	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_verify_fn,
-			INT_TO_POINTER(server_fd), NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+			INT_TO_POINTER(server_fd), INT_TO_POINTER(ARRAY_SIZE(client_fd)), NULL,
+			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
 	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
 
 	/* Client A stays connected, so the server holds both sessions at once */
@@ -1310,6 +1542,78 @@ ZTEST(net_socket_tls_api_extension, test_dtls_optional_chain_ca_not_learned)
 		      "client A: verify result 0x%x", resumed_verify_result[0]);
 	zassert_equal(resumed_verify_result[1], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
 		      "client B: verify result 0x%x", resumed_verify_result[1]);
+#endif
+}
+
+/* wolfSSL-only: client A's CA is gone while its handshake waits, so client B cannot use it */
+ZTEST(net_socket_tls_api_extension, test_dtls_optional_chain_ca_not_learned_mid_handshake)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS) || \
+	!defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || defined(NO_WOLFSSL_CLIENT)
+	ztest_test_skip();
+#else
+	struct net_sockaddr_in sa;
+	WOLFSSL_CTX *stalled_ctx;
+	WOLFSSL *stalled;
+	int server_fd, client_fd, r;
+
+	chain_ca_add_credentials();
+	k_sem_init(&server_sem, 0, 1);
+	server_fd = dtls_optional_server_socket(&sa);
+
+	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_verify_fn,
+			INT_TO_POINTER(server_fd), INT_TO_POINTER(1), NULL, K_PRIO_PREEMPT(8), 0,
+			K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	stalled_client_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_not_equal(stalled_client_sock, -1, "failed to create UDP socket (%d)", errno);
+	zassert_ok(zsock_connect(stalled_client_sock, (struct net_sockaddr *)&sa, sizeof(sa)));
+
+	stalled_ctx = wolfSSL_CTX_new(wolfDTLSv1_2_client_method());
+	zassert_not_null(stalled_ctx);
+	wolfSSL_CTX_set_verify(stalled_ctx, WOLFSSL_VERIFY_NONE, NULL);
+	zassert_equal(wolfSSL_CTX_use_certificate_chain_buffer_format(
+			      stalled_ctx, chain_client_a, sizeof(chain_client_a),
+			      WOLFSSL_FILETYPE_ASN1), WOLFSSL_SUCCESS);
+	zassert_equal(wolfSSL_CTX_use_PrivateKey_buffer(stalled_ctx, chain_client_key,
+							sizeof(chain_client_key),
+							WOLFSSL_FILETYPE_ASN1), WOLFSSL_SUCCESS);
+	wolfSSL_CTX_SetIORecv(stalled_ctx, stalled_client_recv);
+	wolfSSL_CTX_SetIOSend(stalled_ctx, stalled_client_send);
+	stalled = wolfSSL_new(stalled_ctx);
+	zassert_not_null(stalled);
+
+	stalled_client_cert_sent = false;
+	for (int i = 0; !stalled_client_cert_sent && i < 50; i++) {
+		(void)wolfSSL_connect(stalled);
+	}
+	zassert_true(stalled_client_cert_sent, "client A never sent its certificate");
+
+	/* Lets the server take client A's certificate before client B's ClientHello */
+	k_msleep(100);
+
+	client_fd = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_DTLS_1_2);
+	zassert_not_equal(client_fd, -1, "failed to create client socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST,
+				    chain_ca_client_tags[1], sizeof(chain_ca_client_tags[1])));
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, "localhost",
+				    sizeof("localhost")));
+	r = zsock_connect(client_fd, (struct net_sockaddr *)&sa, sizeof(sa));
+	zassert_ok(r, "failed to connect (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+
+	wolfSSL_free(stalled);
+	wolfSSL_CTX_free(stalled_ctx);
+	zassert_ok(zsock_close(stalled_client_sock), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+
+	zassert_equal(resumed_verify_result[0], MBEDTLS_X509_BADCERT_NOT_TRUSTED,
+		      "client B: verify result 0x%x", resumed_verify_result[0]);
 #endif
 }
 
@@ -1623,9 +1927,9 @@ static void server_thread_dtls_recv_each_fn(void *arg0, void *arg1, void *arg2)
 	(void)zsock_recv(POINTER_TO_INT(arg1), buf, sizeof(buf), 0);
 }
 
-static int dtls_server_socket(uint16_t port)
+static int dtls_server_socket_tags(uint16_t port, const sec_tag_t *server_tags,
+				   size_t server_tags_size)
 {
-	static const sec_tag_t server_tags[] = { SERVER_CERTIFICATE_TAG };
 	const int role = ZSOCK_TLS_DTLS_ROLE_SERVER;
 	const struct timeval timeo = { .tv_sec = 1 };
 	struct net_sockaddr_in sa = {
@@ -1638,7 +1942,7 @@ static int dtls_server_socket(uint16_t port)
 	zassert_not_equal(fd, -1, "failed to create server socket (%d)", errno);
 	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_ROLE, &role, sizeof(role)));
 	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, server_tags,
-				    sizeof(server_tags)));
+				    server_tags_size));
 	zassert_ok(zsock_setsockopt(fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo,
 				    sizeof(timeo)));
 	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
@@ -1646,6 +1950,50 @@ static int dtls_server_socket(uint16_t port)
 		   "failed to bind (%d)", errno);
 
 	return fd;
+}
+
+static int dtls_server_socket(uint16_t port)
+{
+	static const sec_tag_t server_tags[] = { SERVER_CERTIFICATE_TAG };
+
+	return dtls_server_socket_tags(port, server_tags, sizeof(server_tags));
+}
+
+/* Connects a DTLS client that trusts the CA on ca_tag and expects hostname */
+static int dtls_client_connect(int *fd, sec_tag_t ca_tag, const char *hostname)
+{
+	const sec_tag_t tags[] = { ca_tag };
+	struct net_sockaddr_in sa = { .sin_family = NET_AF_INET, .sin_port = net_htons(PORT) };
+	const int timeout_max = 1000;
+
+	*fd = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_DTLS_1_2);
+	zassert_not_equal(*fd, -1, "failed to create client socket (%d)", errno);
+	zassert_ok(zsock_setsockopt(*fd, ZSOCK_SOL_TLS, ZSOCK_TLS_HOSTNAME, hostname,
+				    strlen(hostname) + 1));
+	zassert_ok(zsock_setsockopt(*fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, tags,
+				    sizeof(tags)));
+	zassert_ok(zsock_setsockopt(*fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+
+	return zsock_connect(*fd, (struct net_sockaddr *)&sa, sizeof(sa));
+}
+
+static bool dtls_later_peer_served;
+
+/* Receives until a later peer's record arrives, failed handshakes in between included */
+static void dtls_serve_later_peer(int server_fd)
+{
+	int64_t end = k_uptime_get() + 10 * MSEC_PER_SEC;
+	char buf[16];
+
+	while (!dtls_later_peer_served && k_uptime_get() < end) {
+		dtls_later_peer_served = zsock_recv(server_fd, buf, sizeof(buf), 0) == SECRET_SIZE;
+		if (!dtls_later_peer_served) {
+			/* recv() fails at once while the server cannot set up */
+			k_msleep(50);
+		}
+	}
 }
 #endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
@@ -1700,6 +2048,372 @@ ZTEST(net_socket_tls_api_extension, test_dtls_client_sec_tag_change)
 	for (int i = 0; i < ARRAY_SIZE(server_fd); i++) {
 		zassert_ok(zsock_close(server_fd[i]), "close() failed (%d)", errno);
 	}
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+/* Serves the first peer, then switches to the IP SAN certificate for the next */
+static void server_thread_dtls_tag_change_fn(void *arg0, void *arg1, void *arg2)
+{
+	static const sec_tag_t new_tags[] = { IP_SAN_SERVER_TAG };
+	const int server_fd = POINTER_TO_INT(arg0);
+	char buf[16];
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+	r = zsock_recv(server_fd, buf, sizeof(buf), 0);
+	zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+
+	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_SEC_TAG_LIST, new_tags,
+				    sizeof(new_tags)));
+	k_sem_give(&server_sem);
+	dtls_serve_later_peer(server_fd);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
+/* wolfSSL-only: a DTLS server that changes TLS_SEC_TAG_LIST presents the new certificate */
+ZTEST(net_socket_tls_api_extension, test_dtls_server_sec_tag_change)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	int first_fd, client_fd, server_fd, r;
+
+	/* Added first, so that only the sec tag change can rebuild the server's CTX */
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      ip_san_server_der, sizeof(ip_san_server_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      ip_san_server_key_der, sizeof(ip_san_server_key_der)));
+	k_sem_init(&server_sem, 0, 1);
+	dtls_later_peer_served = false;
+
+	server_fd = dtls_server_socket(PORT);
+	k_thread_create(&server_thread, server_stack, STACK_SIZE,
+			server_thread_dtls_tag_change_fn, INT_TO_POINTER(server_fd), NULL, NULL,
+			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	/* The first client stays open, so later clients get new sessions on the server */
+	r = dtls_client_connect(&first_fd, CA_CERTIFICATE_TAG, "localhost");
+	zassert_ok(r, "failed to connect (%d)", errno);
+	r = zsock_send(first_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	r = dtls_client_connect(&client_fd, CA_CERTIFICATE_TAG, "localhost");
+	zassert_equal(r, -1, "the server presented its old certificate");
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+
+	r = dtls_client_connect(&client_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_ok(r, "the server did not present its new certificate (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zassert_true(dtls_later_peer_served, "the server did not serve the new client");
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(first_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+static void server_thread_dtls_rebuild_fail_fn(void *arg0, void *arg1, void *arg2)
+{
+	const int server_fd = POINTER_TO_INT(arg0);
+	char buf[16];
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+	r = zsock_recv(server_fd, buf, sizeof(buf), 0);
+	zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+	k_sem_give(&server_sem);
+	dtls_serve_later_peer(server_fd);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
+/* wolfSSL-only: a DTLS server whose credentials vanish and come back serves the next client */
+ZTEST(net_socket_tls_api_extension, test_dtls_server_ctx_rebuild_failure)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	static const sec_tag_t server_tags[] = { IP_SAN_SERVER_TAG };
+	int first_fd, client_fd, server_fd, r;
+
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      ip_san_server_der, sizeof(ip_san_server_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      ip_san_server_key_der, sizeof(ip_san_server_key_der)));
+	k_sem_init(&server_sem, 0, 1);
+	dtls_later_peer_served = false;
+
+	server_fd = dtls_server_socket_tags(PORT, server_tags, sizeof(server_tags));
+	k_thread_create(&server_thread, server_stack, STACK_SIZE,
+			server_thread_dtls_rebuild_fail_fn, INT_TO_POINTER(server_fd), NULL, NULL,
+			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	r = dtls_client_connect(&first_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_ok(r, "failed to connect (%d)", errno);
+	r = zsock_send(first_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	/* With the server's tag empty, a new session cannot rebuild the CTX */
+	zassert_ok(tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE));
+	zassert_ok(tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY));
+	r = dtls_client_connect(&client_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_equal(r, -1, "connected to a server without credentials");
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+
+	/* The first session ends while the CTX still cannot be built */
+	zassert_ok(zsock_close(first_fd), "close() failed (%d)", errno);
+	k_msleep(300);
+
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      ip_san_server_der, sizeof(ip_san_server_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      ip_san_server_key_der, sizeof(ip_san_server_key_der)));
+	r = dtls_client_connect(&client_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_ok(r, "failed to connect once the credentials were back (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zassert_true(dtls_later_peer_served, "the server did not serve the new client");
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+#endif
+}
+
+/* wolfSSL-only: a DTLS server keeps serving peer A when peer B's reset cannot rebuild the CTX */
+ZTEST(net_socket_tls_api_extension, test_dtls_server_peer_survives_reset_failure)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_TLS_CREDENTIALS) || \
+	!defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) || defined(NO_WOLFSSL_CLIENT)
+	ztest_test_skip();
+#else
+	static const sec_tag_t server_tags[] = { IP_SAN_SERVER_TAG };
+	struct net_sockaddr_in sa = { .sin_family = NET_AF_INET, .sin_port = net_htons(PORT) };
+	const int timeout_max = 1000;
+	WOLFSSL_CTX *stalled_ctx;
+	WOLFSSL *stalled;
+	int first_fd, server_fd, r;
+
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      ip_san_server_der, sizeof(ip_san_server_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      ip_san_server_key_der, sizeof(ip_san_server_key_der)));
+	k_sem_init(&server_sem, 0, 1);
+	dtls_later_peer_served = false;
+
+	server_fd = dtls_server_socket_tags(PORT, server_tags, sizeof(server_tags));
+	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MAX,
+				    &timeout_max, sizeof(timeout_max)));
+	k_thread_create(&server_thread, server_stack, STACK_SIZE,
+			server_thread_dtls_rebuild_fail_fn, INT_TO_POINTER(server_fd), NULL, NULL,
+			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	r = dtls_client_connect(&first_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_ok(r, "failed to connect (%d)", errno);
+	r = zsock_send(first_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	/* Peer B goes silent after the server's flight, so the server times its handshake out */
+	stalled_client_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_not_equal(stalled_client_sock, -1, "failed to create UDP socket (%d)", errno);
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+	zassert_ok(zsock_connect(stalled_client_sock, (struct net_sockaddr *)&sa, sizeof(sa)));
+
+	stalled_ctx = wolfSSL_CTX_new(wolfDTLSv1_2_client_method());
+	zassert_not_null(stalled_ctx);
+	wolfSSL_CTX_set_verify(stalled_ctx, WOLFSSL_VERIFY_NONE, NULL);
+	wolfSSL_CTX_SetIORecv(stalled_ctx, stalled_client_recv);
+	wolfSSL_CTX_SetIOSend(stalled_ctx, stalled_client_send);
+	stalled = wolfSSL_new(stalled_ctx);
+	zassert_not_null(stalled);
+
+	stalled_client_kx_held = false;
+	for (int i = 0; !stalled_client_kx_held && i < 50; i++) {
+		(void)wolfSSL_connect(stalled);
+	}
+	zassert_true(stalled_client_kx_held, "the server never sent its flight");
+
+	/* With the server's tag empty, the reset after peer B's timeout cannot rebuild the CTX */
+	zassert_ok(tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE));
+	zassert_ok(tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY));
+	k_msleep(3000);
+
+	r = zsock_send(first_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+	zassert_true(dtls_later_peer_served, "the server dropped peer A");
+
+	wolfSSL_free(stalled);
+	wolfSSL_CTX_free(stalled_ctx);
+	zassert_ok(zsock_close(stalled_client_sock), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(first_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+#endif
+}
+
+#if defined(CONFIG_WOLFSSL) && defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+static void server_thread_dtls_recv_one_fn(void *arg0, void *arg1, void *arg2)
+{
+	char buf[16];
+	int r;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+
+	k_sem_give(&server_sem);
+	r = zsock_recv(POINTER_TO_INT(arg0), buf, sizeof(buf), 0);
+	zassert_equal(r, SECRET_SIZE, "recv() failed (%d)", errno);
+}
+#endif /* CONFIG_WOLFSSL && CONFIG_NET_SOCKETS_ENABLE_DTLS */
+
+/* wolfSSL-only: a DTLS server serving a peer refuses connect() and keeps serving it */
+ZTEST(net_socket_tls_api_extension, test_dtls_server_connect_while_serving)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	struct net_sockaddr_in other = { .sin_family = NET_AF_INET,
+					 .sin_port = net_htons(PORT + 1) };
+	const int no_handshake = 0;
+	char buf[16];
+	int client_fd, server_fd, r;
+
+	k_sem_init(&server_sem, 0, 1);
+	server_fd = dtls_server_socket(PORT);
+	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_recv_one_fn,
+			INT_TO_POINTER(server_fd), NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	r = dtls_client_connect(&client_fd, CA_CERTIFICATE_TAG, "localhost");
+	zassert_ok(r, "failed to connect (%d)", errno);
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &other.sin_addr), 1);
+	r = zsock_connect(server_fd, (struct net_sockaddr *)&other, sizeof(other));
+	zassert_equal(r, -1, "a DTLS server serving a peer connected elsewhere");
+	zassert_equal(errno, EISCONN, "unexpected errno %d", errno);
+
+	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_ON_CONNECT,
+				    &no_handshake, sizeof(no_handshake)));
+	r = zsock_connect(server_fd, (struct net_sockaddr *)&other, sizeof(other));
+	zassert_equal(r, -1, "connect() without a handshake moved the peer's session");
+	zassert_equal(errno, EISCONN, "unexpected errno %d", errno);
+
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	r = zsock_recv(server_fd, buf, sizeof(buf), 0);
+	zassert_equal(r, SECRET_SIZE, "the server stopped serving its peer (%d)", errno);
+
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+#endif
+}
+
+/* wolfSSL-only: a DTLS server that only pinned a peer with connect() can connect() again */
+ZTEST(net_socket_tls_api_extension, test_dtls_server_connect_after_pin)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	struct net_sockaddr_in peer = { .sin_family = NET_AF_INET };
+	const int no_handshake = 0;
+	int server_fd;
+
+	server_fd = dtls_server_socket(PORT);
+	zassert_ok(zsock_setsockopt(server_fd, ZSOCK_SOL_TLS, ZSOCK_TLS_DTLS_HANDSHAKE_ON_CONNECT,
+				    &no_handshake, sizeof(no_handshake)));
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &peer.sin_addr), 1);
+
+	for (int i = 1; i <= 2; i++) {
+		peer.sin_port = net_htons(PORT + i);
+		zassert_ok(zsock_connect(server_fd, (struct net_sockaddr *)&peer, sizeof(peer)),
+			   "connect() %d failed (%d)", i, errno);
+	}
+
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+#endif
+}
+
+/* wolfSSL-only: a DTLS client whose reset cannot rebuild the CTX reports why and recovers */
+ZTEST(net_socket_tls_api_extension, test_dtls_client_ctx_rebuild_failure)
+{
+#if !defined(CONFIG_WOLFSSL) || !defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	ztest_test_skip();
+#else
+	static const sec_tag_t server_tags[] = { IP_SAN_SERVER_TAG };
+	const struct timeval timeo = { .tv_sec = 2 };
+	struct net_sockaddr_in sa = { .sin_family = NET_AF_INET, .sin_port = net_htons(PORT) };
+	char buf[16];
+	int client_fd, server_fd, r;
+
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE,
+				      ip_san_server_der, sizeof(ip_san_server_der)));
+	zassert_ok(tls_credential_add(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY,
+				      ip_san_server_key_der, sizeof(ip_san_server_key_der)));
+	k_sem_init(&server_sem, 0, 1);
+
+	server_fd = dtls_server_socket_tags(PORT, server_tags, sizeof(server_tags));
+	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_recv_one_fn,
+			INT_TO_POINTER(server_fd), NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	r = dtls_client_connect(&client_fd, IP_SAN_CA_TAG, MY_IPV4_ADDR);
+	zassert_ok(r, "failed to connect (%d)", errno);
+	zassert_ok(zsock_setsockopt(client_fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeo,
+				    sizeof(timeo)));
+	r = zsock_send(client_fd, SECRET, SECRET_SIZE, 0);
+	zassert_equal(r, SECRET_SIZE, "send() failed (%d)", errno);
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+
+	/* With the client's tag empty, the reset after the server's close_notify cannot rebuild */
+	zassert_ok(tls_credential_delete(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE));
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
+	r = zsock_recv(client_fd, buf, sizeof(buf), 0);
+	zassert_equal(r, -1, "recv() succeeded after the server closed");
+	zassert_equal(errno, ENOENT, "unexpected errno %d", errno);
+
+	zassert_ok(tls_credential_add(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
+				      ip_san_ca_der, sizeof(ip_san_ca_der)));
+	server_fd = dtls_server_socket_tags(PORT, server_tags, sizeof(server_tags));
+	k_thread_create(&server_thread, server_stack, STACK_SIZE, server_thread_dtls_recv_one_fn,
+			INT_TO_POINTER(server_fd), NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	zassert_ok(k_sem_take(&server_sem, K_MSEC(TIMEOUT)));
+
+	/* The reset forgot the peer, so sendto() names it and sets the client up again */
+	zassert_equal(zsock_inet_pton(NET_AF_INET, MY_IPV4_ADDR, &sa.sin_addr), 1);
+	r = zsock_sendto(client_fd, SECRET, SECRET_SIZE, 0, (struct net_sockaddr *)&sa,
+			 sizeof(sa));
+	zassert_equal(r, SECRET_SIZE, "sendto() failed once the CA was back (%d)", errno);
+	zassert_ok(k_thread_join(&server_thread, K_FOREVER));
+
+	zassert_ok(zsock_close(client_fd), "close() failed (%d)", errno);
+	zassert_ok(zsock_close(server_fd), "close() failed (%d)", errno);
 #endif
 }
 #endif /* CONFIG_TLS_CREDENTIALS */
@@ -2412,19 +3126,7 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_server_accept)
 /* A verify callback that accepts a failed chain CA does not make it trusted afterwards */
 ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_chain_ca_not_learned)
 {
-	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
-	const struct zsock_tls_cert_verify_cb_wolfssl cb = {
-		.cb = wolfssl_verify_cb,
-		.ctx = &accept_ctx,
-	};
-
-	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), false);
-}
-
-/* A verify callback cannot accept a failed chain CA in a renegotiation */
-ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_reneg_chain_ca_not_learned)
-{
-#if !defined(HAVE_SECURE_RENEGOTIATION) || defined(WOLFSSL_NO_TLS12)
+#if !defined(CONFIG_TLS_CREDENTIALS)
 	ztest_test_skip();
 #else
 	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
@@ -2433,7 +3135,58 @@ ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_reneg_chain_ca_not_le
 		.ctx = &accept_ctx,
 	};
 
-	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), true);
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), false, false);
+#endif
+}
+
+/* A verify callback cannot accept a failed chain CA in a renegotiation */
+ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_reneg_chain_ca_not_learned)
+{
+#if !defined(CONFIG_TLS_CREDENTIALS) || !defined(HAVE_SECURE_RENEGOTIATION) || \
+	defined(WOLFSSL_NO_TLS12)
+	ztest_test_skip();
+#else
+	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
+	const struct zsock_tls_cert_verify_cb_wolfssl cb = {
+		.cb = wolfssl_verify_cb,
+		.ctx = &accept_ctx,
+	};
+
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), true, false);
+#endif
+}
+
+/* Children of a listener with a verify callback share its CTX only without renegotiation */
+ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_listener_ctx_sharing)
+{
+#if defined(SINGLE_THREADED)
+	ztest_test_skip();
+#else
+	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
+	const struct zsock_tls_cert_verify_cb_wolfssl cb = {
+		.cb = wolfssl_verify_cb,
+		.ctx = &accept_ctx,
+	};
+
+	zassert_equal(listener_ctx_shared(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), true),
+		      !RENEGOTIATION_UNSHARES, "unexpected CTX sharing");
+#endif
+}
+
+/* The control for the test above, with client A's CA trusted */
+ZTEST(net_socket_tls_api_extension, test_wolfssl_verify_cb_reneg_trusted_chain)
+{
+#if !defined(CONFIG_TLS_CREDENTIALS) || !defined(HAVE_SECURE_RENEGOTIATION) || \
+	defined(WOLFSSL_NO_TLS12)
+	ztest_test_skip();
+#else
+	static struct wolfssl_verify_ctx accept_ctx = { .decision = 1 };
+	const struct zsock_tls_cert_verify_cb_wolfssl cb = {
+		.cb = wolfssl_verify_cb,
+		.ctx = &accept_ctx,
+	};
+
+	chain_ca_tcp_common(ZSOCK_TLS_PEER_VERIFY_REQUIRED, &cb, sizeof(cb), true, true);
 #endif
 }
 
@@ -2653,6 +3406,7 @@ static void tls_ext_after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 
+	tls_proto = NET_IPPROTO_TLS_1_2;
 	(void)tls_credential_delete(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(CLIENT_AUTH_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
 	(void)tls_credential_delete(EXT_PSK_TAG, TLS_CREDENTIAL_PSK);
@@ -2660,6 +3414,7 @@ static void tls_ext_after(void *fixture)
 	(void)tls_credential_delete(CHAIN_A_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(CHAIN_B_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(CHAIN_KEY_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
+	(void)tls_credential_delete(CHAIN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE);
 	(void)tls_credential_delete(IP_SAN_CA_TAG, TLS_CREDENTIAL_CA_CERTIFICATE);
 	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PUBLIC_CERTIFICATE);
 	(void)tls_credential_delete(IP_SAN_SERVER_TAG, TLS_CREDENTIAL_PRIVATE_KEY);
